@@ -1,0 +1,4 @@
+pandas>=2.2.0
+requests>=2.31.0
+websockets>=12.0
+pycryptodome>=3.19.0

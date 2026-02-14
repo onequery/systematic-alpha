@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "systematic-alpha"
+version = "0.1.0"
+description = "KIS intraday stock selector using REST + WebSocket signals"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+  "pandas>=2.2.0",
+  "requests>=2.31.0",
+  "websockets>=12.0",
+  "pycryptodome>=3.19.0",
+]
+
+[project.scripts]
+systematic-alpha = "main:main"
+
+[tool.setuptools]
+py-modules = ["main"]
+packages = ["systematic_alpha"]
