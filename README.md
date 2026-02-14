@@ -110,6 +110,55 @@ See all options:
 python main.py --help
 ```
 
+## Windows Auto Run at 09:00 (Task Scheduler)
+
+You do not need a 24/7 loop process.  
+Use a scheduled task that runs once at market open time.
+
+### 1) Register task
+
+Run PowerShell as your normal user and execute:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\register_task.ps1
+```
+
+Default behavior:
+- task name: `SystematicAlpha_0900`
+- time: `09:00`
+- schedule: weekdays only (Mon-Fri)
+- runner: `scripts/run_daily.ps1`
+- python: `C:\Users\heesu\anaconda3\envs\systematic-alpha\python.exe`
+
+Custom time/task name example:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\register_task.ps1 -TaskName "SystematicAlpha_Open" -At "09:00"
+```
+
+### 2) Run once now (manual test)
+
+```powershell
+Start-ScheduledTask -TaskName "SystematicAlpha_0900"
+```
+
+### 3) Check outputs
+
+- logs: `logs/`
+- json results: `out/`
+
+### 4) Remove task
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\remove_task.ps1
+```
+
+Notes:
+- The "PC must be on at 09:00" condition applies only to automatic scheduled execution.
+- `remove_task.ps1` is a manual command and works immediately when you run it (not tied to 09:00).
+- If the PC is sleeping at 09:00, the scheduled run may be delayed depending on OS power/task settings.
+- `scripts/run_daily.ps1` clears proxy env variables and uses project-local cache path for `mojito` token stability.
+
 ## Smoke Run (off-market quick check)
 
 Use very small universe and disable realtime collection:

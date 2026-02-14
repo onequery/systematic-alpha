@@ -14,7 +14,16 @@ env/
 
 .cache/
 out/
+logs/
 smoke_codes.txt
+kospi_code.mst
+kospi_code.mst.zip
+kosdaq_code.mst
+kosdaq_code.mst.zip
+kospi_code_part1.tmp
+kospi_code_part2.tmp
+kosdaq_code_part1.tmp
+kosdaq_code_part2.tmp
 
 .vscode/
 .idea/
