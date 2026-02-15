@@ -30,10 +30,17 @@ Common args:
   --min-pass-conditions INT
   --min-maintain-ratio FLOAT
   --rest-sleep FLOAT
+  --long-only / --allow-short-bias
+  --min-exec-ticks INT
+  --min-orderbook-ticks INT
+  --min-realtime-cum-volume FLOAT
+  --min-realtime-coverage-ratio FLOAT
+  --invalidate-on-low-coverage / --allow-low-coverage
   --stage1-log-interval INT
   --realtime-log-interval INT
   --mock
   --user-id TEXT
+  --overnight-report-path PATH
   --output-json PATH
 
 Tip:

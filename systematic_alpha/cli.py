@@ -1,17 +1,38 @@
 from __future__ import annotations
 
+import csv
 import json
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 from time import perf_counter
-from typing import List
+from typing import Dict, List, Optional
 from zoneinfo import ZoneInfo
 
 from systematic_alpha.helpers import fmt
-from systematic_alpha.models import FinalSelection, StrategyConfig
+from systematic_alpha.models import FinalSelection, RealtimeQuality, StrategyConfig
 from systematic_alpha.mojito_loader import import_mojito_module
 from systematic_alpha.selector import DayTradingSelector
+
+REPORT_FIELDS = [
+    "selection_datetime",
+    "selection_date",
+    "code",
+    "name",
+    "rank",
+    "recommendation_score",
+    "score",
+    "max_score",
+    "entry_price",
+    "selection_close",
+    "next_open",
+    "next_open_date",
+    "intraday_return_pct",
+    "overnight_return_pct",
+    "total_return_to_next_open_pct",
+    "status",
+    "last_updated_at",
+]
 
 
 def recommendation_score(item: FinalSelection) -> float:
@@ -52,9 +73,11 @@ def to_ranked_payload(items: List[FinalSelection]) -> List[dict]:
 
 def save_json_output(
     config: StrategyConfig,
-    realtime_ready: bool,
+    decision_at: datetime,
+    realtime_quality: RealtimeQuality,
     final: List[FinalSelection],
     ranked: List[FinalSelection],
+    invalid_reason: Optional[str] = None,
 ) -> None:
     if not config.output_json_path:
         return
@@ -64,7 +87,11 @@ def save_json_output(
         json.dumps(
             {
                 "generated_at": datetime.now(ZoneInfo("Asia/Seoul")).isoformat(),
-                "realtime_ready": realtime_ready,
+                "decision_at": decision_at.isoformat(),
+                "signal_valid": invalid_reason is None,
+                "invalid_reason": invalid_reason,
+                "realtime_ready": realtime_quality.realtime_ready,
+                "realtime_quality": asdict(realtime_quality),
                 "sorted_by": "recommendation_score_desc",
                 "final": to_ranked_payload(final),
                 "all_ranked": to_ranked_payload(ranked),
@@ -80,6 +107,9 @@ def save_json_output(
 def print_final_table(final: List[FinalSelection]) -> None:
     print("")
     print("Final Picks")
+    if not final:
+        print("(no picks)")
+        return
     print("rank code    rec%   score  change%  gap%    volRatio strength bid/ask  vwapOK")
     for idx, item in enumerate(final, start=1):
         vol_ratio = item.metrics.get("volume_ratio")
@@ -100,6 +130,154 @@ def print_final_table(final: List[FinalSelection]) -> None:
         )
 
 
+def _parse_float(value: str) -> Optional[float]:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _fmt_csv_float(value: Optional[float]) -> str:
+    if value is None:
+        return ""
+    return f"{value:.6f}"
+
+
+def _read_report_rows(path: Path) -> List[Dict[str, str]]:
+    if not path.exists():
+        return []
+    with path.open("r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        return [dict(row) for row in reader]
+
+
+def _write_report_rows(path: Path, rows: List[Dict[str, str]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=REPORT_FIELDS)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({k: row.get(k, "") for k in REPORT_FIELDS})
+
+
+def _resolve_report_status(metrics: Dict[str, Optional[float | str]]) -> str:
+    if metrics.get("next_open") is not None:
+        return "complete"
+    if metrics.get("selection_close") is not None:
+        return "day_close_ready"
+    return "pending"
+
+
+def update_pending_overnight_report(selector: DayTradingSelector, report_path: Optional[str]) -> None:
+    if not report_path:
+        return
+    path = Path(report_path)
+    if not path.exists():
+        return
+
+    rows = _read_report_rows(path)
+    if not rows:
+        return
+
+    changed = False
+    updated_count = 0
+    now_iso = datetime.now(ZoneInfo("Asia/Seoul")).isoformat()
+
+    for row in rows:
+        if row.get("status") == "complete":
+            continue
+        code = row.get("code", "").strip()
+        selection_date = row.get("selection_date", "").strip()
+        entry_price = _parse_float(row.get("entry_price", ""))
+        if not code or not selection_date:
+            continue
+
+        metrics = selector.build_overnight_report_metrics(code, selection_date, entry_price)
+        new_status = _resolve_report_status(metrics)
+
+        before = (
+            row.get("selection_close", ""),
+            row.get("next_open", ""),
+            row.get("intraday_return_pct", ""),
+            row.get("overnight_return_pct", ""),
+            row.get("total_return_to_next_open_pct", ""),
+            row.get("status", ""),
+        )
+
+        row["selection_close"] = _fmt_csv_float(metrics.get("selection_close"))  # type: ignore[arg-type]
+        row["next_open"] = _fmt_csv_float(metrics.get("next_open"))  # type: ignore[arg-type]
+        row["next_open_date"] = str(metrics.get("next_open_date") or "")
+        row["intraday_return_pct"] = _fmt_csv_float(metrics.get("intraday_return_pct"))  # type: ignore[arg-type]
+        row["overnight_return_pct"] = _fmt_csv_float(metrics.get("overnight_return_pct"))  # type: ignore[arg-type]
+        row["total_return_to_next_open_pct"] = _fmt_csv_float(
+            metrics.get("total_return_to_next_open_pct")  # type: ignore[arg-type]
+        )
+        row["status"] = new_status
+        row["last_updated_at"] = now_iso
+
+        after = (
+            row.get("selection_close", ""),
+            row.get("next_open", ""),
+            row.get("intraday_return_pct", ""),
+            row.get("overnight_return_pct", ""),
+            row.get("total_return_to_next_open_pct", ""),
+            row.get("status", ""),
+        )
+        if before != after:
+            changed = True
+            updated_count += 1
+
+    if changed:
+        _write_report_rows(path, rows)
+        log(f"[overnight-report] updated pending rows: {updated_count}")
+
+
+def append_selection_report_rows(
+    selector: DayTradingSelector,
+    report_path: Optional[str],
+    final: List[FinalSelection],
+    decision_at: datetime,
+) -> None:
+    if not report_path or not final:
+        return
+
+    path = Path(report_path)
+    rows = _read_report_rows(path)
+    selection_date = decision_at.strftime("%Y%m%d")
+    now_iso = datetime.now(ZoneInfo("Asia/Seoul")).isoformat()
+
+    for idx, item in enumerate(final, start=1):
+        entry_price = item.metrics.get("latest_price")
+        metrics = selector.build_overnight_report_metrics(item.code, selection_date, entry_price)
+        status = _resolve_report_status(metrics)
+        rows.append(
+            {
+                "selection_datetime": decision_at.isoformat(),
+                "selection_date": selection_date,
+                "code": item.code,
+                "name": item.name,
+                "rank": str(idx),
+                "recommendation_score": f"{recommendation_score(item):.4f}",
+                "score": str(item.score),
+                "max_score": str(item.max_score),
+                "entry_price": _fmt_csv_float(entry_price),
+                "selection_close": _fmt_csv_float(metrics.get("selection_close")),  # type: ignore[arg-type]
+                "next_open": _fmt_csv_float(metrics.get("next_open")),  # type: ignore[arg-type]
+                "next_open_date": str(metrics.get("next_open_date") or ""),
+                "intraday_return_pct": _fmt_csv_float(metrics.get("intraday_return_pct")),  # type: ignore[arg-type]
+                "overnight_return_pct": _fmt_csv_float(metrics.get("overnight_return_pct")),  # type: ignore[arg-type]
+                "total_return_to_next_open_pct": _fmt_csv_float(
+                    metrics.get("total_return_to_next_open_pct")  # type: ignore[arg-type]
+                ),
+                "status": status,
+                "last_updated_at": now_iso,
+            }
+        )
+
+    _write_report_rows(path, rows)
+    log(f"[overnight-report] appended rows: {len(final)} -> {path}")
+
+
 def run(config: StrategyConfig) -> None:
     total_started = perf_counter()
     log(
@@ -107,11 +285,16 @@ def run(config: StrategyConfig) -> None:
         f"collect={config.collect_seconds}s, "
         f"final_picks={config.final_picks}, pre_candidates={config.pre_candidates}, "
         f"max_symbols_scan={config.max_symbols_scan}, "
+        f"long_only={config.long_only}, "
+        f"min_coverage={config.min_realtime_coverage_ratio:.2f}, "
+        f"invalidate_on_low_coverage={config.invalidate_on_low_coverage}, "
         f"stage1_log_interval={config.stage1_log_interval}, "
         f"realtime_log_interval={config.realtime_log_interval}s"
     )
     mojito_module = import_mojito_module()
     selector = DayTradingSelector(mojito_module, config)
+
+    update_pending_overnight_report(selector, config.overnight_report_path)
 
     stage_started = perf_counter()
     log("[1/4] Loading universe...")
@@ -144,23 +327,74 @@ def run(config: StrategyConfig) -> None:
 
     if not stage1:
         log("No candidates passed stage1 thresholds.")
+        now = datetime.now(ZoneInfo("Asia/Seoul"))
+        no_realtime = RealtimeQuality(
+            realtime_ready=False,
+            quality_ok=True,
+            coverage_ratio=0.0,
+            eligible_count=0,
+            total_count=0,
+            min_exec_ticks=config.min_exec_ticks,
+            min_orderbook_ticks=config.min_orderbook_ticks,
+            min_realtime_cum_volume=config.min_realtime_cum_volume,
+        )
+        save_json_output(
+            config=config,
+            decision_at=now,
+            realtime_quality=no_realtime,
+            final=[],
+            ranked=[],
+            invalid_reason="no_stage1_candidates",
+        )
         return
 
     stage_started = perf_counter()
     log("[3/4] Collecting realtime data (strength/VWAP/orderbook)...")
     target_codes = [item.code for item in stage1]
-    realtime_stats, realtime_ready = selector.collect_realtime(target_codes)
-    if realtime_ready:
-        log(f"Realtime data received (elapsed {perf_counter() - stage_started:.1f}s). Running full 8-condition scoring.")
-    else:
-        log(
-            f"Realtime execution data not received (elapsed {perf_counter() - stage_started:.1f}s). "
-            "Falling back to stage1-only scoring."
+    realtime_stats, realtime_quality = selector.collect_realtime(target_codes)
+    log(
+        "[realtime] quality summary: "
+        f"ready={realtime_quality.realtime_ready}, "
+        f"coverage={realtime_quality.coverage_ratio:.3f}, "
+        f"eligible={realtime_quality.eligible_count}/{realtime_quality.total_count}, "
+        f"quality_ok={realtime_quality.quality_ok}"
+    )
+    log(f"[3/4] Realtime collection done (elapsed {perf_counter() - stage_started:.1f}s)")
+
+    if (
+        config.collect_seconds > 0
+        and config.invalidate_on_low_coverage
+        and not realtime_quality.quality_ok
+    ):
+        invalid_reason = (
+            "realtime_coverage_too_low:"
+            f"{realtime_quality.coverage_ratio:.3f}<{config.min_realtime_coverage_ratio:.3f}"
         )
+        log(f"[invalid] {invalid_reason} -> no picks for today.")
+        now = datetime.now(ZoneInfo("Asia/Seoul"))
+        print_final_table([])
+        save_json_output(
+            config=config,
+            decision_at=now,
+            realtime_quality=realtime_quality,
+            final=[],
+            ranked=[],
+            invalid_reason=invalid_reason,
+        )
+        print("\nTop codes: (none)")
+        log(f"Run finished (total elapsed {perf_counter() - total_started:.1f}s)")
+        return
+
+    stage_started = perf_counter()
+    log("[3.5/4] Refreshing stage1 snapshots at decision time...")
+    decision_candidates = selector.refresh_candidates_for_decision(stage1)
+    log(f"[3.5/4] Snapshot refresh done (elapsed {perf_counter() - stage_started:.1f}s)")
 
     stage_started = perf_counter()
     log("[4/4] Final scoring...")
-    ranked = sort_by_recommendation(selector.evaluate(stage1, realtime_stats, realtime_ready))
+    ranked = sort_by_recommendation(
+        selector.evaluate(decision_candidates, realtime_stats, realtime_quality.realtime_ready)
+    )
     log(f"Scoring complete (elapsed {perf_counter() - stage_started:.1f}s). Ranked={len(ranked)}")
 
     passed = [item for item in ranked if item.passed]
@@ -169,7 +403,15 @@ def run(config: StrategyConfig) -> None:
         needed = config.final_picks - len(final)
         final.extend([item for item in ranked if item not in final][:needed])
 
+    decision_at = datetime.now(ZoneInfo("Asia/Seoul"))
     print_final_table(final)
-    save_json_output(config, realtime_ready, final, ranked)
-    print("\nTop codes:", ", ".join(item.code for item in final))
+    save_json_output(
+        config=config,
+        decision_at=decision_at,
+        realtime_quality=realtime_quality,
+        final=final,
+        ranked=ranked,
+    )
+    append_selection_report_rows(selector, config.overnight_report_path, final, decision_at)
+    print("\nTop codes:", ", ".join(item.code for item in final) if final else "(none)")
     log(f"Run finished (total elapsed {perf_counter() - total_started:.1f}s)")

@@ -21,6 +21,7 @@ from systematic_alpha.helpers import (
 from systematic_alpha.models import (
     FinalSelection,
     PrevDayStats,
+    RealtimeQuality,
     RealtimeStats,
     Stage1Candidate,
     StrategyConfig,
@@ -40,6 +41,7 @@ class DayTradingSelector:
         self.today_kst = datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y%m%d")
         self._daily_cache: Dict[str, Optional[PrevDayStats]] = {}
         self._price_cache: Dict[str, Optional[Dict[str, Any]]] = {}
+        self._daily_bars_cache: Dict[str, List[Dict[str, Any]]] = {}
 
     def load_universe(self) -> Tuple[List[str], Dict[str, str]]:
         if self.config.universe_file:
@@ -129,8 +131,8 @@ class DayTradingSelector:
         self._daily_cache[code] = stats
         return stats
 
-    def fetch_price_snapshot(self, code: str) -> Optional[Dict[str, Any]]:
-        if code in self._price_cache:
+    def fetch_price_snapshot(self, code: str, use_cache: bool = True) -> Optional[Dict[str, Any]]:
+        if use_cache and code in self._price_cache:
             return self._price_cache[code]
 
         try:
@@ -167,6 +169,178 @@ class DayTradingSelector:
         self._price_cache[code] = snapshot
         return snapshot
 
+    def _pass_change_threshold(self, change_pct: Optional[float], threshold: float) -> bool:
+        if change_pct is None:
+            return False
+        if self.config.long_only:
+            return change_pct >= threshold
+        return abs(change_pct) >= threshold
+
+    def _pass_gap_threshold(self, gap_pct: Optional[float], threshold: float) -> bool:
+        if gap_pct is None:
+            return False
+        if self.config.long_only:
+            return gap_pct >= threshold
+        return abs(gap_pct) >= threshold
+
+    def _is_realtime_symbol_eligible(self, realtime: RealtimeStats) -> bool:
+        return (
+            realtime.execution_ticks >= self.config.min_exec_ticks
+            and realtime.orderbook_ticks >= self.config.min_orderbook_ticks
+            and realtime.cum_trade_volume >= self.config.min_realtime_cum_volume
+        )
+
+    def refresh_candidates_for_decision(self, candidates: List[Stage1Candidate]) -> List[Stage1Candidate]:
+        if not candidates:
+            return []
+
+        refreshed: List[Stage1Candidate] = []
+        total = len(candidates)
+        progress_every = max(1, self.config.stage1_log_interval)
+        for idx, candidate in enumerate(candidates, start=1):
+            try:
+                snap = self.fetch_price_snapshot(candidate.code, use_cache=False)
+                if snap is None:
+                    refreshed.append(candidate)
+                    continue
+
+                current_price = snap.get("price")
+                if current_price is None:
+                    refreshed.append(candidate)
+                    continue
+
+                open_price = snap.get("open")
+                if open_price is None:
+                    open_price = candidate.open_price
+
+                change_pct = snap.get("change_pct")
+                if change_pct is None and candidate.prev_close > 0:
+                    change_pct = ((current_price - candidate.prev_close) / candidate.prev_close) * 100.0
+
+                gap_pct = candidate.gap_pct
+                if candidate.prev_close > 0 and open_price is not None:
+                    gap_pct = ((open_price - candidate.prev_close) / candidate.prev_close) * 100.0
+
+                name = candidate.name or str(snap.get("name") or "")
+                refreshed.append(
+                    Stage1Candidate(
+                        code=candidate.code,
+                        name=name,
+                        current_price=current_price,
+                        open_price=open_price if open_price is not None else candidate.open_price,
+                        current_change_pct=change_pct if change_pct is not None else candidate.current_change_pct,
+                        gap_pct=gap_pct,
+                        prev_close=candidate.prev_close,
+                        prev_day_volume=candidate.prev_day_volume,
+                        prev_day_turnover=candidate.prev_day_turnover,
+                    )
+                )
+            finally:
+                if idx % progress_every == 0 or idx == total:
+                    pct = (idx / total * 100.0) if total > 0 else 100.0
+                    print(
+                        f"[decision-refresh] refreshed={idx}/{total} ({pct:.1f}%)",
+                        flush=True,
+                    )
+                if self.config.rest_sleep_sec > 0:
+                    time.sleep(self.config.rest_sleep_sec)
+
+        return refreshed
+
+    def fetch_daily_bars(self, code: str) -> List[Dict[str, Any]]:
+        if code in self._daily_bars_cache:
+            return self._daily_bars_cache[code]
+
+        try:
+            resp = self.broker.fetch_ohlcv_recent30(code, timeframe="D", adj_price=True)
+        except Exception:
+            self._daily_bars_cache[code] = []
+            return []
+
+        rows = latest_list_of_dict(resp if isinstance(resp, dict) else {})
+        parsed: List[Dict[str, Any]] = []
+        for row in rows:
+            date = normalize_yyyymmdd(
+                pick_first(row, ("stck_bsop_date", "bsop_date", "stck_bsop_dt", "bas_dt", "date", "xymd"))
+            )
+            if not date:
+                continue
+            open_price = to_float(pick_first(row, ("stck_oprc", "open", "oprc")))
+            close_price = to_float(pick_first(row, ("stck_clpr", "close", "stck_prpr", "clpr")))
+            if close_price is None:
+                continue
+            parsed.append({"date": date, "open": open_price, "close": close_price})
+
+        parsed.sort(key=lambda item: item["date"])
+        self._daily_bars_cache[code] = parsed
+        return parsed
+
+    def build_overnight_report_metrics(
+        self,
+        code: str,
+        selection_date: str,
+        entry_price: Optional[float],
+    ) -> Dict[str, Optional[float | str]]:
+        bars = self.fetch_daily_bars(code)
+        if not bars:
+            return {
+                "selection_close": None,
+                "next_open": None,
+                "next_open_date": None,
+                "intraday_return_pct": None,
+                "overnight_return_pct": None,
+                "total_return_to_next_open_pct": None,
+            }
+
+        selection_close: Optional[float] = None
+        next_open: Optional[float] = None
+        next_open_date: Optional[str] = None
+
+        for idx, bar in enumerate(bars):
+            if bar["date"] != selection_date:
+                continue
+            selection_close = bar.get("close")
+            for next_bar in bars[idx + 1 :]:
+                if next_bar["date"] > selection_date and next_bar.get("open") is not None:
+                    next_open = next_bar["open"]
+                    next_open_date = next_bar["date"]
+                    break
+            break
+
+        intraday_return_pct: Optional[float] = None
+        overnight_return_pct: Optional[float] = None
+        total_return_to_next_open_pct: Optional[float] = None
+
+        if (
+            entry_price is not None
+            and entry_price > 0
+            and selection_close is not None
+        ):
+            intraday_return_pct = ((selection_close - entry_price) / entry_price) * 100.0
+
+        if (
+            selection_close is not None
+            and selection_close > 0
+            and next_open is not None
+        ):
+            overnight_return_pct = ((next_open - selection_close) / selection_close) * 100.0
+
+        if (
+            entry_price is not None
+            and entry_price > 0
+            and next_open is not None
+        ):
+            total_return_to_next_open_pct = ((next_open - entry_price) / entry_price) * 100.0
+
+        return {
+            "selection_close": selection_close,
+            "next_open": next_open,
+            "next_open_date": next_open_date,
+            "intraday_return_pct": intraday_return_pct,
+            "overnight_return_pct": overnight_return_pct,
+            "total_return_to_next_open_pct": total_return_to_next_open_pct,
+        }
+
     def _build_candidates_with_thresholds(
         self,
         codes: List[str],
@@ -191,7 +365,7 @@ class DayTradingSelector:
                 if current_price is None or open_price is None:
                     continue
 
-                if change_pct is not None and abs(change_pct) < min_change_pct:
+                if change_pct is not None and not self._pass_change_threshold(change_pct, min_change_pct):
                     continue
 
                 prev = self.fetch_prev_day_stats(code)
@@ -201,11 +375,11 @@ class DayTradingSelector:
                 if change_pct is None:
                     change_pct = ((current_price - prev.prev_close) / prev.prev_close) * 100.0
 
-                if abs(change_pct) < min_change_pct:
+                if not self._pass_change_threshold(change_pct, min_change_pct):
                     continue
 
                 gap_pct = ((open_price - prev.prev_close) / prev.prev_close) * 100.0
-                if abs(gap_pct) < min_gap_pct:
+                if not self._pass_gap_threshold(gap_pct, min_gap_pct):
                     continue
 
                 if prev.prev_turnover < min_prev_turnover:
@@ -234,10 +408,16 @@ class DayTradingSelector:
                 if self.config.rest_sleep_sec > 0:
                     time.sleep(self.config.rest_sleep_sec)
 
-        candidates.sort(
-            key=lambda c: (c.prev_day_turnover, abs(c.current_change_pct), abs(c.gap_pct)),
-            reverse=True,
-        )
+        if self.config.long_only:
+            candidates.sort(
+                key=lambda c: (c.prev_day_turnover, c.current_change_pct, c.gap_pct),
+                reverse=True,
+            )
+        else:
+            candidates.sort(
+                key=lambda c: (c.prev_day_turnover, abs(c.current_change_pct), abs(c.gap_pct)),
+                reverse=True,
+            )
         return candidates[:limit]
 
     def build_stage1_candidates(
@@ -317,6 +497,7 @@ class DayTradingSelector:
 
         ref = stats[code]
         ref.got_execution = True
+        ref.execution_ticks += 1
 
         price = to_float(values[2])
         tick_volume = to_float(values[12])
@@ -351,6 +532,7 @@ class DayTradingSelector:
 
         ref = stats[code]
         ref.got_orderbook = True
+        ref.orderbook_ticks += 1
 
         total_ask = to_float(values[43])
         total_bid = to_float(values[44])
@@ -358,10 +540,20 @@ class DayTradingSelector:
             return
         ref.bid_ask_ratios.append(total_bid / total_ask)
 
-    def collect_realtime(self, codes: List[str]) -> Tuple[Dict[str, RealtimeStats], bool]:
+    def collect_realtime(self, codes: List[str]) -> Tuple[Dict[str, RealtimeStats], RealtimeQuality]:
         stats = {code: RealtimeStats() for code in codes}
         if not codes or self.config.collect_seconds <= 0:
-            return stats, False
+            quality = RealtimeQuality(
+                realtime_ready=False,
+                quality_ok=True,
+                coverage_ratio=0.0,
+                eligible_count=0,
+                total_count=len(codes),
+                min_exec_ticks=self.config.min_exec_ticks,
+                min_orderbook_ticks=self.config.min_orderbook_ticks,
+                min_realtime_cum_volume=self.config.min_realtime_cum_volume,
+            )
+            return stats, quality
 
         log_interval = max(1, self.config.realtime_log_interval)
         ws = self.mojito.KoreaInvestmentWS(
@@ -443,22 +635,51 @@ class DayTradingSelector:
 
         exec_symbols = sum(1 for ref in stats.values() if ref.got_execution)
         ob_symbols = sum(1 for ref in stats.values() if ref.got_orderbook)
+        eligible_count = sum(1 for ref in stats.values() if self._is_realtime_symbol_eligible(ref))
+        total_count = len(codes)
+        coverage_ratio = (eligible_count / total_count) if total_count > 0 else 0.0
+        realtime_ready = execution_events > 0 and orderbook_events > 0
+        quality_ok = coverage_ratio >= self.config.min_realtime_coverage_ratio
         print(
             "[realtime] finished: "
             f"exec_events={execution_events}, orderbook_events={orderbook_events}, "
-            f"exec_symbols={exec_symbols}/{len(codes)}, orderbook_symbols={ob_symbols}/{len(codes)}",
+            f"exec_symbols={exec_symbols}/{len(codes)}, orderbook_symbols={ob_symbols}/{len(codes)}, "
+            f"eligible={eligible_count}/{total_count}, coverage={coverage_ratio:.3f}",
+            flush=True,
+        )
+        print(
+            "[realtime] quality gate: "
+            f"min_exec_ticks={self.config.min_exec_ticks}, "
+            f"min_orderbook_ticks={self.config.min_orderbook_ticks}, "
+            f"min_cum_volume={self.config.min_realtime_cum_volume}, "
+            f"min_coverage_ratio={self.config.min_realtime_coverage_ratio:.3f}, "
+            f"quality_ok={quality_ok}",
             flush=True,
         )
 
-        return stats, execution_events > 0
+        quality = RealtimeQuality(
+            realtime_ready=realtime_ready,
+            quality_ok=quality_ok,
+            coverage_ratio=coverage_ratio,
+            eligible_count=eligible_count,
+            total_count=total_count,
+            min_exec_ticks=self.config.min_exec_ticks,
+            min_orderbook_ticks=self.config.min_orderbook_ticks,
+            min_realtime_cum_volume=self.config.min_realtime_cum_volume,
+        )
+        return stats, quality
 
     def evaluate(
-        self, candidates: List[Stage1Candidate], stats: Dict[str, RealtimeStats], realtime_ready: bool
+        self,
+        candidates: List[Stage1Candidate],
+        stats: Dict[str, RealtimeStats],
+        realtime_ready: bool,
     ) -> List[FinalSelection]:
         results: List[FinalSelection] = []
 
         for candidate in candidates:
             realtime = stats.get(candidate.code, RealtimeStats())
+            symbol_realtime_eligible = self._is_realtime_symbol_eligible(realtime)
             vwap = (
                 realtime.cum_trade_value / realtime.cum_trade_volume
                 if realtime.cum_trade_volume > 0
@@ -489,22 +710,27 @@ class DayTradingSelector:
 
             if realtime_ready:
                 conditions = {
-                    "change_pct": abs(candidate.current_change_pct) >= self.config.min_change_pct,
-                    "gap_pct": abs(candidate.gap_pct) >= self.config.min_gap_pct,
+                    "change_pct": self._pass_change_threshold(
+                        candidate.current_change_pct, self.config.min_change_pct
+                    ),
+                    "gap_pct": self._pass_gap_threshold(candidate.gap_pct, self.config.min_gap_pct),
                     "prev_turnover": candidate.prev_day_turnover >= self.config.min_prev_turnover,
-                    "strength_maintained": strength_ok,
-                    "volume_ratio": volume_ratio is not None
+                    "strength_maintained": symbol_realtime_eligible and strength_ok,
+                    "volume_ratio": symbol_realtime_eligible
+                    and volume_ratio is not None
                     and volume_ratio >= self.config.min_vol_ratio,
-                    "bid_ask_maintained": bid_ask_ok,
-                    "price_above_vwap": current_vs_vwap,
-                    "low_not_broken": not realtime.low_broken_after_start,
+                    "bid_ask_maintained": symbol_realtime_eligible and bid_ask_ok,
+                    "price_above_vwap": symbol_realtime_eligible and current_vs_vwap,
+                    "low_not_broken": symbol_realtime_eligible and (not realtime.low_broken_after_start),
                 }
                 max_score = 8
                 pass_cut = self.config.min_pass_conditions
             else:
                 conditions = {
-                    "change_pct": abs(candidate.current_change_pct) >= self.config.min_change_pct,
-                    "gap_pct": abs(candidate.gap_pct) >= self.config.min_gap_pct,
+                    "change_pct": self._pass_change_threshold(
+                        candidate.current_change_pct, self.config.min_change_pct
+                    ),
+                    "gap_pct": self._pass_gap_threshold(candidate.gap_pct, self.config.min_gap_pct),
                     "prev_turnover": candidate.prev_day_turnover >= self.config.min_prev_turnover,
                 }
                 max_score = 3
@@ -522,6 +748,9 @@ class DayTradingSelector:
                 "bid_ask_hit_ratio": bid_ask_hit_ratio,
                 "volume_ratio": volume_ratio,
                 "vwap": vwap,
+                "execution_ticks": float(realtime.execution_ticks),
+                "orderbook_ticks": float(realtime.orderbook_ticks),
+                "realtime_eligible": 1.0 if symbol_realtime_eligible else 0.0,
                 "latest_price": (
                     realtime.latest_price if realtime.latest_price is not None else candidate.current_price
                 ),

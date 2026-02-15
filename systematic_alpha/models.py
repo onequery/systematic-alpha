@@ -27,8 +27,15 @@ class StrategyConfig:
     min_maintain_ratio: float
     min_strength_samples: int
     min_bid_ask_samples: int
+    long_only: bool
+    min_exec_ticks: int
+    min_orderbook_ticks: int
+    min_realtime_cum_volume: float
+    min_realtime_coverage_ratio: float
+    invalidate_on_low_coverage: bool
     stage1_log_interval: int
     realtime_log_interval: int
+    overnight_report_path: Optional[str]
     output_json_path: Optional[str]
 
 
@@ -57,6 +64,8 @@ class Stage1Candidate:
 class RealtimeStats:
     got_execution: bool = False
     got_orderbook: bool = False
+    execution_ticks: int = 0
+    orderbook_ticks: int = 0
     strength_values: List[float] = field(default_factory=list)
     bid_ask_ratios: List[float] = field(default_factory=list)
     cum_trade_volume: float = 0.0
@@ -76,3 +85,15 @@ class FinalSelection:
     passed: bool
     conditions: Dict[str, bool]
     metrics: Dict[str, Optional[float]]
+
+
+@dataclass
+class RealtimeQuality:
+    realtime_ready: bool
+    quality_ok: bool
+    coverage_ratio: float
+    eligible_count: int
+    total_count: int
+    min_exec_ticks: int
+    min_orderbook_ticks: int
+    min_realtime_cum_volume: float

@@ -6,7 +6,7 @@ import os
 from systematic_alpha.cli import run
 from systematic_alpha.credentials import load_credentials
 from systematic_alpha.dotenv import load_dotenv
-from systematic_alpha.helpers import env_float, env_int
+from systematic_alpha.helpers import env_bool, env_float, env_int
 from systematic_alpha.models import StrategyConfig
 
 
@@ -49,13 +49,13 @@ def parse_args() -> argparse.Namespace:
         "--min-change-pct",
         type=float,
         default=env_float("MIN_CHANGE_PCT", 3.0),
-        help="Absolute current day change %% threshold.",
+        help="Current-day change %% threshold. In long-only mode, change must be >= threshold.",
     )
     parser.add_argument(
         "--min-gap-pct",
         type=float,
         default=env_float("MIN_GAP_PCT", 2.0),
-        help="Absolute opening gap %% threshold.",
+        help="Opening gap %% threshold. In long-only mode, gap must be >= threshold.",
     )
     parser.add_argument(
         "--min-prev-turnover",
@@ -100,6 +100,56 @@ def parse_args() -> argparse.Namespace:
         help="Small delay between REST calls to reduce burst rate.",
     )
     parser.add_argument(
+        "--long-only",
+        dest="long_only",
+        action="store_true",
+        default=env_bool("LONG_ONLY", True),
+        help="Use long-only directional filters (change/gap must be positive and above thresholds).",
+    )
+    parser.add_argument(
+        "--allow-short-bias",
+        dest="long_only",
+        action="store_false",
+        help="Use absolute-value directional-neutral filters (legacy behavior).",
+    )
+    parser.add_argument(
+        "--min-exec-ticks",
+        type=int,
+        default=env_int("MIN_EXEC_TICKS", 30),
+        help="Minimum execution tick samples per symbol for realtime quality eligibility.",
+    )
+    parser.add_argument(
+        "--min-orderbook-ticks",
+        type=int,
+        default=env_int("MIN_ORDERBOOK_TICKS", 30),
+        help="Minimum orderbook tick samples per symbol for realtime quality eligibility.",
+    )
+    parser.add_argument(
+        "--min-realtime-cum-volume",
+        type=float,
+        default=env_float("MIN_REALTIME_CUM_VOLUME", 1.0),
+        help="Minimum cumulative realtime trade volume per symbol for realtime quality eligibility.",
+    )
+    parser.add_argument(
+        "--min-realtime-coverage-ratio",
+        type=float,
+        default=env_float("MIN_REALTIME_COVERAGE_RATIO", 0.8),
+        help="Minimum eligible symbol ratio required to validate realtime signal quality.",
+    )
+    parser.add_argument(
+        "--invalidate-on-low-coverage",
+        dest="invalidate_on_low_coverage",
+        action="store_true",
+        default=env_bool("INVALIDATE_ON_LOW_COVERAGE", True),
+        help="If realtime coverage is too low, invalidate today's signal and emit no picks.",
+    )
+    parser.add_argument(
+        "--allow-low-coverage",
+        dest="invalidate_on_low_coverage",
+        action="store_false",
+        help="Do not invalidate signal when realtime coverage is low.",
+    )
+    parser.add_argument(
         "--stage1-log-interval",
         type=int,
         default=env_int("STAGE1_LOG_INTERVAL", 20),
@@ -129,6 +179,12 @@ def parse_args() -> argparse.Namespace:
         default=os.getenv("SELECTION_OUTPUT_JSON"),
         help="Optional output json file path.",
     )
+    parser.add_argument(
+        "--overnight-report-path",
+        type=str,
+        default=os.getenv("OVERNIGHT_REPORT_PATH", "./out/selection_overnight_report.csv"),
+        help="CSV path for selected-symbol overnight performance tracking report.",
+    )
     return parser.parse_args()
 
 
@@ -157,8 +213,15 @@ def build_config(args: argparse.Namespace) -> StrategyConfig:
         min_maintain_ratio=args.min_maintain_ratio,
         min_strength_samples=3,
         min_bid_ask_samples=3,
+        long_only=args.long_only,
+        min_exec_ticks=max(1, args.min_exec_ticks),
+        min_orderbook_ticks=max(1, args.min_orderbook_ticks),
+        min_realtime_cum_volume=max(0.0, args.min_realtime_cum_volume),
+        min_realtime_coverage_ratio=min(1.0, max(0.0, args.min_realtime_coverage_ratio)),
+        invalidate_on_low_coverage=args.invalidate_on_low_coverage,
         stage1_log_interval=max(1, args.stage1_log_interval),
         realtime_log_interval=max(1, args.realtime_log_interval),
+        overnight_report_path=args.overnight_report_path,
         output_json_path=args.output_json,
     )
 

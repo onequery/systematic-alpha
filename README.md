@@ -12,7 +12,11 @@ This project is a CLI app (no UI). It reads secrets from `.env` and prints top p
 - Two-stage filtering
   - Stage 1: daily/price snapshot filters
   - Stage 2: realtime metrics (strength, VWAP, bid/ask ratio, volume ratio)
+- Long-only directional mode by default (`change >= threshold`, `gap >= threshold`)
 - Fallback fill rule: if stage1 candidates are fewer than `--final-picks`, thresholds are relaxed step-by-step to fill missing slots.
+- Decision-time snapshot refresh: final scoring uses latest snapshot at selection completion time (not only early scan snapshot).
+- Realtime quality gate: if eligible realtime coverage is below threshold (default `0.8`), signal can be invalidated for the day.
+- Automatic overnight performance report (`selection -> close -> next open`) in CSV.
 - Configurable thresholds via CLI arguments or environment variables
 - JSON output export for downstream automation
 - Telegram notifications for retry/failure/success status (optional)
@@ -30,6 +34,9 @@ The default rules are aligned with a numeric intraday workflow:
 - bid/ask remaining ratio
 - price vs VWAP
 - low-break check
+
+Default directional behavior is long-only.  
+At final scoring, `change/gap` are recomputed from the latest snapshot at the actual selection-computation completion time.
 
 The final ranking selects top `N` symbols (`--final-picks`, default `3`).
 
@@ -101,7 +108,12 @@ Optional:
 - `KIS_MOCK` (`0` or `1`)
 - Telegram variables (`TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, etc.)
 - strategy/runtime override variables listed in `.env.example`
-  - monitoring-related: `STAGE1_LOG_INTERVAL`, `REALTIME_LOG_INTERVAL`
+  - quality/monitoring/report-related:
+    `LONG_ONLY`, `MIN_EXEC_TICKS`, `MIN_ORDERBOOK_TICKS`,
+    `MIN_REALTIME_CUM_VOLUME`, `MIN_REALTIME_COVERAGE_RATIO`,
+    `INVALIDATE_ON_LOW_COVERAGE`,
+    `STAGE1_LOG_INTERVAL`, `REALTIME_LOG_INTERVAL`,
+    `OVERNIGHT_REPORT_PATH`
 
 ### Telegram notifications (optional)
 
@@ -126,8 +138,6 @@ When configured, `scripts/run_daily.ps1` sends:
 - retry notifications with short log tail
 - final failure notification with last error tail
 - final success notification with top picks summary + output json path
-
-Note: Telegram keys in `.env` are prioritized over inherited OS environment variables.
 
 ## Run
 
@@ -270,6 +280,8 @@ python main.py \
 
 - Console table with top picks
 - Optional JSON file via `--output-json`
+- Overnight performance report CSV (default): `out/selection_overnight_report.csv`
+  - columns include: selection datetime, entry price, same-day close, next-day open, intraday/overnight/total returns
 
 Example JSON path:
 - `out/smoke_run.json`
