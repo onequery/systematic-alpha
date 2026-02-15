@@ -30,6 +30,8 @@ Common args:
   --min-pass-conditions INT
   --min-maintain-ratio FLOAT
   --rest-sleep FLOAT
+  --stage1-log-interval INT
+  --realtime-log-interval INT
   --mock
   --user-id TEXT
   --output-json PATH

@@ -16,6 +16,7 @@ env/
 out/
 logs/
 smoke_codes.txt
+mojito/
 kospi_code.mst
 kospi_code.mst.zip
 kosdaq_code.mst

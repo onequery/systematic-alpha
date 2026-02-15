@@ -37,19 +37,22 @@ The final ranking selects top `N` symbols (`--final-picks`, default `3`).
 
 ```text
 .
-├─ main.py
-├─ run_main.sh
-├─ requirements.txt
-├─ .env.example
-├─ systematic_alpha/
-│  ├─ cli.py
-│  ├─ selector.py
-│  ├─ models.py
-│  ├─ credentials.py
-│  ├─ dotenv.py
-│  ├─ helpers.py
-│  └─ mojito_loader.py
-└─ mojito/                # vendored upstream wrapper
+|-- main.py
+|-- run_main.sh
+|-- requirements.txt
+|-- .env.example
+|-- scripts/
+|   |-- register_task.ps1
+|   |-- run_daily.ps1
+|   `-- remove_task.ps1
+`-- systematic_alpha/
+    |-- cli.py
+    |-- selector.py
+    |-- models.py
+    |-- credentials.py
+    |-- dotenv.py
+    |-- helpers.py
+    `-- mojito_loader.py
 ```
 
 ## Prerequisites
@@ -57,6 +60,7 @@ The final ranking selects top `N` symbols (`--final-picks`, default `3`).
 - Python `>= 3.10` (tested on `3.12`)
 - KIS API credentials
 - Network access to KIS OpenAPI endpoints
+- `mojito2` package (installed via `requirements.txt`)
 
 ## Installation
 
@@ -79,6 +83,12 @@ Copy `.env.example` to `.env` and fill credentials:
 
 ```bash
 cp .env.example .env
+```
+
+PowerShell equivalent:
+
+```powershell
+Copy-Item .env.example .env
 ```
 
 Required keys:
@@ -282,11 +292,22 @@ Example JSON path:
 - Rotate keys immediately if exposed
 - Treat output files as potentially sensitive (strategy + symbols)
 
+## GitHub Publish Checklist
+
+- Confirm secrets are only in `.env` (not in tracked files).
+- Confirm generated outputs are ignored (`logs/`, `out/`, `*.mst`, `.cache/`).
+- Run:
+  - `git status`
+  - `python main.py --help`
+- Review staged diff before push:
+  - `git diff --staged`
+
 ## Third-Party Code
 
-- `mojito/` directory is vendored from `mojito2`-related source.
-- Its license is included at `mojito/LICENSE`.
+- This project depends on `mojito2` from PyPI.
+- `systematic_alpha/mojito_loader.py` also supports an optional local `./mojito` override for development; that folder is excluded from git by default.
 
 ## Disclaimer
 
 This repository is for research/automation purposes only and is not financial advice.
+
