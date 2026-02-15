@@ -39,14 +39,31 @@ class DayTradingSelector:
         )
         self.today_kst = datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y%m%d")
         self._daily_cache: Dict[str, Optional[PrevDayStats]] = {}
+        self._price_cache: Dict[str, Optional[Dict[str, Any]]] = {}
 
     def load_universe(self) -> Tuple[List[str], Dict[str, str]]:
         if self.config.universe_file:
             universe_path = Path(self.config.universe_file)
             if not universe_path.exists():
                 raise FileNotFoundError(f"Universe file not found: {universe_path}")
-            codes = parse_universe_file(universe_path)
-            return codes[: self.config.max_symbols_scan], {}
+            codes, file_names = parse_universe_file(universe_path)
+            codes = codes[: self.config.max_symbols_scan]
+            names = {code: file_names.get(code, "") for code in codes if file_names.get(code)}
+
+            # Fill missing names from symbol master if available.
+            missing_codes = [code for code in codes if code not in names]
+            if missing_codes:
+                try:
+                    symbols_df = self.broker.fetch_symbols()
+                    max_count = len(symbols_df.index) if hasattr(symbols_df, "index") else 20000
+                    _, all_names = extract_codes_and_names_from_df(symbols_df, max_count=max_count)
+                    for code in missing_codes:
+                        if all_names.get(code):
+                            names[code] = all_names[code]
+                except Exception:
+                    pass
+
+            return codes, names
 
         symbols_df = self.broker.fetch_symbols()
         return extract_codes_and_names_from_df(symbols_df, self.config.max_symbols_scan)
@@ -112,14 +129,19 @@ class DayTradingSelector:
         self._daily_cache[code] = stats
         return stats
 
-    def fetch_price_snapshot(self, code: str) -> Optional[Dict[str, Optional[float]]]:
+    def fetch_price_snapshot(self, code: str) -> Optional[Dict[str, Any]]:
+        if code in self._price_cache:
+            return self._price_cache[code]
+
         try:
             resp = self.broker.fetch_price(code)
         except Exception:
+            self._price_cache[code] = None
             return None
 
         output = first_dict(resp if isinstance(resp, dict) else {})
         if not output:
+            self._price_cache[code] = None
             return None
 
         price = to_float(pick_first(output, ("stck_prpr", "stck_clpr", "last")))
@@ -127,23 +149,36 @@ class DayTradingSelector:
         change_pct = to_float(pick_first(output, ("prdy_ctrt", "change_rate", "chg_rt")))
         acml_volume = to_float(pick_first(output, ("acml_vol", "volume")))
         low_price = to_float(pick_first(output, ("stck_lwpr", "low")))
+        stock_name_raw = pick_first(output, ("hts_kor_isnm", "prdt_name", "name", "stck_name"))
+        stock_name = str(stock_name_raw).strip() if stock_name_raw else ""
 
         if price is None:
+            self._price_cache[code] = None
             return None
 
-        return {
+        snapshot = {
             "price": price,
             "open": open_price,
             "change_pct": change_pct,
             "acml_volume": acml_volume,
             "low_price": low_price,
+            "name": stock_name,
         }
+        self._price_cache[code] = snapshot
+        return snapshot
 
-    def build_stage1_candidates(
-        self, codes: List[str], names: Dict[str, str]
+    def _build_candidates_with_thresholds(
+        self,
+        codes: List[str],
+        names: Dict[str, str],
+        min_change_pct: float,
+        min_gap_pct: float,
+        min_prev_turnover: float,
+        limit: int,
     ) -> List[Stage1Candidate]:
         candidates: List[Stage1Candidate] = []
         total = len(codes)
+        progress_every = max(1, self.config.stage1_log_interval)
         for idx, code in enumerate(codes, start=1):
             try:
                 snap = self.fetch_price_snapshot(code)
@@ -156,7 +191,7 @@ class DayTradingSelector:
                 if current_price is None or open_price is None:
                     continue
 
-                if change_pct is not None and abs(change_pct) < self.config.min_change_pct:
+                if change_pct is not None and abs(change_pct) < min_change_pct:
                     continue
 
                 prev = self.fetch_prev_day_stats(code)
@@ -166,20 +201,20 @@ class DayTradingSelector:
                 if change_pct is None:
                     change_pct = ((current_price - prev.prev_close) / prev.prev_close) * 100.0
 
-                if abs(change_pct) < self.config.min_change_pct:
+                if abs(change_pct) < min_change_pct:
                     continue
 
                 gap_pct = ((open_price - prev.prev_close) / prev.prev_close) * 100.0
-                if abs(gap_pct) < self.config.min_gap_pct:
+                if abs(gap_pct) < min_gap_pct:
                     continue
 
-                if prev.prev_turnover < self.config.min_prev_turnover:
+                if prev.prev_turnover < min_prev_turnover:
                     continue
 
                 candidates.append(
                     Stage1Candidate(
                         code=code,
-                        name=names.get(code, ""),
+                        name=names.get(code, "") or str(snap.get("name") or ""),
                         current_price=current_price,
                         open_price=open_price,
                         current_change_pct=change_pct,
@@ -190,9 +225,10 @@ class DayTradingSelector:
                     )
                 )
             finally:
-                if idx % 50 == 0:
+                if idx % progress_every == 0 or idx == total:
+                    pct = (idx / total * 100.0) if total > 0 else 100.0
                     print(
-                        f"[stage1] scanned={idx}/{total}, candidates={len(candidates)}",
+                        f"[stage1] scanned={idx}/{total} ({pct:.1f}%), candidates={len(candidates)}",
                         flush=True,
                     )
                 if self.config.rest_sleep_sec > 0:
@@ -202,7 +238,72 @@ class DayTradingSelector:
             key=lambda c: (c.prev_day_turnover, abs(c.current_change_pct), abs(c.gap_pct)),
             reverse=True,
         )
-        return candidates[: self.config.pre_candidates]
+        return candidates[:limit]
+
+    def build_stage1_candidates(
+        self, codes: List[str], names: Dict[str, str]
+    ) -> List[Stage1Candidate]:
+        return self._build_candidates_with_thresholds(
+            codes=codes,
+            names=names,
+            min_change_pct=self.config.min_change_pct,
+            min_gap_pct=self.config.min_gap_pct,
+            min_prev_turnover=self.config.min_prev_turnover,
+            limit=self.config.pre_candidates,
+        )
+
+    def build_fallback_candidates(
+        self,
+        codes: List[str],
+        names: Dict[str, str],
+        exclude_codes: set[str],
+        needed: int,
+    ) -> List[Stage1Candidate]:
+        if needed <= 0:
+            return []
+
+        fallback_pool_limit = max(self.config.pre_candidates, self.config.final_picks * 10, 50)
+        profiles = [
+            (
+                max(self.config.min_change_pct * 0.7, 0.8),
+                max(self.config.min_gap_pct * 0.7, 0.5),
+                self.config.min_prev_turnover * 0.5,
+            ),
+            (
+                max(self.config.min_change_pct * 0.4, 0.3),
+                max(self.config.min_gap_pct * 0.4, 0.2),
+                self.config.min_prev_turnover * 0.2,
+            ),
+            (0.0, 0.0, 0.0),
+        ]
+
+        selected: List[Stage1Candidate] = []
+        taken = set(exclude_codes)
+        for idx, (chg, gap, turnover) in enumerate(profiles, start=1):
+            print(
+                f"[fallback] profile={idx} min_change={chg:.2f} min_gap={gap:.2f} min_turnover={turnover:.0f}",
+                flush=True,
+            )
+            profile_candidates = self._build_candidates_with_thresholds(
+                codes=codes,
+                names=names,
+                min_change_pct=chg,
+                min_gap_pct=gap,
+                min_prev_turnover=turnover,
+                limit=fallback_pool_limit,
+            )
+            added = 0
+            for candidate in profile_candidates:
+                if candidate.code in taken:
+                    continue
+                selected.append(candidate)
+                taken.add(candidate.code)
+                added += 1
+                if len(selected) >= needed:
+                    return selected
+            print(f"[fallback] profile={idx} added={added}", flush=True)
+
+        return selected
 
     @staticmethod
     def _apply_execution(payload: Dict[str, Any], stats: Dict[str, RealtimeStats]) -> None:
@@ -262,6 +363,7 @@ class DayTradingSelector:
         if not codes or self.config.collect_seconds <= 0:
             return stats, False
 
+        log_interval = max(1, self.config.realtime_log_interval)
         ws = self.mojito.KoreaInvestmentWS(
             self.config.api_key,
             self.config.api_secret,
@@ -270,22 +372,39 @@ class DayTradingSelector:
             user_id=self.config.user_id,
         )
 
+        print(
+            f"[realtime] starting websocket: codes={len(codes)}, duration={self.config.collect_seconds}s, heartbeat={log_interval}s",
+            flush=True,
+        )
         ws.start()
         execution_events = 0
         orderbook_events = 0
+        first_exec_logged = False
+        first_orderbook_logged = False
         started = time.time()
         deadline = started + self.config.collect_seconds
-        next_log = started + 60
+        next_log = started + log_interval
 
         try:
             while time.time() < deadline:
                 if time.time() >= next_log:
                     remain = max(int(deadline - time.time()), 0)
+                    exec_symbols = sum(1 for ref in stats.values() if ref.got_execution)
+                    ob_symbols = sum(1 for ref in stats.values() if ref.got_orderbook)
+                    queue_size: str = "n/a"
+                    try:
+                        queue_size = str(ws.queue.qsize())
+                    except Exception:
+                        pass
                     print(
-                        f"[realtime] remain={remain}s, exec_events={execution_events}, orderbook_events={orderbook_events}",
+                        "[realtime] "
+                        f"remain={remain}s, "
+                        f"exec_events={execution_events}, orderbook_events={orderbook_events}, "
+                        f"exec_symbols={exec_symbols}/{len(codes)}, orderbook_symbols={ob_symbols}/{len(codes)}, "
+                        f"queue={queue_size}",
                         flush=True,
                     )
-                    next_log += 60
+                    next_log += log_interval
 
                 try:
                     event = ws.queue.get(timeout=1.0)
@@ -304,9 +423,15 @@ class DayTradingSelector:
                 if 46 <= values_len < 55:
                     self._apply_execution(payload, stats)
                     execution_events += 1
+                    if not first_exec_logged and execution_events > 0:
+                        print("[realtime] first execution tick received.", flush=True)
+                        first_exec_logged = True
                 elif values_len >= 55:
                     self._apply_orderbook(payload, stats)
                     orderbook_events += 1
+                    if not first_orderbook_logged and orderbook_events > 0:
+                        print("[realtime] first orderbook tick received.", flush=True)
+                        first_orderbook_logged = True
         finally:
             try:
                 ws.terminate()
@@ -315,6 +440,15 @@ class DayTradingSelector:
                     ws.join(timeout=3)
                 except Exception:
                     pass
+
+        exec_symbols = sum(1 for ref in stats.values() if ref.got_execution)
+        ob_symbols = sum(1 for ref in stats.values() if ref.got_orderbook)
+        print(
+            "[realtime] finished: "
+            f"exec_events={execution_events}, orderbook_events={orderbook_events}, "
+            f"exec_symbols={exec_symbols}/{len(codes)}, orderbook_symbols={ob_symbols}/{len(codes)}",
+            flush=True,
+        )
 
         return stats, execution_events > 0
 

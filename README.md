@@ -12,8 +12,11 @@ This project is a CLI app (no UI). It reads secrets from `.env` and prints top p
 - Two-stage filtering
   - Stage 1: daily/price snapshot filters
   - Stage 2: realtime metrics (strength, VWAP, bid/ask ratio, volume ratio)
+- Fallback fill rule: if stage1 candidates are fewer than `--final-picks`, thresholds are relaxed step-by-step to fill missing slots.
 - Configurable thresholds via CLI arguments or environment variables
 - JSON output export for downstream automation
+- Telegram notifications for retry/failure/success status (optional)
+- Live progress/heartbeat logs during scan and realtime collection
 - Local `.env` loader (no external dotenv dependency)
 
 ## Strategy Summary
@@ -86,7 +89,32 @@ Required keys:
 Optional:
 - `KIS_USER_ID`
 - `KIS_MOCK` (`0` or `1`)
+- Telegram variables (`TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, etc.)
 - strategy/runtime override variables listed in `.env.example`
+  - monitoring-related: `STAGE1_LOG_INTERVAL`, `REALTIME_LOG_INTERVAL`
+
+### Telegram notifications (optional)
+
+If you want retry/failure/success alerts in Telegram:
+
+1. Create a bot in Telegram (`@BotFather`) and get bot token.
+2. Open chat with that bot once (send any message).
+3. Get your `chat_id` from bot updates.
+4. Add values to `.env`:
+
+```env
+TELEGRAM_ENABLED=1
+TELEGRAM_BOT_TOKEN=<your_bot_token>   # no leading "bot"
+TELEGRAM_CHAT_ID=<your_chat_id>
+# optional:
+# TELEGRAM_THREAD_ID=<topic_thread_id>
+# TELEGRAM_DISABLE_NOTIFICATION=1
+```
+
+When configured, `scripts/run_daily.ps1` sends:
+- retry notifications with short log tail
+- final failure notification with last error tail
+- final success notification with top picks summary + output json path
 
 ## Run
 
@@ -110,6 +138,15 @@ See all options:
 python main.py --help
 ```
 
+### Universe file format (`--universe-file`)
+
+Supported line formats:
+- `005930`
+- `005930,SAMSUNG_ELEC`
+- `005930 SAMSUNG_ELEC`
+
+If name is omitted, the app tries to fill it from KIS symbol master automatically.
+
 ## Windows Auto Run at 09:00 (Task Scheduler)
 
 You do not need a 24/7 loop process.  
@@ -129,6 +166,9 @@ Default behavior:
 - schedule: weekdays only (Mon-Fri)
 - runner: `scripts/run_daily.ps1`
 - python: `C:\Users\heesu\anaconda3\envs\systematic-alpha\python.exe`
+- startup delay: `20 sec` (to avoid exact open-time mismatch)
+- internal retries: up to `4` attempts (`30s`, backoff `x2`, max `180s`)
+- task-level restart: up to `2` restarts within `10 min`
 
 Custom time/task name example:
 
@@ -136,18 +176,24 @@ Custom time/task name example:
 powershell -ExecutionPolicy Bypass -File .\scripts\register_task.ps1 -TaskName "SystematicAlpha_Open" -At "09:00"
 ```
 
-### 2) Run once now (manual test)
+### 2) Verify task registration
+
+```powershell
+Get-ScheduledTask -TaskName "SystematicAlpha_0900"
+```
+
+### 3) Run once now (manual test)
 
 ```powershell
 Start-ScheduledTask -TaskName "SystematicAlpha_0900"
 ```
 
-### 3) Check outputs
+### 4) Check outputs
 
 - logs: `logs/`
 - json results: `out/`
 
-### 4) Remove task
+### 5) Remove task
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\remove_task.ps1
@@ -158,6 +204,30 @@ Notes:
 - `remove_task.ps1` is a manual command and works immediately when you run it (not tied to 09:00).
 - If the PC is sleeping at 09:00, the scheduled run may be delayed depending on OS power/task settings.
 - `scripts/run_daily.ps1` clears proxy env variables and uses project-local cache path for `mojito` token stability.
+- `scripts/run_daily.ps1` reads Telegram settings from `.env` and sends notifications automatically when configured.
+- If token issuance hits rate-limit (`EGW00133`), retry wait is automatically expanded to `65 sec`.
+
+### Reliability knobs (`scripts/run_daily.ps1`)
+
+You can tune retry behavior manually:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\run_daily.ps1 `
+  -StartDelaySeconds 20 `
+  -MaxAttempts 4 `
+  -RetryDelaySeconds 30 `
+  -RetryBackoffMultiplier 2 `
+  -MaxRetryDelaySeconds 180 `
+  -NotifyTailLines 20 `
+  -NotifyStart
+```
+
+Execution monitor behavior:
+- `run_daily.ps1` now streams Python output in real time (no end-of-run dump).
+- each attempt prints start time, command line, live log file path, and elapsed seconds.
+- startup/retry waiting now prints elapsed/remaining seconds every second.
+- stage1 scan prints progress every `STAGE1_LOG_INTERVAL` symbols (default `20`).
+- realtime collection prints heartbeat every `REALTIME_LOG_INTERVAL` seconds (default `10`).
 
 ## Smoke Run (off-market quick check)
 

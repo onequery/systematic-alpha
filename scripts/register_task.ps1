@@ -4,7 +4,12 @@ param(
     [string]$At = "09:00",
     [string]$RunScriptPath = "",
     [string]$PythonExe = "C:\Users\heesu\anaconda3\envs\systematic-alpha\python.exe",
-    [switch]$WeekdaysOnly = $true
+    [switch]$WeekdaysOnly = $true,
+    [int]$StartDelaySeconds = 20,
+    [int]$MaxAttempts = 4,
+    [int]$RetryDelaySeconds = 30,
+    [int]$RetryBackoffMultiplier = 2,
+    [int]$MaxRetryDelaySeconds = 180
 )
 
 $ErrorActionPreference = "Stop"
@@ -27,7 +32,7 @@ $minute = [int]$parts[1]
 $atTime = (Get-Date).Date.AddHours($hour).AddMinutes($minute)
 
 $psExe = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
-$actionArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$RunScriptPath`" -PythonExe `"$PythonExe`""
+$actionArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$RunScriptPath`" -PythonExe `"$PythonExe`" -StartDelaySeconds $StartDelaySeconds -MaxAttempts $MaxAttempts -RetryDelaySeconds $RetryDelaySeconds -RetryBackoffMultiplier $RetryBackoffMultiplier -MaxRetryDelaySeconds $MaxRetryDelaySeconds"
 
 $action = New-ScheduledTaskAction -Execute $psExe -Argument $actionArgs
 
@@ -41,7 +46,9 @@ $settings = New-ScheduledTaskSettingsSet `
     -StartWhenAvailable `
     -WakeToRun `
     -AllowStartIfOnBatteries `
-    -DontStopIfGoingOnBatteries
+    -DontStopIfGoingOnBatteries `
+    -RestartCount 2 `
+    -RestartInterval (New-TimeSpan -Minutes 10)
 
 $principal = New-ScheduledTaskPrincipal `
     -UserId "$env:USERDOMAIN\$env:USERNAME" `
@@ -60,6 +67,7 @@ if ($WeekdaysOnly) {
 } else {
     Write-Output "Schedule: Daily"
 }
+Write-Output "Retry config: start_delay=${StartDelaySeconds}s, max_attempts=$MaxAttempts, retry_delay=${RetryDelaySeconds}s, backoff=x$RetryBackoffMultiplier, max_retry_delay=${MaxRetryDelaySeconds}s"
 Write-Output "Command: $psExe $actionArgs"
 Write-Output ""
 Write-Output "Check task:"

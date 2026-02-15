@@ -27,6 +27,8 @@ class StrategyConfig:
     min_maintain_ratio: float
     min_strength_samples: int
     min_bid_ask_samples: int
+    stage1_log_interval: int
+    realtime_log_interval: int
     output_json_path: Optional[str]
 
 

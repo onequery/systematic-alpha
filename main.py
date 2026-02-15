@@ -100,6 +100,18 @@ def parse_args() -> argparse.Namespace:
         help="Small delay between REST calls to reduce burst rate.",
     )
     parser.add_argument(
+        "--stage1-log-interval",
+        type=int,
+        default=env_int("STAGE1_LOG_INTERVAL", 20),
+        help="Print stage1 scan progress every N symbols.",
+    )
+    parser.add_argument(
+        "--realtime-log-interval",
+        type=int,
+        default=env_int("REALTIME_LOG_INTERVAL", 10),
+        help="Print realtime collection heartbeat every N seconds.",
+    )
+    parser.add_argument(
         "--mock",
         action="store_true",
         default=os.getenv("KIS_MOCK", "0") == "1",
@@ -145,6 +157,8 @@ def build_config(args: argparse.Namespace) -> StrategyConfig:
         min_maintain_ratio=args.min_maintain_ratio,
         min_strength_samples=3,
         min_bid_ask_samples=3,
+        stage1_log_interval=max(1, args.stage1_log_interval),
+        realtime_log_interval=max(1, args.realtime_log_interval),
         output_json_path=args.output_json,
     )
 

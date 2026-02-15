@@ -124,16 +124,54 @@ def maintained(
     return hit_ratio >= min_ratio, mean(values), hit_ratio
 
 
-def parse_universe_file(path: Path) -> List[str]:
-    content = path.read_text(encoding="utf-8", errors="ignore")
-    codes = re.findall(r"\b\d{6}\b", content)
-    deduped: List[str] = []
+def parse_universe_file(path: Path) -> Tuple[List[str], Dict[str, str]]:
+    """
+    Parse a universe file.
+
+    Supported line formats:
+    - 005930
+    - 005930,삼성전자
+    - 005930 삼성전자
+    - ...any text containing a 6-digit code (first code is used)
+    """
+    codes: List[str] = []
+    names: Dict[str, str] = {}
     seen = set()
-    for code in codes:
-        if code not in seen:
-            seen.add(code)
-            deduped.append(code)
-    return deduped
+
+    for raw_line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = raw_line.strip().lstrip("\ufeff")
+        if not line or line.startswith("#"):
+            continue
+
+        code = ""
+        name = ""
+
+        match_sep = re.match(r"^\s*(\d{6})\s*[,|\t]\s*(.+?)\s*$", line)
+        if match_sep:
+            code = match_sep.group(1)
+            name = match_sep.group(2).strip()
+        else:
+            match_space = re.match(r"^\s*(\d{6})\s+(.+?)\s*$", line)
+            if match_space:
+                code = match_space.group(1)
+                name = match_space.group(2).strip()
+            else:
+                codes_in_line = re.findall(r"\b\d{6}\b", line)
+                if not codes_in_line:
+                    continue
+                code = codes_in_line[0]
+
+        if code in seen:
+            if name and not names.get(code):
+                names[code] = name
+            continue
+
+        seen.add(code)
+        codes.append(code)
+        if name:
+            names[code] = name
+
+    return codes, names
 
 
 def extract_codes_and_names_from_df(df: Any, max_count: int) -> Tuple[List[str], Dict[str, str]]:
