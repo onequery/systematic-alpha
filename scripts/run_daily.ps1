@@ -1,7 +1,7 @@
 param(
     [string]$ProjectRoot = (Split-Path -Parent $PSScriptRoot),
     [string]$PythonExe = "",
-    [int]$CollectSeconds = 10,
+    [int]$CollectSeconds = 600,
     [int]$FinalPicks = 3,
     [int]$StartDelaySeconds = 5,
     [int]$MaxAttempts = 4,
@@ -70,46 +70,6 @@ function Import-DotEnv {
             Set-Item -Path "Env:$key" -Value $value
         }
     }
-}
-
-function Get-DotEnvValue {
-    param(
-        [string]$Path,
-        [string]$Key
-    )
-
-    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path $Path)) {
-        return $null
-    }
-
-    foreach ($raw in Get-Content -Path $Path -Encoding UTF8) {
-        $line = $raw.Trim()
-        if (-not $line -or $line.StartsWith("#")) {
-            continue
-        }
-        if ($line.StartsWith("export ")) {
-            $line = $line.Substring(7).Trim()
-        }
-        $eqIdx = $line.IndexOf("=")
-        if ($eqIdx -lt 1) {
-            continue
-        }
-        $currentKey = $line.Substring(0, $eqIdx).Trim()
-        if ($currentKey -ne $Key) {
-            continue
-        }
-        $value = $line.Substring($eqIdx + 1).Trim()
-        if ($value.Length -ge 2) {
-            $first = $value[0]
-            $last = $value[$value.Length - 1]
-            if (($first -eq '"' -and $last -eq '"') -or ($first -eq "'" -and $last -eq "'")) {
-                $value = $value.Substring(1, $value.Length - 2)
-            }
-        }
-        return $value
-    }
-
-    return $null
 }
 
 function Truncate-Text {
@@ -307,49 +267,23 @@ if ([string]::IsNullOrWhiteSpace($PythonExe)) {
 
 Set-Location $ProjectRoot
 
-$envPath = Join-Path $ProjectRoot ".env"
-Import-DotEnv -Path $envPath
+Import-DotEnv -Path (Join-Path $ProjectRoot ".env")
 Ensure-Tls12
 
-$tgTokenRaw = Get-DotEnvValue -Path $envPath -Key "TELEGRAM_BOT_TOKEN"
-if ([string]::IsNullOrWhiteSpace($tgTokenRaw)) {
-    $tgTokenRaw = [string]$env:TELEGRAM_BOT_TOKEN
-}
-
-$tgChatRaw = Get-DotEnvValue -Path $envPath -Key "TELEGRAM_CHAT_ID"
-if ([string]::IsNullOrWhiteSpace($tgChatRaw)) {
-    $tgChatRaw = [string]$env:TELEGRAM_CHAT_ID
-}
-
-$tgThreadRaw = Get-DotEnvValue -Path $envPath -Key "TELEGRAM_THREAD_ID"
-if ([string]::IsNullOrWhiteSpace($tgThreadRaw)) {
-    $tgThreadRaw = [string]$env:TELEGRAM_THREAD_ID
-}
-
-$tgDisableRaw = Get-DotEnvValue -Path $envPath -Key "TELEGRAM_DISABLE_NOTIFICATION"
-if ([string]::IsNullOrWhiteSpace($tgDisableRaw)) {
-    $tgDisableRaw = [string]$env:TELEGRAM_DISABLE_NOTIFICATION
-}
-
-$tgEnabledRaw = Get-DotEnvValue -Path $envPath -Key "TELEGRAM_ENABLED"
-if ([string]::IsNullOrWhiteSpace($tgEnabledRaw)) {
-    $tgEnabledRaw = [string]$env:TELEGRAM_ENABLED
-}
-
-$script:TelegramBotToken = Normalize-TelegramToken $tgTokenRaw
-$script:TelegramChatId = [string]$tgChatRaw
-$script:TelegramThreadId = [string]$tgThreadRaw
-$script:TelegramDisableNotification = Test-Truthy $tgDisableRaw
+$script:TelegramBotToken = Normalize-TelegramToken ([string]$env:TELEGRAM_BOT_TOKEN)
+$script:TelegramChatId = [string]$env:TELEGRAM_CHAT_ID
+$script:TelegramThreadId = [string]$env:TELEGRAM_THREAD_ID
+$script:TelegramDisableNotification = Test-Truthy $env:TELEGRAM_DISABLE_NOTIFICATION
 
 $enabledByKeys = -not (
     [string]::IsNullOrWhiteSpace($script:TelegramBotToken) -or
     [string]::IsNullOrWhiteSpace($script:TelegramChatId)
 )
 
-if ([string]::IsNullOrWhiteSpace($tgEnabledRaw)) {
+if ([string]::IsNullOrWhiteSpace($env:TELEGRAM_ENABLED)) {
     $script:TelegramEnabled = $enabledByKeys
 } else {
-    $script:TelegramEnabled = (Test-Truthy $tgEnabledRaw) -and $enabledByKeys
+    $script:TelegramEnabled = (Test-Truthy $env:TELEGRAM_ENABLED) -and $enabledByKeys
 }
 
 if ($script:TelegramEnabled) {
