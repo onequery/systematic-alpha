@@ -112,9 +112,12 @@ TELEGRAM_CHAT_ID=<your_chat_id>
 ```
 
 When configured, `scripts/run_daily.ps1` sends:
+- start notification at run begin (default)
 - retry notifications with short log tail
 - final failure notification with last error tail
 - final success notification with top picks summary + output json path
+
+Note: Telegram keys in `.env` are prioritized over inherited OS environment variables.
 
 ## Run
 
@@ -166,7 +169,7 @@ Default behavior:
 - schedule: weekdays only (Mon-Fri)
 - runner: `scripts/run_daily.ps1`
 - python: `C:\Users\heesu\anaconda3\envs\systematic-alpha\python.exe`
-- startup delay: `20 sec` (to avoid exact open-time mismatch)
+- startup delay: `5 sec` (to avoid exact open-time mismatch)
 - internal retries: up to `4` attempts (`30s`, backoff `x2`, max `180s`)
 - task-level restart: up to `2` restarts within `10 min`
 
@@ -191,6 +194,8 @@ Start-ScheduledTask -TaskName "SystematicAlpha_0900"
 ### 4) Check outputs
 
 - logs: `logs/`
+  - python run log: `logs/daily_YYYYMMDD_HHMMSS_tryN.log`
+  - runner/notification log: `logs/runner_YYYYMMDD_HHMMSS.log`
 - json results: `out/`
 
 ### 5) Remove task
@@ -213,13 +218,18 @@ You can tune retry behavior manually:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\run_daily.ps1 `
-  -StartDelaySeconds 20 `
+  -StartDelaySeconds 5 `
   -MaxAttempts 4 `
   -RetryDelaySeconds 30 `
   -RetryBackoffMultiplier 2 `
   -MaxRetryDelaySeconds 180 `
-  -NotifyTailLines 20 `
-  -NotifyStart
+  -NotifyTailLines 20
+```
+
+To disable start notification for a specific manual run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\run_daily.ps1 -NotifyStart:$false
 ```
 
 Execution monitor behavior:

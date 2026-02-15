@@ -5,7 +5,7 @@ param(
     [string]$RunScriptPath = "",
     [string]$PythonExe = "C:\Users\heesu\anaconda3\envs\systematic-alpha\python.exe",
     [switch]$WeekdaysOnly = $true,
-    [int]$StartDelaySeconds = 20,
+    [int]$StartDelaySeconds = 5,
     [int]$MaxAttempts = 4,
     [int]$RetryDelaySeconds = 30,
     [int]$RetryBackoffMultiplier = 2,

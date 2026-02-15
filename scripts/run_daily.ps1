@@ -1,18 +1,30 @@
 param(
     [string]$ProjectRoot = (Split-Path -Parent $PSScriptRoot),
     [string]$PythonExe = "",
-    [int]$CollectSeconds = 600,
+    [int]$CollectSeconds = 10,
     [int]$FinalPicks = 3,
-    [int]$StartDelaySeconds = 20,
+    [int]$StartDelaySeconds = 5,
     [int]$MaxAttempts = 4,
     [int]$RetryDelaySeconds = 30,
     [int]$RetryBackoffMultiplier = 2,
     [int]$MaxRetryDelaySeconds = 180,
     [int]$NotifyTailLines = 20,
-    [switch]$NotifyStart = $false
+    [switch]$NotifyStart = $true
 )
 
 $ErrorActionPreference = "Stop"
+$script:RunLogFile = $null
+
+function Ensure-Tls12 {
+    try {
+        $current = [Net.ServicePointManager]::SecurityProtocol
+        if (($current -band [Net.SecurityProtocolType]::Tls12) -eq 0) {
+            [Net.ServicePointManager]::SecurityProtocol = $current -bor [Net.SecurityProtocolType]::Tls12
+        }
+    } catch {
+        # Keep silent; runtime will surface HTTPS errors if this fails.
+    }
+}
 
 function Test-Truthy {
     param([string]$Value)
@@ -58,6 +70,46 @@ function Import-DotEnv {
             Set-Item -Path "Env:$key" -Value $value
         }
     }
+}
+
+function Get-DotEnvValue {
+    param(
+        [string]$Path,
+        [string]$Key
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path $Path)) {
+        return $null
+    }
+
+    foreach ($raw in Get-Content -Path $Path -Encoding UTF8) {
+        $line = $raw.Trim()
+        if (-not $line -or $line.StartsWith("#")) {
+            continue
+        }
+        if ($line.StartsWith("export ")) {
+            $line = $line.Substring(7).Trim()
+        }
+        $eqIdx = $line.IndexOf("=")
+        if ($eqIdx -lt 1) {
+            continue
+        }
+        $currentKey = $line.Substring(0, $eqIdx).Trim()
+        if ($currentKey -ne $Key) {
+            continue
+        }
+        $value = $line.Substring($eqIdx + 1).Trim()
+        if ($value.Length -ge 2) {
+            $first = $value[0]
+            $last = $value[$value.Length - 1]
+            if (($first -eq '"' -and $last -eq '"') -or ($first -eq "'" -and $last -eq "'")) {
+                $value = $value.Substring(1, $value.Length - 2)
+            }
+        }
+        return $value
+    }
+
+    return $null
 }
 
 function Truncate-Text {
@@ -141,6 +193,7 @@ function Send-TelegramMessage {
         return
     }
 
+    Ensure-Tls12
     $uri = "https://api.telegram.org/bot$($script:TelegramBotToken)/sendMessage"
     $payload = @{
         chat_id = $script:TelegramChatId
@@ -167,9 +220,9 @@ function Send-TelegramMessage {
         if ($null -ne $resp -and $null -ne $resp.ok -and (-not $resp.ok)) {
             $errCode = $resp.error_code
             $errDesc = $resp.description
-            Write-Warning "[telegram] api error: code=$errCode desc=$errDesc"
+            Write-MonitorLog "[telegram] api error: code=$errCode desc=$errDesc"
             if ($errCode -eq 401) {
-                Write-Warning "[telegram] token unauthorized. disabling telegram notifications for this run."
+                Write-MonitorLog "[telegram] token unauthorized. disabling telegram notifications for this run."
                 $script:TelegramEnabled = $false
             }
         }
@@ -183,11 +236,11 @@ function Send-TelegramMessage {
             $statusCode = $null
         }
         if ($statusCode -eq 401) {
-            Write-Warning "[telegram] send failed: HTTP 401 Unauthorized. check TELEGRAM_BOT_TOKEN (do not include leading 'bot'). disabling telegram notifications for this run."
+            Write-MonitorLog "[telegram] send failed: HTTP 401 Unauthorized. check TELEGRAM_BOT_TOKEN (do not include leading 'bot'). disabling telegram notifications for this run."
             $script:TelegramEnabled = $false
             return
         }
-        Write-Warning "[telegram] send failed: $($_.Exception.Message)"
+        Write-MonitorLog "[telegram] send failed: $($_.Exception.Message)"
     }
 }
 
@@ -197,7 +250,15 @@ function Get-Timestamp {
 
 function Write-MonitorLog {
     param([string]$Message)
-    Write-Output ("[{0}] {1}" -f (Get-Timestamp), $Message)
+    $line = ("[{0}] {1}" -f (Get-Timestamp), $Message)
+    Write-Output $line
+    if (-not [string]::IsNullOrWhiteSpace($script:RunLogFile)) {
+        try {
+            $line | Out-File -FilePath $script:RunLogFile -Encoding UTF8 -Append
+        } catch {
+            # Ignore file logging failures and keep console output alive.
+        }
+    }
 }
 
 function Normalize-TelegramToken {
@@ -246,22 +307,49 @@ if ([string]::IsNullOrWhiteSpace($PythonExe)) {
 
 Set-Location $ProjectRoot
 
-Import-DotEnv -Path (Join-Path $ProjectRoot ".env")
+$envPath = Join-Path $ProjectRoot ".env"
+Import-DotEnv -Path $envPath
+Ensure-Tls12
 
-$script:TelegramBotToken = Normalize-TelegramToken ([string]$env:TELEGRAM_BOT_TOKEN)
-$script:TelegramChatId = [string]$env:TELEGRAM_CHAT_ID
-$script:TelegramThreadId = [string]$env:TELEGRAM_THREAD_ID
-$script:TelegramDisableNotification = Test-Truthy $env:TELEGRAM_DISABLE_NOTIFICATION
+$tgTokenRaw = Get-DotEnvValue -Path $envPath -Key "TELEGRAM_BOT_TOKEN"
+if ([string]::IsNullOrWhiteSpace($tgTokenRaw)) {
+    $tgTokenRaw = [string]$env:TELEGRAM_BOT_TOKEN
+}
+
+$tgChatRaw = Get-DotEnvValue -Path $envPath -Key "TELEGRAM_CHAT_ID"
+if ([string]::IsNullOrWhiteSpace($tgChatRaw)) {
+    $tgChatRaw = [string]$env:TELEGRAM_CHAT_ID
+}
+
+$tgThreadRaw = Get-DotEnvValue -Path $envPath -Key "TELEGRAM_THREAD_ID"
+if ([string]::IsNullOrWhiteSpace($tgThreadRaw)) {
+    $tgThreadRaw = [string]$env:TELEGRAM_THREAD_ID
+}
+
+$tgDisableRaw = Get-DotEnvValue -Path $envPath -Key "TELEGRAM_DISABLE_NOTIFICATION"
+if ([string]::IsNullOrWhiteSpace($tgDisableRaw)) {
+    $tgDisableRaw = [string]$env:TELEGRAM_DISABLE_NOTIFICATION
+}
+
+$tgEnabledRaw = Get-DotEnvValue -Path $envPath -Key "TELEGRAM_ENABLED"
+if ([string]::IsNullOrWhiteSpace($tgEnabledRaw)) {
+    $tgEnabledRaw = [string]$env:TELEGRAM_ENABLED
+}
+
+$script:TelegramBotToken = Normalize-TelegramToken $tgTokenRaw
+$script:TelegramChatId = [string]$tgChatRaw
+$script:TelegramThreadId = [string]$tgThreadRaw
+$script:TelegramDisableNotification = Test-Truthy $tgDisableRaw
 
 $enabledByKeys = -not (
     [string]::IsNullOrWhiteSpace($script:TelegramBotToken) -or
     [string]::IsNullOrWhiteSpace($script:TelegramChatId)
 )
 
-if ([string]::IsNullOrWhiteSpace($env:TELEGRAM_ENABLED)) {
+if ([string]::IsNullOrWhiteSpace($tgEnabledRaw)) {
     $script:TelegramEnabled = $enabledByKeys
 } else {
-    $script:TelegramEnabled = (Test-Truthy $env:TELEGRAM_ENABLED) -and $enabledByKeys
+    $script:TelegramEnabled = (Test-Truthy $tgEnabledRaw) -and $enabledByKeys
 }
 
 if ($script:TelegramEnabled) {
@@ -284,6 +372,7 @@ $null = New-Item -ItemType Directory -Force -Path (Join-Path $ProjectRoot "logs"
 $null = New-Item -ItemType Directory -Force -Path (Join-Path $ProjectRoot "out")
 
 $stamp = Get-Date -Format "yyyyMMdd_HHmmss"
+$script:RunLogFile = Join-Path $ProjectRoot ("logs\runner_{0}.log" -f $stamp)
 $outputJson = Join-Path $ProjectRoot ("out\daily_{0}.json" -f $stamp)
 $baseArgs = @(
     "main.py",
@@ -291,6 +380,8 @@ $baseArgs = @(
     "--final-picks", "$FinalPicks",
     "--output-json", $outputJson
 )
+
+Write-MonitorLog "[run] monitor_log: $script:RunLogFile"
 
 $hostTag = "$env:COMPUTERNAME/$env:USERNAME"
 if ($NotifyStart) {
