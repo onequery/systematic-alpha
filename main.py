@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
+from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from systematic_alpha.cli import run
 from systematic_alpha.credentials import load_credentials
@@ -216,8 +219,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--analytics-dir",
         type=str,
-        default="./out/analytics",
-        help="Directory where long-horizon analytics datasets are accumulated.",
+        default=None,
+        help="Directory where analytics datasets are accumulated. Default: out/YYYYMMDD/{kr|us}/analytics",
     )
     parser.add_argument(
         "--disable-analytics-log",
@@ -235,8 +238,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--overnight-report-path",
         type=str,
-        default="./out/selection_overnight_report.csv",
-        help="CSV path for selected-symbol overnight performance tracking report.",
+        default=None,
+        help="CSV path for overnight performance tracking. Default: out/YYYYMMDD/{kr|us}/selection_overnight_report.csv",
     )
     parser.add_argument(
         "--test-assume-open",
@@ -258,6 +261,11 @@ def build_config(args: argparse.Namespace) -> StrategyConfig:
     api_key, api_secret, acc_no, file_user_id = load_credentials(args.key_file)
     user_id = args.user_id or file_user_id
     market = args.market.strip().upper()
+    market_tag = market.lower()
+    run_date = datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y%m%d")
+    out_base_dir = Path("out") / run_date / market_tag
+    analytics_dir = args.analytics_dir or str(out_base_dir / "analytics")
+    overnight_report_path = args.overnight_report_path or str(out_base_dir / "selection_overnight_report.csv")
     universe_file = args.universe_file
     if market == "US":
         if args.us_universe_file:
@@ -297,9 +305,9 @@ def build_config(args: argparse.Namespace) -> StrategyConfig:
         invalidate_on_low_coverage=args.invalidate_on_low_coverage,
         stage1_log_interval=max(1, args.stage1_log_interval),
         realtime_log_interval=max(1, args.realtime_log_interval),
-        overnight_report_path=args.overnight_report_path,
+        overnight_report_path=overnight_report_path,
         output_json_path=args.output_json,
-        analytics_dir=args.analytics_dir,
+        analytics_dir=analytics_dir,
         enable_analytics_log=args.enable_analytics_log,
         test_assume_open=args.test_assume_open,
     )

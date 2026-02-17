@@ -429,11 +429,15 @@ $marketTag = if ($Market -eq "US") { "us" } else { "kr" }
 
 $logRootDir = Join-Path $ProjectRoot "logs"
 $outRootDir = Join-Path $ProjectRoot "out"
-$runLogDir = Join-Path $logRootDir $runDate
-$runOutDir = Join-Path $outRootDir $runDate
+$runDateDirForLog = Join-Path $logRootDir $runDate
+$runDateDirForOut = Join-Path $outRootDir $runDate
+$runLogDir = Join-Path $runDateDirForLog $marketTag
+$runOutMarketDir = Join-Path $runDateDirForOut $marketTag
+$runResultDir = Join-Path $runOutMarketDir "results"
 
 $null = New-Item -ItemType Directory -Force -Path $runLogDir
-$null = New-Item -ItemType Directory -Force -Path $runOutDir
+$null = New-Item -ItemType Directory -Force -Path $runOutMarketDir
+$null = New-Item -ItemType Directory -Force -Path $runResultDir
 
 $script:RunLogFile = Join-Path $runLogDir ("{0}_daily_{1}.log" -f $marketTag, $stamp)
 
@@ -483,14 +487,14 @@ foreach ($name in @("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "A
 $env:HOME = $ProjectRoot
 $env:USERPROFILE = $ProjectRoot
 
-$outputJson = Join-Path $runOutDir ("{0}_daily_{1}.json" -f $marketTag, $stamp)
+$outputJson = Join-Path $runResultDir ("{0}_daily_{1}.json" -f $marketTag, $stamp)
 $resolvedOvernightReportPath = if ([string]::IsNullOrWhiteSpace($OvernightReportPath)) {
-    Join-Path $outRootDir "selection_overnight_report.csv"
+    Join-Path $runOutMarketDir "selection_overnight_report.csv"
 } else {
     $OvernightReportPath
 }
 $resolvedAnalyticsDir = if ([string]::IsNullOrWhiteSpace($AnalyticsDir)) {
-    Join-Path $outRootDir "analytics"
+    Join-Path $runOutMarketDir "analytics"
 } else {
     $AnalyticsDir
 }
@@ -580,7 +584,9 @@ if ($Market -eq "US" -and $RequireUsOpen -and -not $AssumeOpenForTest) {
     }
 
     $usEtDate = $state.now_et.ToString("yyyyMMdd")
-    $usDayLock = Join-Path $outRootDir ("us_run_lock_{0}.txt" -f $usEtDate)
+    $runtimeDir = Join-Path $runOutMarketDir "runtime"
+    $null = New-Item -ItemType Directory -Force -Path $runtimeDir
+    $usDayLock = Join-Path $runtimeDir ("us_run_lock_{0}.txt" -f $usEtDate)
     if (Test-Path $usDayLock) {
         Write-MonitorLog "[market-check] US daily lock exists ($usDayLock). skipping duplicate run."
         if ($script:TelegramEnabled) {

@@ -179,68 +179,100 @@ def _resolve_report_status(metrics: Dict[str, Optional[float | str]]) -> str:
     return "pending"
 
 
-def update_pending_overnight_report(selector: DayTradingSelector, report_path: Optional[str]) -> None:
+def _discover_market_report_paths(report_path: Optional[str], market: str) -> List[Path]:
     if not report_path:
-        return
-    path = Path(report_path)
-    if not path.exists():
+        return []
+    current_path = Path(report_path)
+    market_tag = market.strip().lower()
+    if not market_tag:
+        return [current_path]
+
+    # Expected layout: out/YYYYMMDD/{kr|us}/selection_overnight_report.csv
+    # If layout differs, fallback to current path only.
+    try:
+        out_root = current_path.parent.parent.parent
+        if out_root.exists():
+            discovered = sorted(out_root.glob(f"*/{market_tag}/selection_overnight_report.csv"))
+            if current_path not in discovered:
+                discovered.append(current_path)
+            return sorted(set(discovered))
+    except Exception:
+        pass
+    return [current_path]
+
+
+def update_pending_overnight_reports(selector: Any, report_path: Optional[str], market: str) -> None:
+    report_paths = _discover_market_report_paths(report_path, market)
+    if not report_paths:
         return
 
-    rows = _read_report_rows(path)
-    if not rows:
-        return
-
-    changed = False
-    updated_count = 0
+    total_changed_rows = 0
+    updated_files = 0
     now_iso = datetime.now(ZoneInfo("Asia/Seoul")).isoformat()
 
-    for row in rows:
-        if row.get("status") == "complete":
+    for path in report_paths:
+        if not path.exists():
             continue
-        code = row.get("code", "").strip()
-        selection_date = row.get("selection_date", "").strip()
-        entry_price = _parse_float(row.get("entry_price", ""))
-        if not code or not selection_date:
+        rows = _read_report_rows(path)
+        if not rows:
             continue
 
-        metrics = selector.build_overnight_report_metrics(code, selection_date, entry_price)
-        new_status = _resolve_report_status(metrics)
+        changed = False
+        updated_count = 0
+        for row in rows:
+            if row.get("status") == "complete":
+                continue
+            code = row.get("code", "").strip()
+            selection_date = row.get("selection_date", "").strip()
+            entry_price = _parse_float(row.get("entry_price", ""))
+            if not code or not selection_date:
+                continue
 
-        before = (
-            row.get("selection_close", ""),
-            row.get("next_open", ""),
-            row.get("intraday_return_pct", ""),
-            row.get("overnight_return_pct", ""),
-            row.get("total_return_to_next_open_pct", ""),
-            row.get("status", ""),
+            metrics = selector.build_overnight_report_metrics(code, selection_date, entry_price)
+            new_status = _resolve_report_status(metrics)
+
+            before = (
+                row.get("selection_close", ""),
+                row.get("next_open", ""),
+                row.get("intraday_return_pct", ""),
+                row.get("overnight_return_pct", ""),
+                row.get("total_return_to_next_open_pct", ""),
+                row.get("status", ""),
+            )
+
+            row["selection_close"] = _fmt_csv_float(metrics.get("selection_close"))  # type: ignore[arg-type]
+            row["next_open"] = _fmt_csv_float(metrics.get("next_open"))  # type: ignore[arg-type]
+            row["next_open_date"] = str(metrics.get("next_open_date") or "")
+            row["intraday_return_pct"] = _fmt_csv_float(metrics.get("intraday_return_pct"))  # type: ignore[arg-type]
+            row["overnight_return_pct"] = _fmt_csv_float(metrics.get("overnight_return_pct"))  # type: ignore[arg-type]
+            row["total_return_to_next_open_pct"] = _fmt_csv_float(
+                metrics.get("total_return_to_next_open_pct")  # type: ignore[arg-type]
+            )
+            row["status"] = new_status
+            row["last_updated_at"] = now_iso
+
+            after = (
+                row.get("selection_close", ""),
+                row.get("next_open", ""),
+                row.get("intraday_return_pct", ""),
+                row.get("overnight_return_pct", ""),
+                row.get("total_return_to_next_open_pct", ""),
+                row.get("status", ""),
+            )
+            if before != after:
+                changed = True
+                updated_count += 1
+
+        if changed:
+            _write_report_rows(path, rows)
+            total_changed_rows += updated_count
+            updated_files += 1
+
+    if total_changed_rows > 0:
+        log(
+            f"[overnight-report] updated pending rows: {total_changed_rows} "
+            f"(files={updated_files})"
         )
-
-        row["selection_close"] = _fmt_csv_float(metrics.get("selection_close"))  # type: ignore[arg-type]
-        row["next_open"] = _fmt_csv_float(metrics.get("next_open"))  # type: ignore[arg-type]
-        row["next_open_date"] = str(metrics.get("next_open_date") or "")
-        row["intraday_return_pct"] = _fmt_csv_float(metrics.get("intraday_return_pct"))  # type: ignore[arg-type]
-        row["overnight_return_pct"] = _fmt_csv_float(metrics.get("overnight_return_pct"))  # type: ignore[arg-type]
-        row["total_return_to_next_open_pct"] = _fmt_csv_float(
-            metrics.get("total_return_to_next_open_pct")  # type: ignore[arg-type]
-        )
-        row["status"] = new_status
-        row["last_updated_at"] = now_iso
-
-        after = (
-            row.get("selection_close", ""),
-            row.get("next_open", ""),
-            row.get("intraday_return_pct", ""),
-            row.get("overnight_return_pct", ""),
-            row.get("total_return_to_next_open_pct", ""),
-            row.get("status", ""),
-        )
-        if before != after:
-            changed = True
-            updated_count += 1
-
-    if changed:
-        _write_report_rows(path, rows)
-        log(f"[overnight-report] updated pending rows: {updated_count}")
 
 
 def append_selection_report_rows(
@@ -288,37 +320,6 @@ def append_selection_report_rows(
 
     _write_report_rows(path, rows)
     log(f"[overnight-report] appended rows: {len(final)} -> {path}")
-
-
-def sync_overnight_report_daily_partitions(
-    report_path: Optional[str],
-    analytics_dir: Optional[str],
-) -> None:
-    if not report_path or not analytics_dir:
-        return
-
-    source_path = Path(report_path)
-    if not source_path.exists():
-        return
-
-    rows = _read_report_rows(source_path)
-    if not rows:
-        return
-
-    base_dir = Path(analytics_dir)
-    all_path = base_dir / "all" / "selection_overnight_report.csv"
-    _write_report_rows(all_path, rows)
-
-    grouped: Dict[str, List[Dict[str, str]]] = {}
-    for row in rows:
-        key = row.get("selection_date", "").strip()
-        if not key or len(key) != 8 or not key.isdigit():
-            key = "unknown"
-        grouped.setdefault(key, []).append(row)
-
-    for day, day_rows in grouped.items():
-        daily_path = base_dir / "daily" / day / "selection_overnight_report.csv"
-        _write_report_rows(daily_path, day_rows)
 
 
 def build_assume_open_stage1_candidates(
@@ -514,8 +515,7 @@ def run(config: StrategyConfig) -> None:
         except Exception as exc:
             log(f"[analytics] persist failed: {exc}")
 
-    update_pending_overnight_report(selector, config.overnight_report_path)
-    sync_overnight_report_daily_partitions(config.overnight_report_path, config.analytics_dir)
+    update_pending_overnight_reports(selector, config.overnight_report_path, config.market)
 
     stage_started = perf_counter()
     log("[1/4] Loading universe...")
@@ -678,7 +678,6 @@ def run(config: StrategyConfig) -> None:
         ranked=ranked,
     )
     append_selection_report_rows(selector, config.overnight_report_path, final, decision_at)
-    sync_overnight_report_daily_partitions(config.overnight_report_path, config.analytics_dir)
     persist_analytics_snapshot(decision_at=decision_at, invalid_reason=None)
     print("\nTop codes:", ", ".join(item.code for item in final) if final else "(none)")
     log(f"Run finished (total elapsed {perf_counter() - total_started:.1f}s)")

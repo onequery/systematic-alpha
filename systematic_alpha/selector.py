@@ -46,41 +46,75 @@ class DayTradingSelector:
         self.last_stage1_scan: List[Dict[str, Any]] = []
         self._load_prev_stats_cache()
 
-    def _liquidity_cache_path(self) -> Path:
+    def _session_root_dir(self) -> Path:
+        if self.config.output_json_path:
+            out_path = Path(self.config.output_json_path)
+            if out_path.parent.name.lower() == "results":
+                return out_path.parent.parent
+            return out_path.parent
+        if self.config.analytics_dir:
+            analytics_path = Path(self.config.analytics_dir)
+            if analytics_path.name.lower() == "analytics":
+                return analytics_path.parent
+            return analytics_path
+        return Path("out") / self.today_kst / "kr"
+
+    def _cache_dir(self) -> Path:
+        return self._session_root_dir() / "cache"
+
+    def _legacy_liquidity_cache_path(self) -> Path:
         return Path("out") / f"kr_universe_liquidity_{self.today_kst}.csv"
 
-    def _prev_stats_cache_path(self) -> Path:
+    def _legacy_prev_stats_cache_path(self) -> Path:
         return Path("out") / f"kr_prev_day_stats_{self.today_kst}.csv"
 
+    def _liquidity_cache_path(self) -> Path:
+        return self._cache_dir() / "kr_universe_liquidity.csv"
+
+    def _prev_stats_cache_path(self) -> Path:
+        return self._cache_dir() / "kr_prev_day_stats.csv"
+
+    def _prev_stats_cache_candidates(self) -> List[Path]:
+        paths = [self._prev_stats_cache_path(), self._legacy_prev_stats_cache_path()]
+        unique: List[Path] = []
+        seen = set()
+        for path in paths:
+            key = str(path.resolve()) if path.exists() else str(path)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(path)
+        return unique
+
     def _load_prev_stats_cache(self) -> None:
-        path = self._prev_stats_cache_path()
-        if not path.exists():
-            return
-        try:
-            with path.open("r", encoding="utf-8", newline="") as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    code = normalize_code(row.get("code", "")).strip()
-                    if len(code) != 6 or not code.isdigit():
-                        continue
-                    prev_close = to_float(row.get("prev_close"))
-                    prev_volume = to_float(row.get("prev_volume"))
-                    prev_turnover = to_float(row.get("prev_turnover"))
-                    prev_day_change_pct = to_float(row.get("prev_day_change_pct"))
-                    if prev_close is None or prev_close <= 0:
-                        continue
-                    if prev_volume is None:
-                        prev_volume = 0.0
-                    if prev_turnover is None:
-                        prev_turnover = prev_close * prev_volume
-                    self._daily_cache[code] = PrevDayStats(
-                        prev_close=prev_close,
-                        prev_volume=prev_volume,
-                        prev_turnover=prev_turnover,
-                        prev_day_change_pct=prev_day_change_pct,
-                    )
-        except Exception:
-            return
+        for path in self._prev_stats_cache_candidates():
+            if not path.exists():
+                continue
+            try:
+                with path.open("r", encoding="utf-8", newline="") as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        code = normalize_code(row.get("code", "")).strip()
+                        if len(code) != 6 or not code.isdigit():
+                            continue
+                        prev_close = to_float(row.get("prev_close"))
+                        prev_volume = to_float(row.get("prev_volume"))
+                        prev_turnover = to_float(row.get("prev_turnover"))
+                        prev_day_change_pct = to_float(row.get("prev_day_change_pct"))
+                        if prev_close is None or prev_close <= 0:
+                            continue
+                        if prev_volume is None:
+                            prev_volume = 0.0
+                        if prev_turnover is None:
+                            prev_turnover = prev_close * prev_volume
+                        self._daily_cache[code] = PrevDayStats(
+                            prev_close=prev_close,
+                            prev_volume=prev_volume,
+                            prev_turnover=prev_turnover,
+                            prev_day_change_pct=prev_day_change_pct,
+                        )
+            except Exception:
+                continue
 
     def _write_prev_stats_cache(self, codes: List[str]) -> None:
         path = self._prev_stats_cache_path()
@@ -168,6 +202,10 @@ class DayTradingSelector:
     def _build_objective_universe(self) -> Tuple[List[str], Dict[str, str]]:
         cache_path = self._liquidity_cache_path()
         cached_codes, cached_names = self._read_liquidity_cache(cache_path)
+        if not cached_codes:
+            legacy_path = self._legacy_liquidity_cache_path()
+            if legacy_path.exists():
+                cached_codes, cached_names = self._read_liquidity_cache(legacy_path)
         if cached_codes:
             target = min(self.config.kr_universe_size, len(cached_codes))
             selected_codes = cached_codes[:target]

@@ -54,6 +54,7 @@ class USDayTradingSelector:
             mock=config.mock,
         )
         self.today_us = datetime.now(ZoneInfo("America/New_York")).strftime("%Y%m%d")
+        self.today_kst = datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y%m%d")
         self._daily_cache: Dict[str, Optional[PrevDayStats]] = {}
         self._price_cache: Dict[str, Optional[Dict[str, Any]]] = {}
         self._detail_cache: Dict[str, Optional[Dict[str, Any]]] = {}
@@ -62,41 +63,75 @@ class USDayTradingSelector:
         self.last_stage1_scan: List[Dict[str, Any]] = []
         self._load_prev_stats_cache()
 
-    def _sp500_cache_path(self) -> Path:
+    def _session_root_dir(self) -> Path:
+        if self.config.output_json_path:
+            out_path = Path(self.config.output_json_path)
+            if out_path.parent.name.lower() == "results":
+                return out_path.parent.parent
+            return out_path.parent
+        if self.config.analytics_dir:
+            analytics_path = Path(self.config.analytics_dir)
+            if analytics_path.name.lower() == "analytics":
+                return analytics_path.parent
+            return analytics_path
+        return Path("out") / self.today_kst / "us"
+
+    def _cache_dir(self) -> Path:
+        return self._session_root_dir() / "cache"
+
+    def _legacy_sp500_cache_path(self) -> Path:
         return Path("out") / f"us_sp500_constituents_{self.today_us}.csv"
 
-    def _prev_stats_cache_path(self) -> Path:
+    def _legacy_prev_stats_cache_path(self) -> Path:
         return Path("out") / f"us_prev_day_stats_{self.today_us}.csv"
 
+    def _sp500_cache_path(self) -> Path:
+        return self._cache_dir() / "us_sp500_constituents.csv"
+
+    def _prev_stats_cache_path(self) -> Path:
+        return self._cache_dir() / "us_prev_day_stats.csv"
+
+    def _prev_stats_cache_candidates(self) -> List[Path]:
+        paths = [self._prev_stats_cache_path(), self._legacy_prev_stats_cache_path()]
+        unique: List[Path] = []
+        seen = set()
+        for path in paths:
+            key = str(path.resolve()) if path.exists() else str(path)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(path)
+        return unique
+
     def _load_prev_stats_cache(self) -> None:
-        path = self._prev_stats_cache_path()
-        if not path.exists():
-            return
-        try:
-            with path.open("r", encoding="utf-8", newline="") as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    symbol = normalize_symbol(row.get("code", ""))
-                    if not symbol:
-                        continue
-                    prev_close = to_float(row.get("prev_close"))
-                    prev_volume = to_float(row.get("prev_volume"))
-                    prev_turnover = to_float(row.get("prev_turnover"))
-                    prev_day_change_pct = to_float(row.get("prev_day_change_pct"))
-                    if prev_close is None or prev_close <= 0:
-                        continue
-                    if prev_volume is None:
-                        prev_volume = 0.0
-                    if prev_turnover is None:
-                        prev_turnover = prev_close * prev_volume
-                    self._daily_cache[symbol] = PrevDayStats(
-                        prev_close=prev_close,
-                        prev_volume=prev_volume,
-                        prev_turnover=prev_turnover,
-                        prev_day_change_pct=prev_day_change_pct,
-                    )
-        except Exception:
-            return
+        for path in self._prev_stats_cache_candidates():
+            if not path.exists():
+                continue
+            try:
+                with path.open("r", encoding="utf-8", newline="") as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        symbol = normalize_symbol(row.get("code", ""))
+                        if not symbol:
+                            continue
+                        prev_close = to_float(row.get("prev_close"))
+                        prev_volume = to_float(row.get("prev_volume"))
+                        prev_turnover = to_float(row.get("prev_turnover"))
+                        prev_day_change_pct = to_float(row.get("prev_day_change_pct"))
+                        if prev_close is None or prev_close <= 0:
+                            continue
+                        if prev_volume is None:
+                            prev_volume = 0.0
+                        if prev_turnover is None:
+                            prev_turnover = prev_close * prev_volume
+                        self._daily_cache[symbol] = PrevDayStats(
+                            prev_close=prev_close,
+                            prev_volume=prev_volume,
+                            prev_turnover=prev_turnover,
+                            prev_day_change_pct=prev_day_change_pct,
+                        )
+            except Exception:
+                continue
 
     def _write_prev_stats_cache(self, codes: List[str]) -> None:
         path = self._prev_stats_cache_path()
@@ -246,6 +281,10 @@ class USDayTradingSelector:
 
         cache_path = self._sp500_cache_path()
         cached_symbols, cached_names = self._read_sp500_csv(cache_path)
+        if not cached_symbols:
+            legacy_path = self._legacy_sp500_cache_path()
+            if legacy_path.exists():
+                cached_symbols, cached_names = self._read_sp500_csv(legacy_path)
         if cached_symbols:
             source = f"cache:{cache_path}"
             symbols = cached_symbols

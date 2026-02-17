@@ -28,7 +28,8 @@ $nowKst = [System.TimeZoneInfo]::ConvertTime((Get-Date), $kstTz)
 $runDate = $nowKst.ToString("yyyyMMdd")
 $stamp = $nowKst.ToString("yyyyMMdd_HHmmss")
 
-$logDir = Join-Path (Join-Path $ProjectRoot "logs") $runDate
+$logDateDir = Join-Path (Join-Path $ProjectRoot "logs") $runDate
+$logDir = Join-Path $logDateDir "kr"
 $null = New-Item -ItemType Directory -Force -Path $logDir
 $null = New-Item -ItemType Directory -Force -Path (Join-Path $ProjectRoot "out")
 
