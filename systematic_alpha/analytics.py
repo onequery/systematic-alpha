@@ -243,7 +243,12 @@ def persist_run_analytics(
         return {}
 
     base_dir = Path(config.analytics_dir or "./out/analytics")
-    runs_dir = base_dir / "runs"
+    decision_day = decision_at.strftime("%Y%m%d")
+    all_dir = base_dir / "all"
+    daily_dir = base_dir / "daily" / decision_day
+    runs_dir = base_dir / "runs" / decision_day
+    all_dir.mkdir(parents=True, exist_ok=True)
+    daily_dir.mkdir(parents=True, exist_ok=True)
     runs_dir.mkdir(parents=True, exist_ok=True)
 
     run_id = f"{config.market.lower()}_{decision_at.strftime('%Y%m%d_%H%M%S_%f')}"
@@ -295,8 +300,10 @@ def persist_run_analytics(
         "total_sec": timings_sec.get("total_sec", 0.0),
         "final_codes": "|".join(item.code for item in final),
     }
-    run_summary_path = base_dir / "run_summary.csv"
-    _append_csv_rows(run_summary_path, RUN_SUMMARY_FIELDS, [summary_row])
+    all_run_summary_path = all_dir / "run_summary.csv"
+    daily_run_summary_path = daily_dir / "run_summary.csv"
+    _append_csv_rows(all_run_summary_path, RUN_SUMMARY_FIELDS, [summary_row])
+    _append_csv_rows(daily_run_summary_path, RUN_SUMMARY_FIELDS, [summary_row])
 
     stage1_scan_rows_raw = getattr(selector, "last_stage1_scan", []) or []
     stage1_scan_rows: List[Dict[str, Any]] = []
@@ -327,8 +334,10 @@ def persist_run_analytics(
                 "long_only": _bool_to_int(row.get("long_only")),
             }
         )
-    stage1_scan_path = base_dir / "stage1_scan.csv"
-    _append_csv_rows(stage1_scan_path, STAGE1_SCAN_FIELDS, stage1_scan_rows)
+    all_stage1_scan_path = all_dir / "stage1_scan.csv"
+    daily_stage1_scan_path = daily_dir / "stage1_scan.csv"
+    _append_csv_rows(all_stage1_scan_path, STAGE1_SCAN_FIELDS, stage1_scan_rows)
+    _append_csv_rows(daily_stage1_scan_path, STAGE1_SCAN_FIELDS, stage1_scan_rows)
 
     ranked_rows: List[Dict[str, Any]] = []
     for idx, item in enumerate(ranked, start=1):
@@ -382,8 +391,10 @@ def persist_run_analytics(
                 "rt_bid_ask_samples": len(rt.bid_ask_ratios) if rt is not None else "",
             }
         )
-    ranked_symbols_path = base_dir / "ranked_symbols.csv"
-    _append_csv_rows(ranked_symbols_path, RANKED_SYMBOL_FIELDS, ranked_rows)
+    all_ranked_symbols_path = all_dir / "ranked_symbols.csv"
+    daily_ranked_symbols_path = daily_dir / "ranked_symbols.csv"
+    _append_csv_rows(all_ranked_symbols_path, RANKED_SYMBOL_FIELDS, ranked_rows)
+    _append_csv_rows(daily_ranked_symbols_path, RANKED_SYMBOL_FIELDS, ranked_rows)
 
     run_bundle = {
         "run_id": run_id,
@@ -423,8 +434,11 @@ def persist_run_analytics(
     )
 
     return {
-        "run_summary": run_summary_path,
-        "stage1_scan": stage1_scan_path,
-        "ranked_symbols": ranked_symbols_path,
+        "run_summary": daily_run_summary_path,
+        "stage1_scan": daily_stage1_scan_path,
+        "ranked_symbols": daily_ranked_symbols_path,
         "run_bundle": run_bundle_path,
+        "all_run_summary": all_run_summary_path,
+        "all_stage1_scan": all_stage1_scan_path,
+        "all_ranked_symbols": all_ranked_symbols_path,
     }

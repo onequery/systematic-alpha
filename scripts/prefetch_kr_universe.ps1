@@ -1,8 +1,7 @@
 param(
     [string]$ProjectRoot = (Split-Path -Parent $PSScriptRoot),
     [string]$PythonExe = "",
-    [string]$UsExchange = "NASD",
-    [int]$UsUniverseSize = 500,
+    [int]$KrUniverseSize = 500,
     [int]$MaxSymbolsScan = 500,
     [switch]$ForceRefresh = $false
 )
@@ -43,38 +42,26 @@ foreach ($name in @("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "A
 $env:HOME = $ProjectRoot
 $env:USERPROFILE = $ProjectRoot
 
-$logFile = Join-Path $logDir ("prefetch_us_{0}.log" -f $stamp)
-$universeArgs = @(
-    "scripts\prefetch_us_universe.py",
-    "--project-root", $ProjectRoot
-)
-$cacheArgs = @(
-    "scripts\prefetch_us_market_cache.py",
+$logFile = Join-Path $logDir ("prefetch_kr_{0}.log" -f $stamp)
+$argsList = @(
+    "scripts\prefetch_kr_universe.py",
     "--project-root", $ProjectRoot,
-    "--us-exchange", $UsExchange,
-    "--us-universe-size", "$UsUniverseSize",
+    "--kr-universe-size", "$KrUniverseSize",
     "--max-symbols-scan", "$MaxSymbolsScan"
 )
 if ($ForceRefresh) {
-    $cacheArgs += "--force-refresh"
+    $argsList += "--force-refresh"
 }
 
-Write-Output "[prefetch] command(universe): $PythonExe $($universeArgs -join ' ')"
-Write-Output "[prefetch] command(market-cache): $PythonExe $($cacheArgs -join ' ')"
-Write-Output "[prefetch] log: $logFile"
+Write-Output "[prefetch-kr] command: $PythonExe $($argsList -join ' ')"
+Write-Output "[prefetch-kr] log: $logFile"
 
 try {
     $prevErrorActionPreference = $ErrorActionPreference
     try {
         # Treat native stderr as stream output (for logging), not as terminating PowerShell errors.
         $ErrorActionPreference = "Continue"
-        & $PythonExe @universeArgs 2>&1 | Tee-Object -FilePath $logFile
-        $firstExit = if ($null -eq $LASTEXITCODE) { 0 } else { [int]$LASTEXITCODE }
-        if ($firstExit -ne 0) {
-            $exitCode = $firstExit
-            throw "prefetch_us_universe.py failed (exit=$firstExit)"
-        }
-        & $PythonExe @cacheArgs 2>&1 | Tee-Object -FilePath $logFile -Append
+        & $PythonExe @argsList 2>&1 | Tee-Object -FilePath $logFile
     } finally {
         $ErrorActionPreference = $prevErrorActionPreference
     }
@@ -88,5 +75,5 @@ try {
     }
 }
 
-Write-Output "[prefetch] finished (exit=$exitCode)"
+Write-Output "[prefetch-kr] finished (exit=$exitCode)"
 exit $exitCode

@@ -60,9 +60,94 @@ class USDayTradingSelector:
         self._daily_bars_cache: Dict[str, List[Dict[str, Any]]] = {}
         self._orderbook_available = False
         self.last_stage1_scan: List[Dict[str, Any]] = []
+        self._load_prev_stats_cache()
 
     def _sp500_cache_path(self) -> Path:
         return Path("out") / f"us_sp500_constituents_{self.today_us}.csv"
+
+    def _prev_stats_cache_path(self) -> Path:
+        return Path("out") / f"us_prev_day_stats_{self.today_us}.csv"
+
+    def _load_prev_stats_cache(self) -> None:
+        path = self._prev_stats_cache_path()
+        if not path.exists():
+            return
+        try:
+            with path.open("r", encoding="utf-8", newline="") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    symbol = normalize_symbol(row.get("code", ""))
+                    if not symbol:
+                        continue
+                    prev_close = to_float(row.get("prev_close"))
+                    prev_volume = to_float(row.get("prev_volume"))
+                    prev_turnover = to_float(row.get("prev_turnover"))
+                    prev_day_change_pct = to_float(row.get("prev_day_change_pct"))
+                    if prev_close is None or prev_close <= 0:
+                        continue
+                    if prev_volume is None:
+                        prev_volume = 0.0
+                    if prev_turnover is None:
+                        prev_turnover = prev_close * prev_volume
+                    self._daily_cache[symbol] = PrevDayStats(
+                        prev_close=prev_close,
+                        prev_volume=prev_volume,
+                        prev_turnover=prev_turnover,
+                        prev_day_change_pct=prev_day_change_pct,
+                    )
+        except Exception:
+            return
+
+    def _write_prev_stats_cache(self, codes: List[str]) -> None:
+        path = self._prev_stats_cache_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["code", "prev_close", "prev_volume", "prev_turnover", "prev_day_change_pct"])
+            for code in codes:
+                stats = self._daily_cache.get(code)
+                if stats is None:
+                    continue
+                writer.writerow(
+                    [
+                        code,
+                        f"{stats.prev_close:.8f}",
+                        f"{stats.prev_volume:.8f}",
+                        f"{stats.prev_turnover:.8f}",
+                        "" if stats.prev_day_change_pct is None else f"{stats.prev_day_change_pct:.8f}",
+                    ]
+                )
+
+    def prefetch_prev_day_stats(self, codes: List[str], force_refresh: bool = False) -> Tuple[int, int]:
+        unique_codes: List[str] = []
+        seen = set()
+        for code in codes:
+            symbol = normalize_symbol(code)
+            if not symbol or symbol in seen:
+                continue
+            seen.add(symbol)
+            unique_codes.append(symbol)
+
+        success = 0
+        total = len(unique_codes)
+        progress_every = max(20, self.config.stage1_log_interval)
+        for idx, code in enumerate(unique_codes, start=1):
+            if force_refresh and code in self._daily_cache:
+                self._daily_cache.pop(code, None)
+            stats = self.fetch_prev_day_stats(code)
+            if stats is not None:
+                success += 1
+            if idx % progress_every == 0 or idx == total:
+                pct = (idx / total * 100.0) if total > 0 else 100.0
+                print(
+                    f"[prefetch-prev] scanned={idx}/{total} ({pct:.1f}%), success={success}",
+                    flush=True,
+                )
+            if self.config.rest_sleep_sec > 0:
+                time.sleep(self.config.rest_sleep_sec)
+
+        self._write_prev_stats_cache(unique_codes)
+        return success, total
 
     @staticmethod
     def _read_sp500_csv(path: Path) -> Tuple[List[str], Dict[str, str]]:

@@ -290,6 +290,37 @@ def append_selection_report_rows(
     log(f"[overnight-report] appended rows: {len(final)} -> {path}")
 
 
+def sync_overnight_report_daily_partitions(
+    report_path: Optional[str],
+    analytics_dir: Optional[str],
+) -> None:
+    if not report_path or not analytics_dir:
+        return
+
+    source_path = Path(report_path)
+    if not source_path.exists():
+        return
+
+    rows = _read_report_rows(source_path)
+    if not rows:
+        return
+
+    base_dir = Path(analytics_dir)
+    all_path = base_dir / "all" / "selection_overnight_report.csv"
+    _write_report_rows(all_path, rows)
+
+    grouped: Dict[str, List[Dict[str, str]]] = {}
+    for row in rows:
+        key = row.get("selection_date", "").strip()
+        if not key or len(key) != 8 or not key.isdigit():
+            key = "unknown"
+        grouped.setdefault(key, []).append(row)
+
+    for day, day_rows in grouped.items():
+        daily_path = base_dir / "daily" / day / "selection_overnight_report.csv"
+        _write_report_rows(daily_path, day_rows)
+
+
 def build_assume_open_stage1_candidates(
     selector: Any,
     codes: List[str],
@@ -484,6 +515,7 @@ def run(config: StrategyConfig) -> None:
             log(f"[analytics] persist failed: {exc}")
 
     update_pending_overnight_report(selector, config.overnight_report_path)
+    sync_overnight_report_daily_partitions(config.overnight_report_path, config.analytics_dir)
 
     stage_started = perf_counter()
     log("[1/4] Loading universe...")
@@ -646,6 +678,7 @@ def run(config: StrategyConfig) -> None:
         ranked=ranked,
     )
     append_selection_report_rows(selector, config.overnight_report_path, final, decision_at)
+    sync_overnight_report_daily_partitions(config.overnight_report_path, config.analytics_dir)
     persist_analytics_snapshot(decision_at=decision_at, invalid_reason=None)
     print("\nTop codes:", ", ".join(item.code for item in final) if final else "(none)")
     log(f"Run finished (total elapsed {perf_counter() - total_started:.1f}s)")

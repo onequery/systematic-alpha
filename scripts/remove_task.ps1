@@ -1,6 +1,8 @@
 [CmdletBinding()]
 param(
-    [string]$TaskName = "SystematicAlpha_KR_Open_0900"
+    [string]$TaskName = "SystematicAlpha_KR_Open_0900",
+    [switch]$RemovePrefetch = $true,
+    [string]$PrefetchTaskName = "SystematicAlpha_KR_Prefetch_Universe_0730"
 )
 
 $ErrorActionPreference = "Stop"
@@ -10,4 +12,7 @@ if (-not (Test-Path $target)) {
 }
 
 Write-Output "[alias] remove_task.ps1 is kept for backward compatibility. Use remove_kr_task.ps1."
-& $target -TaskName $TaskName
+& $target `
+    -TaskName $TaskName `
+    -RemovePrefetch:$RemovePrefetch `
+    -PrefetchTaskName $PrefetchTaskName

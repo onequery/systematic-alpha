@@ -1,7 +1,7 @@
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(
     [string]$TaskName = "SystematicAlpha_US_Open_0930ET",
-    [string]$PrefetchTaskName = "SystematicAlpha_US_Prefetch_SP500_0925ET",
+    [string]$PrefetchTaskName = "SystematicAlpha_US_Prefetch_Setup_0830ET",
     [switch]$RemovePrefetch = $true
 )
 

@@ -64,8 +64,11 @@ Default universe policy:
 |   |-- register_kr_task.ps1
 |   |-- register_task.ps1 (alias)
 |   |-- register_us_task.ps1
+|   |-- prefetch_kr_universe.ps1
+|   |-- prefetch_kr_universe.py
 |   |-- prefetch_us_universe.ps1
 |   |-- prefetch_us_universe.py
+|   |-- prefetch_us_market_cache.py
 |   |-- run_daily.ps1
 |   |-- remove_kr_task.ps1
 |   |-- remove_task.ps1 (alias)
@@ -218,10 +221,21 @@ Default behavior:
 - time: `09:00`
 - schedule: weekdays only (Mon-Fri)
 - runner: `scripts/run_daily.ps1 -Market KR`
+- prefetch task name: `SystematicAlpha_KR_Prefetch_Universe_0730`
+- prefetch time(KST): `07:30` on weekdays (90m buffer before KR open)
+- prefetch actions:
+  - build `out/kr_universe_liquidity_YYYYMMDD.csv`
+  - build `out/kr_prev_day_stats_YYYYMMDD.csv`
 - python: `C:\Users\heesu\anaconda3\envs\systematic-alpha\python.exe`
 - startup delay: `5 sec` (to avoid exact open-time mismatch)
 - internal retries: up to `4` attempts (`30s`, backoff `x2`, max `180s`)
 - task-level restart: up to `2` restarts within `10 min`
+
+To register KR open task without prefetch:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\register_kr_task.ps1 -RegisterPrefetch:$false
+```
 
 ### US open task registration (DST/STD dual trigger)
 
@@ -234,9 +248,11 @@ Default behavior:
 - triggers(KST): `22:30` and `23:30` on weekdays
 - runner: `scripts/run_daily.ps1 -Market US -RequireUsOpen`
 - runtime guard: open-window check (`09:30 ET + 20m`) + ET-day lock(1 run/day)
-- prefetch task name: `SystematicAlpha_US_Prefetch_SP500_0925ET`
-- prefetch triggers(KST): `22:25` and `23:25` on weekdays
-- prefetch action: download latest S&P500 constituents into `out/us_sp500_constituents_YYYYMMDD.csv`
+- prefetch task name: `SystematicAlpha_US_Prefetch_Setup_0830ET`
+- prefetch triggers(KST): `21:30` and `22:30` on weekdays (60m buffer before US open)
+- prefetch actions:
+  - download latest S&P500 constituents into `out/us_sp500_constituents_YYYYMMDD.csv`
+  - build `out/us_prev_day_stats_YYYYMMDD.csv`
 
 Custom example:
 
@@ -248,26 +264,28 @@ powershell -ExecutionPolicy Bypass -File .\scripts\register_us_task.ps1 -UsExcha
 
 ```powershell
 Get-ScheduledTask -TaskName "SystematicAlpha_KR_Open_0900"
+Get-ScheduledTask -TaskName "SystematicAlpha_KR_Prefetch_Universe_0730"
 Get-ScheduledTask -TaskName "SystematicAlpha_US_Open_0930ET"
-Get-ScheduledTask -TaskName "SystematicAlpha_US_Prefetch_SP500_0925ET"
+Get-ScheduledTask -TaskName "SystematicAlpha_US_Prefetch_Setup_0830ET"
 ```
 
 ### Run once now (manual test)
 
 ```powershell
 Start-ScheduledTask -TaskName "SystematicAlpha_KR_Open_0900"
+Start-ScheduledTask -TaskName "SystematicAlpha_KR_Prefetch_Universe_0730"
 Start-ScheduledTask -TaskName "SystematicAlpha_US_Open_0930ET"
-Start-ScheduledTask -TaskName "SystematicAlpha_US_Prefetch_SP500_0925ET"
+Start-ScheduledTask -TaskName "SystematicAlpha_US_Prefetch_Setup_0830ET"
 ```
 
 ### Check outputs
 
-- logs: `logs/`
-  - python run log: `logs/{kr|us}_daily_YYYYMMDD_HHMMSS_tryN.log`
-  - runner log: `logs/runner_{kr|us}_YYYYMMDD_HHMMSS.log`
-- json results: `out/`
-  - `out/kr_daily_YYYYMMDD_HHMMSS.json`
-  - `out/us_daily_YYYYMMDD_HHMMSS.json`
+- logs (single file per run): `logs/YYYYMMDD/`
+  - run log: `logs/YYYYMMDD/{kr|us}_daily_YYYYMMDD_HHMMSS.log`
+  - prefetch logs: `logs/YYYYMMDD/prefetch_{kr|us}_YYYYMMDD_HHMMSS.log`
+- json results (date partitioned): `out/YYYYMMDD/`
+  - `out/YYYYMMDD/kr_daily_YYYYMMDD_HHMMSS.json`
+  - `out/YYYYMMDD/us_daily_YYYYMMDD_HHMMSS.json`
 
 ### Remove tasks
 
@@ -275,6 +293,10 @@ Start-ScheduledTask -TaskName "SystematicAlpha_US_Prefetch_SP500_0925ET"
 powershell -ExecutionPolicy Bypass -File .\scripts\remove_kr_task.ps1
 powershell -ExecutionPolicy Bypass -File .\scripts\remove_us_task.ps1
 ```
+
+`remove_kr_task.ps1` removes both:
+- `SystematicAlpha_KR_Open_0900`
+- `SystematicAlpha_KR_Prefetch_Universe_0730`
 
 To register only US open task without prefetch task:
 
@@ -286,6 +308,10 @@ Notes:
 - The PC must be on for automatic task execution.
 - `remove_kr_task.ps1` / `remove_us_task.ps1` are manual commands and run immediately.
 - If the PC is sleeping at trigger time, execution can be delayed by OS/task settings.
+- `out/kr_universe_liquidity_YYYYMMDD.csv` is daily-varying data (previous-day turnover ranking), not a static file.
+  - it should be refreshed each trading day before KR open (handled by KR prefetch task).
+- `out/kr_prev_day_stats_YYYYMMDD.csv` and `out/us_prev_day_stats_YYYYMMDD.csv` are daily-varying caches.
+  - they are pre-built before market open to reduce stage1 API calls and startup latency.
 - `scripts/run_daily.ps1` clears proxy env variables and uses project-local cache path for `mojito` token stability.
 - `scripts/run_daily.ps1` reads Telegram settings from `.env` and sends notifications automatically when configured.
 - If token issuance hits rate-limit (`EGW00133`), retry wait is automatically expanded to `65 sec`.
@@ -352,7 +378,8 @@ powershell -ExecutionPolicy Bypass -File .\scripts\run_daily.ps1 -NotifyStart:$f
 
 Execution monitor behavior:
 - `run_daily.ps1` now streams Python output in real time (no end-of-run dump).
-- each attempt prints start time, command line, live log file path, and elapsed seconds.
+- each run writes into one single log file (`logs/YYYYMMDD/{kr|us}_daily_*.log`), including monitor + Python output.
+- each attempt prints start time, command line, and elapsed seconds.
 - startup/retry waiting now prints elapsed/remaining seconds every second.
 - stage1 scan prints progress every `STAGE1_LOG_INTERVAL` symbols (default `20`).
 - realtime collection prints heartbeat every `REALTIME_LOG_INTERVAL` seconds (default `10`).
@@ -412,16 +439,22 @@ python main.py --disable-analytics-log
 
 - Console table with top picks
 - Optional JSON file via `--output-json`
-- Overnight performance report CSV (default): `out/selection_overnight_report.csv`
+- Overnight performance report CSV:
+  - cumulative source: `out/selection_overnight_report.csv`
+  - date-partitioned copies: `out/analytics/daily/YYYYMMDD/selection_overnight_report.csv`
   - columns include: selection datetime, entry price, same-day close, next-day open, intraday/overnight/total returns
 - Analytics datasets (default): `out/analytics/`
-  - `run_summary.csv`: one row per run (counts, quality gate, timings, final codes)
-  - `stage1_scan.csv`: per-symbol stage1 scan result (pass/fail + skip reason + thresholds)
-  - `ranked_symbols.csv`: ranked symbols with conditions, metrics, realtime aggregates
-  - `runs/{market}_YYYYMMDD_HHMMSS_microsec.json`: full per-run bundle for deep analysis/replay
+  - `daily/YYYYMMDD/run_summary.csv`: date-partitioned run summary
+  - `daily/YYYYMMDD/stage1_scan.csv`: date-partitioned stage1 scan diagnostics
+  - `daily/YYYYMMDD/ranked_symbols.csv`: date-partitioned ranking dataset
+  - `all/run_summary.csv`: cumulative summary across days
+  - `all/stage1_scan.csv`: cumulative stage1 diagnostics across days
+  - `all/ranked_symbols.csv`: cumulative ranking dataset across days
+  - `runs/YYYYMMDD/{market}_YYYYMMDD_HHMMSS_microsec.json`: full per-run bundle
 
 Example JSON path:
 - `out/smoke_run.json`
+- scheduled run example: `out/YYYYMMDD/kr_daily_YYYYMMDD_HHMMSS.json`
 
 ## Troubleshooting
 

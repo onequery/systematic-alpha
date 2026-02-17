@@ -3,7 +3,13 @@ param(
     [string]$TaskName = "SystematicAlpha_KR_Open_0900",
     [string]$At = "09:00",
     [string]$RunScriptPath = "",
+    [switch]$RegisterPrefetch = $true,
+    [string]$PrefetchTaskName = "SystematicAlpha_KR_Prefetch_Universe_0730",
+    [string]$PrefetchAt = "07:30",
+    [string]$PrefetchScriptPath = "",
     [string]$PythonExe = "C:\Users\heesu\anaconda3\envs\systematic-alpha\python.exe",
+    [int]$KrUniverseSize = 500,
+    [int]$MaxSymbolsScan = 500,
     [switch]$WeekdaysOnly = $true,
     [int]$StartDelaySeconds = 5,
     [int]$MaxAttempts = 4,
@@ -23,8 +29,14 @@ Write-Output "[alias] register_task.ps1 is kept for backward compatibility. Use 
     -TaskName $TaskName `
     -At $At `
     -RunScriptPath $RunScriptPath `
+    -RegisterPrefetch:$RegisterPrefetch `
+    -PrefetchTaskName $PrefetchTaskName `
+    -PrefetchAt $PrefetchAt `
+    -PrefetchScriptPath $PrefetchScriptPath `
     -PythonExe $PythonExe `
-    -WeekdaysOnly:$($WeekdaysOnly.IsPresent) `
+    -KrUniverseSize $KrUniverseSize `
+    -MaxSymbolsScan $MaxSymbolsScan `
+    -WeekdaysOnly:$WeekdaysOnly `
     -StartDelaySeconds $StartDelaySeconds `
     -MaxAttempts $MaxAttempts `
     -RetryDelaySeconds $RetryDelaySeconds `

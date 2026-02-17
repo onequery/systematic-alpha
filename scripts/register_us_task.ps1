@@ -5,13 +5,15 @@ param(
     [string]$AtStd = "23:30",
     [string]$RunScriptPath = "",
     [switch]$RegisterPrefetch = $true,
-    [string]$PrefetchTaskName = "SystematicAlpha_US_Prefetch_SP500_0925ET",
-    [string]$PrefetchAtDst = "22:25",
-    [string]$PrefetchAtStd = "23:25",
+    [string]$PrefetchTaskName = "SystematicAlpha_US_Prefetch_Setup_0830ET",
+    [string]$PrefetchAtDst = "21:30",
+    [string]$PrefetchAtStd = "22:30",
     [string]$PrefetchScriptPath = "",
     [string]$PythonExe = "C:\Users\heesu\anaconda3\envs\systematic-alpha\python.exe",
     [string]$UsExchange = "NASD",
     [int]$UsOpenWindowMinutes = 20,
+    [int]$UsUniverseSize = 500,
+    [int]$MaxSymbolsScan = 500,
     [switch]$WeekdaysOnly = $true,
     [int]$StartDelaySeconds = 5,
     [int]$MaxAttempts = 4,
@@ -54,9 +56,9 @@ $prefetchAtDstTime = Parse-TimeToDate -At $PrefetchAtDst
 $prefetchAtStdTime = Parse-TimeToDate -At $PrefetchAtStd
 
 $psExe = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
-$actionArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$RunScriptPath`" -PythonExe `"$PythonExe`" -Market US -UsExchange `"$UsExchange`" -RequireUsOpen -UsOpenWindowMinutes $UsOpenWindowMinutes -StartDelaySeconds $StartDelaySeconds -MaxAttempts $MaxAttempts -RetryDelaySeconds $RetryDelaySeconds -RetryBackoffMultiplier $RetryBackoffMultiplier -MaxRetryDelaySeconds $MaxRetryDelaySeconds"
+$actionArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$RunScriptPath`" -PythonExe `"$PythonExe`" -Market US -UsExchange `"$UsExchange`" -UsUniverseSize $UsUniverseSize -MaxSymbolsScan $MaxSymbolsScan -RequireUsOpen -UsOpenWindowMinutes $UsOpenWindowMinutes -StartDelaySeconds $StartDelaySeconds -MaxAttempts $MaxAttempts -RetryDelaySeconds $RetryDelaySeconds -RetryBackoffMultiplier $RetryBackoffMultiplier -MaxRetryDelaySeconds $MaxRetryDelaySeconds"
 $action = New-ScheduledTaskAction -Execute $psExe -Argument $actionArgs
-$prefetchActionArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$PrefetchScriptPath`" -ProjectRoot `"$projectRoot`" -PythonExe `"$PythonExe`""
+$prefetchActionArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$PrefetchScriptPath`" -ProjectRoot `"$projectRoot`" -PythonExe `"$PythonExe`" -UsExchange `"$UsExchange`" -UsUniverseSize $UsUniverseSize -MaxSymbolsScan $MaxSymbolsScan"
 $prefetchAction = New-ScheduledTaskAction -Execute $psExe -Argument $prefetchActionArgs
 
 if ($WeekdaysOnly) {
@@ -106,6 +108,7 @@ if ($WeekdaysOnly) {
     Write-Output "Schedule: Daily"
 }
 Write-Output "Execution guard: run_daily.ps1 -RequireUsOpen -UsOpenWindowMinutes $UsOpenWindowMinutes (open-window + daily-lock)"
+Write-Output "US setup prep: us_universe_size=$UsUniverseSize, max_symbols_scan=$MaxSymbolsScan"
 Write-Output "Retry config: start_delay=${StartDelaySeconds}s, max_attempts=$MaxAttempts, retry_delay=${RetryDelaySeconds}s, backoff=x$RetryBackoffMultiplier, max_retry_delay=${MaxRetryDelaySeconds}s"
 Write-Output "Command: $psExe $actionArgs"
 if ($RegisterPrefetch) {

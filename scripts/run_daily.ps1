@@ -33,6 +33,7 @@
     [int]$Stage1LogInterval = 20,
     [int]$RealtimeLogInterval = 10,
     [string]$OvernightReportPath = "",
+    [string]$AnalyticsDir = "",
     [switch]$Mock = $false,
     [int]$StartDelaySeconds = 5,
     [int]$MaxAttempts = 4,
@@ -419,6 +420,23 @@ if ([string]::IsNullOrWhiteSpace($PythonExe)) {
 
 Set-Location $ProjectRoot
 
+# Prepare date-partitioned log/output paths first so all monitor lines go into one file.
+$kstTz = [System.TimeZoneInfo]::FindSystemTimeZoneById("Korea Standard Time")
+$nowKst = [System.TimeZoneInfo]::ConvertTime((Get-Date), $kstTz)
+$runDate = $nowKst.ToString("yyyyMMdd")
+$stamp = $nowKst.ToString("yyyyMMdd_HHmmss")
+$marketTag = if ($Market -eq "US") { "us" } else { "kr" }
+
+$logRootDir = Join-Path $ProjectRoot "logs"
+$outRootDir = Join-Path $ProjectRoot "out"
+$runLogDir = Join-Path $logRootDir $runDate
+$runOutDir = Join-Path $outRootDir $runDate
+
+$null = New-Item -ItemType Directory -Force -Path $runLogDir
+$null = New-Item -ItemType Directory -Force -Path $runOutDir
+
+$script:RunLogFile = Join-Path $runLogDir ("{0}_daily_{1}.log" -f $marketTag, $stamp)
+
 Import-DotEnv -Path (Join-Path $ProjectRoot ".env") -AllowedKeys @(
     "KIS_APP_KEY",
     "KIS_APP_SECRET",
@@ -465,17 +483,16 @@ foreach ($name in @("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "A
 $env:HOME = $ProjectRoot
 $env:USERPROFILE = $ProjectRoot
 
-$null = New-Item -ItemType Directory -Force -Path (Join-Path $ProjectRoot "logs")
-$null = New-Item -ItemType Directory -Force -Path (Join-Path $ProjectRoot "out")
-
-$stamp = Get-Date -Format "yyyyMMdd_HHmmss"
-$marketTag = if ($Market -eq "US") { "us" } else { "kr" }
-$script:RunLogFile = Join-Path $ProjectRoot ("logs\runner_{0}_{1}.log" -f $marketTag, $stamp)
-$outputJson = Join-Path $ProjectRoot ("out\{0}_daily_{1}.json" -f $marketTag, $stamp)
+$outputJson = Join-Path $runOutDir ("{0}_daily_{1}.json" -f $marketTag, $stamp)
 $resolvedOvernightReportPath = if ([string]::IsNullOrWhiteSpace($OvernightReportPath)) {
-    Join-Path $ProjectRoot "out\selection_overnight_report.csv"
+    Join-Path $outRootDir "selection_overnight_report.csv"
 } else {
     $OvernightReportPath
+}
+$resolvedAnalyticsDir = if ([string]::IsNullOrWhiteSpace($AnalyticsDir)) {
+    Join-Path $outRootDir "analytics"
+} else {
+    $AnalyticsDir
 }
 $baseArgs = @(
     "main.py",
@@ -502,6 +519,7 @@ $baseArgs = @(
     "--stage1-log-interval", "$Stage1LogInterval",
     "--realtime-log-interval", "$RealtimeLogInterval",
     "--overnight-report-path", $resolvedOvernightReportPath,
+    "--analytics-dir", $resolvedAnalyticsDir,
     "--output-json", $outputJson
 )
 if ($Market -eq "US") {
@@ -562,7 +580,7 @@ if ($Market -eq "US" -and $RequireUsOpen -and -not $AssumeOpenForTest) {
     }
 
     $usEtDate = $state.now_et.ToString("yyyyMMdd")
-    $usDayLock = Join-Path $ProjectRoot ("out\us_run_lock_{0}.txt" -f $usEtDate)
+    $usDayLock = Join-Path $outRootDir ("us_run_lock_{0}.txt" -f $usEtDate)
     if (Test-Path $usDayLock) {
         Write-MonitorLog "[market-check] US daily lock exists ($usDayLock). skipping duplicate run."
         if ($script:TelegramEnabled) {
@@ -611,11 +629,10 @@ $multiplier = [Math]::Max(1, $RetryBackoffMultiplier)
 $maxDelay = [Math]::Max(1, $MaxRetryDelaySeconds)
 
 for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
-    $attemptLog = Join-Path $ProjectRoot ("logs\{0}_daily_{1}_try{2}.log" -f $marketTag, $stamp, $attempt)
     $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     Write-MonitorLog "[attempt $attempt/$MaxAttempts] starting"
     Write-MonitorLog "command: $PythonExe -u $($baseArgs -join ' ')"
-    Write-MonitorLog "live_log: $attemptLog"
+    Write-MonitorLog "log_file: $script:RunLogFile"
 
     $exitCode = 1
     $combinedOutput = @()
@@ -629,7 +646,7 @@ for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
             & $PythonExe -u @baseArgs 2>&1 | ForEach-Object {
                 $line = "$_"
                 $combinedOutputList.Add($line) | Out-Null
-                $line | Tee-Object -FilePath $attemptLog -Append
+                $line | Tee-Object -FilePath $script:RunLogFile -Append
             }
         } finally {
             $ErrorActionPreference = $prevErrorActionPreference
@@ -644,7 +661,7 @@ for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
     } catch {
         $errText = $_ | Out-String
         $combinedOutput = @($errText)
-        $combinedOutput | Tee-Object -FilePath $attemptLog
+        $combinedOutput | Tee-Object -FilePath $script:RunLogFile -Append
         Write-MonitorLog "[attempt $attempt/$MaxAttempts] pipeline exception: $($_.Exception.Message)"
         $exitCode = 9009
     }
@@ -659,7 +676,7 @@ for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
             "host=$hostTag`n" +
             "attempt=$attempt/$MaxAttempts`n" +
             "output=$outputJson`n" +
-            "log=$attemptLog`n" +
+            "log=$script:RunLogFile`n" +
             "`n$summary"
         )
         exit 0
@@ -673,7 +690,7 @@ for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
             "host=$hostTag`n" +
             "attempt=$attempt/$MaxAttempts`n" +
             "exit_code=$exitCode`n" +
-            "last_log=$attemptLog`n" +
+            "last_log=$script:RunLogFile`n" +
             "`n--- log tail ---`n" +
             (Truncate-Text -Text $tail -MaxChars 2000)
         )
@@ -695,7 +712,7 @@ for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
         "attempt=$attempt/$MaxAttempts`n" +
         "exit_code=$exitCode`n" +
         "next_delay=${nextDelay}s`n" +
-        "log=$attemptLog`n" +
+        "log=$script:RunLogFile`n" +
         "`n--- log tail ---`n" +
         (Truncate-Text -Text $retryTail -MaxChars 1500)
     )
