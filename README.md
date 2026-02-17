@@ -275,6 +275,38 @@ Get-ScheduledTask -TaskName "SystematicAlpha_US_Open_0930ET"
 Get-ScheduledTask -TaskName "SystematicAlpha_US_Prefetch_Setup_0830ET"
 ```
 
+### Task list and state
+
+- `All registered tasks` means every task currently saved in Windows Task Scheduler (ready/running/disabled all included).
+- `Currently running tasks` means only tasks whose state is `Running` right now.
+
+Show all registered tasks:
+
+```powershell
+Get-ScheduledTask | Sort-Object TaskPath, TaskName | Format-Table TaskPath, TaskName, State -AutoSize
+```
+
+Show only currently running tasks:
+
+```powershell
+Get-ScheduledTask | Where-Object { $_.State -eq "Running" } | Format-Table TaskPath, TaskName, State -AutoSize
+```
+
+Show only this project's tasks with run history:
+
+```powershell
+Get-ScheduledTask -TaskName "SystematicAlpha*" | ForEach-Object {
+  $info = Get-ScheduledTaskInfo -TaskName $_.TaskName -TaskPath $_.TaskPath
+  [PSCustomObject]@{
+    TaskName       = $_.TaskName
+    State          = $_.State
+    NextRunTime    = $info.NextRunTime
+    LastRunTime    = $info.LastRunTime
+    LastTaskResult = $info.LastTaskResult
+  }
+} | Format-Table -AutoSize
+```
+
 ### Run once now (manual test)
 
 ```powershell
