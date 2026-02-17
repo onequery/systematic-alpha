@@ -14,12 +14,16 @@ This project is a CLI app (no UI). It reads secrets from `.env` and prints ranke
   - Stage 2: realtime metrics (strength, VWAP, bid/ask ratio, volume ratio)
 - `--market kr` (default): domestic KR flow (REST + WebSocket)
 - `--market us`: overseas US flow (REST + polling)
+- Objective universe by default (no manual file required):
+  - KR: previous-day turnover rank top-N
+  - US: S&P 500 constituents top-N
 - Long-only directional mode by default (`change >= threshold`, `gap >= threshold`)
 - Fallback fill rule: if stage1 candidates are fewer than `--final-picks`, thresholds are relaxed step-by-step to fill missing slots.
 - Decision-time snapshot refresh: final scoring uses latest snapshot at selection completion time (not only early scan snapshot).
 - Realtime quality gate: if eligible realtime coverage is below threshold (default `0.8`), signal can be invalidated for the day.
+- Off-market test mode (`--test-assume-open`) to force full pipeline execution when market is closed.
 - Automatic overnight performance report (`selection -> close -> next open`) in CSV.
-- Configurable thresholds via CLI arguments or environment variables
+- Configurable thresholds via CLI arguments (scheduled runs use `scripts/run_daily.ps1` parameters)
 - JSON output export for downstream automation
 - Telegram notifications for retry/failure/success status (optional)
 - Live progress/heartbeat logs during scan and realtime collection
@@ -42,6 +46,11 @@ At final scoring, `change/gap` are recomputed from the latest snapshot at the ac
 
 The final ranking selects top `N` symbols (`--final-picks`, default `3`).
 
+Default universe policy:
+- KR objective pool: top `KR_UNIVERSE_SIZE` by previous-day turnover (default `500`), then truncated by `MAX_SYMBOLS_SCAN`.
+- US objective pool: top `US_UNIVERSE_SIZE` from S&P 500 constituents (default `500`), then truncated by `MAX_SYMBOLS_SCAN`.
+- Manual override remains available via `--universe-file` / `--us-universe-file`.
+
 ## Project Structure
 
 ```text
@@ -51,10 +60,14 @@ The final ranking selects top `N` symbols (`--final-picks`, default `3`).
 |-- requirements.txt
 |-- .env.example
 |-- scripts/
-|   |-- register_task.ps1
+|   |-- register_kr_task.ps1
+|   |-- register_task.ps1 (alias)
 |   |-- register_us_task.ps1
+|   |-- prefetch_us_universe.ps1
+|   |-- prefetch_us_universe.py
 |   |-- run_daily.ps1
-|   |-- remove_task.ps1
+|   |-- remove_kr_task.ps1
+|   |-- remove_task.ps1 (alias)
 |   `-- remove_us_task.ps1
 `-- systematic_alpha/
     |-- cli.py
@@ -65,6 +78,7 @@ The final ranking selects top `N` symbols (`--final-picks`, default `3`).
     |-- dotenv.py
     |-- helpers.py
     |-- data/
+    |   |-- us_sp500_snapshot.csv
     |   `-- us_universe_default.txt
     `-- mojito_loader.py
 ```
@@ -112,20 +126,12 @@ Required keys:
 
 Optional:
 - `KIS_USER_ID`
-- `KIS_MOCK` (`0` or `1`)
-- market variables:
-  - `MARKET=kr|us`
-  - `US_EXCHANGE=NASD|NYSE|AMEX`
-  - `US_UNIVERSE_FILE=./systematic_alpha/data/us_universe_default.txt`
-  - `US_POLL_INTERVAL=2.0`
 - Telegram variables (`TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, etc.)
-- strategy/runtime override variables listed in `.env.example`
-  - quality/monitoring/report-related:
-    `LONG_ONLY`, `MIN_EXEC_TICKS`, `MIN_ORDERBOOK_TICKS`,
-    `MIN_REALTIME_CUM_VOLUME`, `MIN_REALTIME_COVERAGE_RATIO`,
-    `INVALIDATE_ON_LOW_COVERAGE`,
-    `STAGE1_LOG_INTERVAL`, `REALTIME_LOG_INTERVAL`,
-    `OVERNIGHT_REPORT_PATH`
+
+Config policy:
+- `.env`: secrets only (KIS credentials, Telegram token/chat id).
+- `scripts/run_daily.ps1`: strategy/runtime hyperparameters (source of truth for scheduled runs).
+- `scripts/run_daily.ps1` intentionally whitelists and imports only sensitive keys from `.env`.
 
 ### Telegram notifications (optional)
 
@@ -202,11 +208,11 @@ Use scheduled tasks at market-open times.
 ### KR 09:00 task registration
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\register_task.ps1
+powershell -ExecutionPolicy Bypass -File .\scripts\register_kr_task.ps1
 ```
 
 Default behavior:
-- task name: `SystematicAlpha_0900`
+- task name: `SystematicAlpha_KR_Open_0900`
 - time: `09:00`
 - schedule: weekdays only (Mon-Fri)
 - runner: `scripts/run_daily.ps1 -Market KR`
@@ -222,29 +228,34 @@ powershell -ExecutionPolicy Bypass -File .\scripts\register_us_task.ps1
 ```
 
 Default behavior:
-- task name: `SystematicAlpha_US_Open`
+- task name: `SystematicAlpha_US_Open_0930ET`
 - triggers(KST): `22:30` and `23:30` on weekdays
 - runner: `scripts/run_daily.ps1 -Market US -RequireUsOpen`
 - runtime guard: open-window check (`09:30 ET + 20m`) + ET-day lock(1 run/day)
+- prefetch task name: `SystematicAlpha_US_Prefetch_SP500_0925ET`
+- prefetch triggers(KST): `22:25` and `23:25` on weekdays
+- prefetch action: download latest S&P500 constituents into `out/us_sp500_constituents_YYYYMMDD.csv`
 
 Custom example:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\register_us_task.ps1 -UsExchange "NASD" -UsOpenWindowMinutes 20 -TaskName "SystematicAlpha_US"
+powershell -ExecutionPolicy Bypass -File .\scripts\register_us_task.ps1 -UsExchange "NASD" -UsOpenWindowMinutes 20 -TaskName "SystematicAlpha_US_Open_0930ET_Custom"
 ```
 
 ### Verify registration
 
 ```powershell
-Get-ScheduledTask -TaskName "SystematicAlpha_0900"
-Get-ScheduledTask -TaskName "SystematicAlpha_US_Open"
+Get-ScheduledTask -TaskName "SystematicAlpha_KR_Open_0900"
+Get-ScheduledTask -TaskName "SystematicAlpha_US_Open_0930ET"
+Get-ScheduledTask -TaskName "SystematicAlpha_US_Prefetch_SP500_0925ET"
 ```
 
 ### Run once now (manual test)
 
 ```powershell
-Start-ScheduledTask -TaskName "SystematicAlpha_0900"
-Start-ScheduledTask -TaskName "SystematicAlpha_US_Open"
+Start-ScheduledTask -TaskName "SystematicAlpha_KR_Open_0900"
+Start-ScheduledTask -TaskName "SystematicAlpha_US_Open_0930ET"
+Start-ScheduledTask -TaskName "SystematicAlpha_US_Prefetch_SP500_0925ET"
 ```
 
 ### Check outputs
@@ -259,19 +270,28 @@ Start-ScheduledTask -TaskName "SystematicAlpha_US_Open"
 ### Remove tasks
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\remove_task.ps1
+powershell -ExecutionPolicy Bypass -File .\scripts\remove_kr_task.ps1
 powershell -ExecutionPolicy Bypass -File .\scripts\remove_us_task.ps1
+```
+
+To register only US open task without prefetch task:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\register_us_task.ps1 -RegisterPrefetch:$false
 ```
 
 Notes:
 - The PC must be on for automatic task execution.
-- `remove_task.ps1` / `remove_us_task.ps1` are manual commands and run immediately.
+- `remove_kr_task.ps1` / `remove_us_task.ps1` are manual commands and run immediately.
 - If the PC is sleeping at trigger time, execution can be delayed by OS/task settings.
 - `scripts/run_daily.ps1` clears proxy env variables and uses project-local cache path for `mojito` token stability.
 - `scripts/run_daily.ps1` reads Telegram settings from `.env` and sends notifications automatically when configured.
 - If token issuance hits rate-limit (`EGW00133`), retry wait is automatically expanded to `65 sec`.
 - US holidays/half-days are not fully modeled in this repo.
 - US task prevents duplicate same-day runs via `out/us_run_lock_YYYYMMDD.txt` (ET date 기준).
+- Backward-compatibility aliases are kept:
+  - `register_task.ps1` -> `register_kr_task.ps1`
+  - `remove_task.ps1` -> `remove_kr_task.ps1`
 
 ### Reliability knobs (`scripts/run_daily.ps1`)
 
@@ -287,10 +307,39 @@ powershell -ExecutionPolicy Bypass -File .\scripts\run_daily.ps1 `
   -NotifyTailLines 20
 ```
 
+You can also tune strategy hyperparameters in the same script call:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\run_daily.ps1 `
+  -Market KR `
+  -CollectSeconds 600 `
+  -FinalPicks 3 `
+  -PreCandidates 40 `
+  -MaxSymbolsScan 500 `
+  -KrUniverseSize 500 `
+  -MinChangePct 3.0 `
+  -MinGapPct 2.0 `
+  -MinPrevTurnover 10000000000 `
+  -MinStrength 100 `
+  -MinVolRatio 0.10 `
+  -MinBidAskRatio 1.2 `
+  -MinPassConditions 5 `
+  -MinMaintainRatio 0.6 `
+  -MinExecTicks 30 `
+  -MinOrderbookTicks 30 `
+  -MinRealtimeCoverageRatio 0.8
+```
+
 US manual run example:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\run_daily.ps1 -Market US -UsExchange "NASD" -RequireUsOpen -UsOpenWindowMinutes 20
+```
+
+US off-market forced test example:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\run_daily.ps1 -Market US -UsExchange "NASD" -AssumeOpenForTest
 ```
 
 To disable start notification for a specific manual run:
@@ -329,7 +378,6 @@ US quick smoke example:
 python main.py \
   --market us \
   --exchange NASD \
-  --universe-file systematic_alpha/data/us_universe_default.txt \
   --max-symbols-scan 3 \
   --pre-candidates 3 \
   --final-picks 3 \
@@ -338,6 +386,18 @@ python main.py \
   --min-gap-pct 0 \
   --min-prev-turnover 0 \
   --output-json out/us_smoke_run.json
+```
+
+Off-market full-pipeline test example (force assume market-open conditions):
+
+```bash
+python main.py \
+  --market us \
+  --exchange NASD \
+  --collect-seconds 120 \
+  --final-picks 3 \
+  --test-assume-open \
+  --output-json out/us_assume_open_test.json
 ```
 
 ## Output

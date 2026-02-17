@@ -10,7 +10,13 @@ from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
 from systematic_alpha.helpers import fmt
-from systematic_alpha.models import FinalSelection, RealtimeQuality, StrategyConfig
+from systematic_alpha.models import (
+    FinalSelection,
+    RealtimeQuality,
+    RealtimeStats,
+    Stage1Candidate,
+    StrategyConfig,
+)
 from systematic_alpha.mojito_loader import import_mojito_module
 from systematic_alpha.selector import DayTradingSelector
 from systematic_alpha.selector_us import USDayTradingSelector
@@ -283,6 +289,112 @@ def append_selection_report_rows(
     log(f"[overnight-report] appended rows: {len(final)} -> {path}")
 
 
+def build_assume_open_stage1_candidates(
+    selector: Any,
+    codes: List[str],
+    names: Dict[str, str],
+    limit: int,
+) -> List[Stage1Candidate]:
+    generated: List[Stage1Candidate] = []
+    target = max(1, limit)
+    for code in codes:
+        try:
+            snap = selector.fetch_price_snapshot(code, use_cache=False)
+            prev = selector.fetch_prev_day_stats(code)
+        except Exception:
+            continue
+        if not snap or prev is None or prev.prev_close <= 0:
+            continue
+
+        price = snap.get("price")
+        if price is None or price <= 0:
+            continue
+
+        open_price = snap.get("open")
+        if open_price is None or open_price <= 0:
+            open_price = price
+
+        change_pct = snap.get("change_pct")
+        if change_pct is None:
+            change_pct = ((price - prev.prev_close) / prev.prev_close) * 100.0
+        gap_pct = ((open_price - prev.prev_close) / prev.prev_close) * 100.0
+        name = names.get(code, "") or str(snap.get("name") or "")
+
+        generated.append(
+            Stage1Candidate(
+                code=code,
+                name=name,
+                current_price=float(price),
+                open_price=float(open_price),
+                current_change_pct=float(change_pct),
+                gap_pct=float(gap_pct),
+                prev_close=float(prev.prev_close),
+                prev_day_volume=float(prev.prev_volume),
+                prev_day_turnover=float(prev.prev_turnover),
+            )
+        )
+        if len(generated) >= target:
+            break
+    return generated
+
+
+def inject_assume_open_realtime(
+    selector: Any,
+    config: StrategyConfig,
+    candidates: List[Stage1Candidate],
+    stats: Dict[str, RealtimeStats],
+) -> RealtimeQuality:
+    if hasattr(selector, "_orderbook_available"):
+        setattr(selector, "_orderbook_available", True)
+
+    strength_floor = max(config.min_strength + 5.0, 120.0)
+    bid_ask_floor = max(config.min_bid_ask_ratio + 0.1, 1.25)
+    strength_samples = max(3, config.min_strength_samples)
+    bid_ask_samples = max(3, config.min_bid_ask_samples)
+
+    for candidate in candidates:
+        realtime = stats.get(candidate.code, RealtimeStats())
+        px = candidate.current_price if candidate.current_price > 0 else max(candidate.open_price, 1.0)
+
+        realtime.got_execution = True
+        realtime.execution_ticks = max(realtime.execution_ticks, config.min_exec_ticks, 30)
+        realtime.got_orderbook = True
+        realtime.orderbook_ticks = max(realtime.orderbook_ticks, config.min_orderbook_ticks, 30)
+
+        if len(realtime.strength_values) < strength_samples:
+            realtime.strength_values = [strength_floor] * strength_samples
+        if len(realtime.bid_ask_ratios) < bid_ask_samples:
+            realtime.bid_ask_ratios = [bid_ask_floor] * bid_ask_samples
+
+        realtime.cum_trade_volume = max(
+            realtime.cum_trade_volume,
+            config.min_realtime_cum_volume + float(realtime.execution_ticks),
+        )
+        realtime.cum_trade_value = max(realtime.cum_trade_value, px * realtime.cum_trade_volume)
+        realtime.latest_price = realtime.latest_price if realtime.latest_price is not None else px
+
+        min_acml_volume = max(1.0, candidate.prev_day_volume * max(config.min_vol_ratio, 0.1) * 1.2)
+        current_acml = realtime.latest_acml_volume or 0.0
+        realtime.latest_acml_volume = max(current_acml, min_acml_volume)
+
+        if realtime.first_reported_low is None:
+            realtime.first_reported_low = candidate.open_price if candidate.open_price > 0 else px
+        realtime.low_broken_after_start = False
+        stats[candidate.code] = realtime
+
+    total = len(candidates)
+    return RealtimeQuality(
+        realtime_ready=total > 0,
+        quality_ok=True,
+        coverage_ratio=1.0 if total > 0 else 0.0,
+        eligible_count=total,
+        total_count=total,
+        min_exec_ticks=config.min_exec_ticks,
+        min_orderbook_ticks=config.min_orderbook_ticks,
+        min_realtime_cum_volume=config.min_realtime_cum_volume,
+    )
+
+
 def run(config: StrategyConfig) -> None:
     total_started = perf_counter()
     log(
@@ -293,6 +405,7 @@ def run(config: StrategyConfig) -> None:
         f"final_picks={config.final_picks}, pre_candidates={config.pre_candidates}, "
         f"max_symbols_scan={config.max_symbols_scan}, "
         f"long_only={config.long_only}, "
+        f"test_assume_open={config.test_assume_open}, "
         f"min_coverage={config.min_realtime_coverage_ratio:.2f}, "
         f"invalidate_on_low_coverage={config.invalidate_on_low_coverage}, "
         f"stage1_log_interval={config.stage1_log_interval}, "
@@ -335,6 +448,19 @@ def run(config: StrategyConfig) -> None:
         else:
             log("[fallback] no additional candidates found.")
 
+    if not stage1 and config.test_assume_open:
+        force_limit = max(config.pre_candidates, config.final_picks * 2)
+        log(
+            "[test-assume-open] stage1 is empty. building synthetic stage1 from current snapshots for off-market testing..."
+        )
+        stage1 = build_assume_open_stage1_candidates(
+            selector=selector,
+            codes=codes,
+            names=names,
+            limit=force_limit,
+        )
+        log(f"[test-assume-open] synthetic stage1 candidates: {len(stage1)}")
+
     if not stage1:
         log("No candidates passed stage1 thresholds.")
         now = datetime.now(ZoneInfo("Asia/Seoul"))
@@ -371,9 +497,28 @@ def run(config: StrategyConfig) -> None:
     )
     log(f"[3/4] Realtime collection done (elapsed {perf_counter() - stage_started:.1f}s)")
 
+    if config.test_assume_open and (not realtime_quality.realtime_ready or not realtime_quality.quality_ok):
+        log(
+            "[test-assume-open] realtime data is insufficient/off-market. injecting synthetic realtime metrics to force full pipeline test."
+        )
+        realtime_quality = inject_assume_open_realtime(
+            selector=selector,
+            config=config,
+            candidates=stage1,
+            stats=realtime_stats,
+        )
+        log(
+            "[test-assume-open] quality summary overridden: "
+            f"ready={realtime_quality.realtime_ready}, "
+            f"coverage={realtime_quality.coverage_ratio:.3f}, "
+            f"eligible={realtime_quality.eligible_count}/{realtime_quality.total_count}, "
+            f"quality_ok={realtime_quality.quality_ok}"
+        )
+
     if (
         config.collect_seconds > 0
         and config.invalidate_on_low_coverage
+        and not config.test_assume_open
         and not realtime_quality.quality_ok
     ):
         invalid_reason = (

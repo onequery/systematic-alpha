@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import csv
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
+import requests
 
 from systematic_alpha.helpers import (
     first_dict,
@@ -25,20 +27,8 @@ from systematic_alpha.models import (
     StrategyConfig,
 )
 
-DEFAULT_US_SYMBOLS = [
-    "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA", "AMD", "NFLX", "AVGO",
-    "COST", "ADBE", "CSCO", "PEP", "INTC", "QCOM", "AMGN", "TXN", "BKNG", "PYPL",
-    "SBUX", "CMCSA", "INTU", "AMAT", "MU", "GILD", "ADI", "LRCX", "MDLZ", "REGN",
-    "VRTX", "ISRG", "PANW", "KLAC", "SNPS", "CDNS", "MELI", "ASML", "CRWD", "MAR",
-    "ORLY", "MNST", "FTNT", "ABNB", "CTAS", "ADP", "PAYX", "ROST", "ODFL", "XEL",
-    "JPM", "BAC", "WFC", "C", "GS", "MS", "BLK", "SCHW", "USB", "PNC",
-    "V", "MA", "AXP", "PYPL", "SQ", "COIN", "SOFI", "HOOD", "SHOP", "UBER",
-    "JNJ", "PFE", "MRK", "LLY", "ABBV", "BMY", "UNH", "CVS", "TMO", "DHR",
-    "XOM", "CVX", "COP", "SLB", "EOG", "MPC", "PSX", "VLO", "HAL", "OXY",
-    "WMT", "TGT", "HD", "LOW", "NKE", "DIS", "KO", "MCD", "PG", "BA",
-    "CAT", "DE", "GE", "MMM", "HON", "LMT", "NOC", "RTX", "UNP", "SPY",
-    "QQQ", "IWM", "DIA", "TQQQ", "SQQQ", "SOXL", "SOXS", "SMH", "XLF", "XLK",
-]
+SP500_SOURCE_URL = "https://datahub.io/core/s-and-p-500-companies/r/constituents.csv"
+SP500_BUNDLED_SNAPSHOT_PATH = Path(__file__).resolve().parent / "data" / "us_sp500_snapshot.csv"
 
 
 class USDayTradingSelector:
@@ -70,6 +60,144 @@ class USDayTradingSelector:
         self._daily_bars_cache: Dict[str, List[Dict[str, Any]]] = {}
         self._orderbook_available = False
 
+    def _sp500_cache_path(self) -> Path:
+        return Path("out") / f"us_sp500_constituents_{self.today_us}.csv"
+
+    @staticmethod
+    def _read_sp500_csv(path: Path) -> Tuple[List[str], Dict[str, str]]:
+        symbols: List[str] = []
+        names: Dict[str, str] = {}
+        seen = set()
+        if not path.exists():
+            return symbols, names
+
+        try:
+            with path.open("r", encoding="utf-8", newline="") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    raw_symbol = (
+                        row.get("symbol")
+                        or row.get("Symbol")
+                        or row.get("ticker")
+                        or row.get("Ticker")
+                        or ""
+                    )
+                    symbol = normalize_symbol(raw_symbol)
+                    if not symbol or symbol in seen:
+                        continue
+                    seen.add(symbol)
+                    symbols.append(symbol)
+
+                    raw_name = (
+                        row.get("name")
+                        or row.get("Name")
+                        or row.get("security")
+                        or row.get("Security")
+                        or ""
+                    )
+                    name = str(raw_name).strip()
+                    if name:
+                        names[symbol] = name
+        except Exception:
+            return [], {}
+        return symbols, names
+
+    @staticmethod
+    def _write_sp500_csv(path: Path, symbols: List[str], names: Dict[str, str]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["symbol", "name"])
+            for symbol in symbols:
+                writer.writerow([symbol, names.get(symbol, "")])
+
+    def _fetch_sp500_remote(self) -> Tuple[List[str], Dict[str, str]]:
+        try:
+            resp = requests.get(SP500_SOURCE_URL, timeout=10)
+            resp.raise_for_status()
+        except Exception as exc:
+            print(f"[universe] US objective remote fetch failed: {exc}", flush=True)
+            return [], {}
+
+        try:
+            reader = csv.DictReader(resp.text.splitlines())
+        except Exception:
+            return [], {}
+
+        symbols: List[str] = []
+        names: Dict[str, str] = {}
+        seen = set()
+        for row in reader:
+            raw_symbol = (
+                row.get("symbol")
+                or row.get("Symbol")
+                or row.get("ticker")
+                or row.get("Ticker")
+                or ""
+            )
+            symbol = normalize_symbol(raw_symbol)
+            if not symbol or symbol in seen:
+                continue
+            seen.add(symbol)
+            symbols.append(symbol)
+
+            raw_name = (
+                row.get("name")
+                or row.get("Name")
+                or row.get("security")
+                or row.get("Security")
+                or ""
+            )
+            name = str(raw_name).strip()
+            if name:
+                names[symbol] = name
+        return symbols, names
+
+    def _build_objective_universe(self) -> Tuple[List[str], Dict[str, str]]:
+        source = ""
+        symbols: List[str] = []
+        names: Dict[str, str] = {}
+
+        cache_path = self._sp500_cache_path()
+        cached_symbols, cached_names = self._read_sp500_csv(cache_path)
+        if cached_symbols:
+            source = f"cache:{cache_path}"
+            symbols = cached_symbols
+            names = cached_names
+        else:
+            remote_symbols, remote_names = self._fetch_sp500_remote()
+            if remote_symbols:
+                source = f"remote:{SP500_SOURCE_URL}"
+                symbols = remote_symbols
+                names = remote_names
+                try:
+                    self._write_sp500_csv(cache_path, symbols, names)
+                except Exception:
+                    pass
+            else:
+                bundled_symbols, bundled_names = self._read_sp500_csv(SP500_BUNDLED_SNAPSHOT_PATH)
+                if bundled_symbols:
+                    source = f"bundled:{SP500_BUNDLED_SNAPSHOT_PATH}"
+                    symbols = bundled_symbols
+                    names = bundled_names
+
+        if not symbols:
+            print(
+                "[universe] US objective pool unavailable (S&P500 source and snapshot failed).",
+                flush=True,
+            )
+            return [], {}
+
+        target = min(self.config.us_universe_size, len(symbols))
+        selected_symbols = symbols[:target]
+        selected_names = {symbol: names.get(symbol, "") for symbol in selected_symbols if names.get(symbol)}
+        print(
+            f"[universe] US objective pool selected: {len(selected_symbols)}/{len(symbols)} "
+            f"(basis=S&P500_constituents, source={source}, us_universe_size={self.config.us_universe_size})",
+            flush=True,
+        )
+        return selected_symbols, selected_names
+
     def load_universe(self) -> Tuple[List[str], Dict[str, str]]:
         symbols: List[str]
         names: Dict[str, str]
@@ -80,8 +208,7 @@ class USDayTradingSelector:
                 raise FileNotFoundError(f"US universe file not found: {universe_path}")
             symbols, names = parse_us_universe_file(universe_path)
         else:
-            symbols = list(DEFAULT_US_SYMBOLS)
-            names = {}
+            symbols, names = self._build_objective_universe()
 
         deduped: List[str] = []
         deduped_names: Dict[str, str] = {}
@@ -572,7 +699,7 @@ class USDayTradingSelector:
 
     def _build_candidates_with_thresholds(
         self,
-        symbols: List[str],
+        codes: List[str],
         names: Dict[str, str],
         min_change_pct: float,
         min_gap_pct: float,
@@ -580,9 +707,9 @@ class USDayTradingSelector:
         limit: int,
     ) -> List[Stage1Candidate]:
         candidates: List[Stage1Candidate] = []
-        total = len(symbols)
+        total = len(codes)
         progress_every = max(1, self.config.stage1_log_interval)
-        for idx, symbol in enumerate(symbols, start=1):
+        for idx, symbol in enumerate(codes, start=1):
             try:
                 snap = self.fetch_price_snapshot(symbol)
                 if snap is None:
@@ -650,10 +777,10 @@ class USDayTradingSelector:
         return candidates[:limit]
 
     def build_stage1_candidates(
-        self, symbols: List[str], names: Dict[str, str]
+        self, codes: List[str], names: Dict[str, str]
     ) -> List[Stage1Candidate]:
         return self._build_candidates_with_thresholds(
-            symbols=symbols,
+            codes=codes,
             names=names,
             min_change_pct=self.config.min_change_pct,
             min_gap_pct=self.config.min_gap_pct,
@@ -663,7 +790,7 @@ class USDayTradingSelector:
 
     def build_fallback_candidates(
         self,
-        symbols: List[str],
+        codes: List[str],
         names: Dict[str, str],
         exclude_codes: set[str],
         needed: int,
@@ -694,7 +821,7 @@ class USDayTradingSelector:
                 flush=True,
             )
             profile_candidates = self._build_candidates_with_thresholds(
-                symbols=symbols,
+                codes=codes,
                 names=names,
                 min_change_pct=chg,
                 min_gap_pct=gap,

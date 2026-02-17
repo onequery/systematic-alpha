@@ -14,6 +14,8 @@ class StrategyConfig:
     mock: bool
     us_exchange: str
     us_poll_interval: float
+    kr_universe_size: int
+    us_universe_size: int
     universe_file: Optional[str]
     max_symbols_scan: int
     pre_candidates: int
@@ -40,6 +42,7 @@ class StrategyConfig:
     realtime_log_interval: int
     overnight_report_path: Optional[str]
     output_json_path: Optional[str]
+    test_assume_open: bool
 
 
 @dataclass

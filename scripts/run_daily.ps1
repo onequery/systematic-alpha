@@ -4,11 +4,36 @@
     [ValidateSet("KR", "US")]
     [string]$Market = "KR",
     [string]$UsExchange = "NASD",
+    [double]$UsPollInterval = 2.0,
     [string]$UniverseFile = "",
     [switch]$RequireUsOpen = $false,
+    [switch]$AssumeOpenForTest = $false,
     [int]$UsOpenWindowMinutes = 20,
     [int]$CollectSeconds = 600,
     [int]$FinalPicks = 3,
+    [int]$PreCandidates = 40,
+    [int]$MaxSymbolsScan = 500,
+    [int]$KrUniverseSize = 500,
+    [int]$UsUniverseSize = 500,
+    [double]$MinChangePct = 3.0,
+    [double]$MinGapPct = 2.0,
+    [double]$MinPrevTurnover = 10000000000,
+    [double]$MinStrength = 100.0,
+    [double]$MinVolRatio = 0.10,
+    [double]$MinBidAskRatio = 1.2,
+    [int]$MinPassConditions = 5,
+    [double]$MinMaintainRatio = 0.6,
+    [double]$RestSleepSec = 0.03,
+    [switch]$AllowShortBias = $false,
+    [int]$MinExecTicks = 30,
+    [int]$MinOrderbookTicks = 30,
+    [double]$MinRealtimeCumVolume = 1.0,
+    [double]$MinRealtimeCoverageRatio = 0.8,
+    [switch]$AllowLowCoverage = $false,
+    [int]$Stage1LogInterval = 20,
+    [int]$RealtimeLogInterval = 10,
+    [string]$OvernightReportPath = "",
+    [switch]$Mock = $false,
     [int]$StartDelaySeconds = 5,
     [int]$MaxAttempts = 4,
     [int]$RetryDelaySeconds = 30,
@@ -41,10 +66,23 @@ function Test-Truthy {
 }
 
 function Import-DotEnv {
-    param([string]$Path)
+    param(
+        [string]$Path,
+        [string[]]$AllowedKeys = @()
+    )
 
     if (-not (Test-Path $Path)) {
         return
+    }
+
+    $allowLookup = $null
+    if ($AllowedKeys -and $AllowedKeys.Count -gt 0) {
+        $allowLookup = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($item in $AllowedKeys) {
+            if (-not [string]::IsNullOrWhiteSpace($item)) {
+                [void]$allowLookup.Add($item.Trim())
+            }
+        }
     }
 
     foreach ($raw in Get-Content -Path $Path -Encoding UTF8) {
@@ -62,6 +100,9 @@ function Import-DotEnv {
         $key = $line.Substring(0, $eqIdx).Trim()
         $value = $line.Substring($eqIdx + 1).Trim()
         if ([string]::IsNullOrWhiteSpace($key)) {
+            continue
+        }
+        if ($allowLookup -ne $null -and -not $allowLookup.Contains($key)) {
             continue
         }
         if ($value.Length -ge 2) {
@@ -148,6 +189,76 @@ function Get-SelectionSummary {
     return ($lines -join "`n")
 }
 
+function Send-TelegramViaPython {
+    param([string]$Text)
+
+    if ([string]::IsNullOrWhiteSpace($Text)) {
+        return $false
+    }
+    if ([string]::IsNullOrWhiteSpace($PythonExe)) {
+        return $false
+    }
+
+    $pyScript = @'
+import json
+import os
+import sys
+import requests
+
+token = os.environ.get("SA_TELEGRAM_BOT_TOKEN", "").strip()
+chat_id = os.environ.get("SA_TELEGRAM_CHAT_ID", "").strip()
+thread_id = os.environ.get("SA_TELEGRAM_THREAD_ID", "").strip()
+disable_notification = os.environ.get("SA_TELEGRAM_DISABLE_NOTIFICATION", "").strip().lower() in {"1","true","yes","y","on"}
+text = os.environ.get("SA_TELEGRAM_TEXT", "")
+
+if not token or not chat_id or not text:
+    sys.exit(2)
+
+for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY", "all_proxy"):
+    os.environ.pop(key, None)
+
+url = f"https://api.telegram.org/bot{token}/sendMessage"
+payload = {
+    "chat_id": chat_id,
+    "text": text,
+    "disable_web_page_preview": True,
+}
+if disable_notification:
+    payload["disable_notification"] = True
+if thread_id:
+    try:
+        payload["message_thread_id"] = int(thread_id)
+    except Exception:
+        pass
+
+resp = requests.post(url, json=payload, timeout=15)
+resp.raise_for_status()
+obj = resp.json()
+if not obj.get("ok"):
+    raise RuntimeError(f"telegram_api_error:{obj}")
+sys.exit(0)
+'@
+
+    $env:SA_TELEGRAM_BOT_TOKEN = $script:TelegramBotToken
+    $env:SA_TELEGRAM_CHAT_ID = $script:TelegramChatId
+    $env:SA_TELEGRAM_THREAD_ID = $script:TelegramThreadId
+    $env:SA_TELEGRAM_DISABLE_NOTIFICATION = if ($script:TelegramDisableNotification) { "1" } else { "0" }
+    $env:SA_TELEGRAM_TEXT = $Text
+
+    try {
+        $pyScript | & $PythonExe - 2>$null
+        return ($LASTEXITCODE -eq 0)
+    } catch {
+        return $false
+    } finally {
+        Remove-Item Env:SA_TELEGRAM_BOT_TOKEN -ErrorAction SilentlyContinue
+        Remove-Item Env:SA_TELEGRAM_CHAT_ID -ErrorAction SilentlyContinue
+        Remove-Item Env:SA_TELEGRAM_THREAD_ID -ErrorAction SilentlyContinue
+        Remove-Item Env:SA_TELEGRAM_DISABLE_NOTIFICATION -ErrorAction SilentlyContinue
+        Remove-Item Env:SA_TELEGRAM_TEXT -ErrorAction SilentlyContinue
+    }
+}
+
 function Send-TelegramMessage {
     param([string]$Text)
 
@@ -206,6 +317,10 @@ function Send-TelegramMessage {
             return
         }
         Write-MonitorLog "[telegram] send failed: $($_.Exception.Message)"
+        if (Send-TelegramViaPython -Text $Text) {
+            Write-MonitorLog "[telegram] fallback send succeeded (python requests)."
+            return
+        }
     }
 }
 
@@ -236,6 +351,11 @@ function Normalize-TelegramToken {
         $clean = $clean.Substring(3)
     }
     return $clean
+}
+
+function To-InvariantString {
+    param([double]$Value)
+    return $Value.ToString([System.Globalization.CultureInfo]::InvariantCulture)
 }
 
 function Wait-WithProgress {
@@ -299,8 +419,19 @@ if ([string]::IsNullOrWhiteSpace($PythonExe)) {
 
 Set-Location $ProjectRoot
 
-Import-DotEnv -Path (Join-Path $ProjectRoot ".env")
+Import-DotEnv -Path (Join-Path $ProjectRoot ".env") -AllowedKeys @(
+    "KIS_APP_KEY",
+    "KIS_APP_SECRET",
+    "KIS_ACC_NO",
+    "KIS_USER_ID",
+    "TELEGRAM_ENABLED",
+    "TELEGRAM_BOT_TOKEN",
+    "TELEGRAM_CHAT_ID",
+    "TELEGRAM_THREAD_ID",
+    "TELEGRAM_DISABLE_NOTIFICATION"
+)
 Ensure-Tls12
+Write-MonitorLog "[config] .env secrets loaded (whitelist). strategy/runtime params are sourced from run_daily.ps1 arguments."
 
 $script:TelegramBotToken = Normalize-TelegramToken ([string]$env:TELEGRAM_BOT_TOKEN)
 $script:TelegramChatId = [string]$env:TELEGRAM_CHAT_ID
@@ -341,25 +472,75 @@ $stamp = Get-Date -Format "yyyyMMdd_HHmmss"
 $marketTag = if ($Market -eq "US") { "us" } else { "kr" }
 $script:RunLogFile = Join-Path $ProjectRoot ("logs\runner_{0}_{1}.log" -f $marketTag, $stamp)
 $outputJson = Join-Path $ProjectRoot ("out\{0}_daily_{1}.json" -f $marketTag, $stamp)
+$resolvedOvernightReportPath = if ([string]::IsNullOrWhiteSpace($OvernightReportPath)) {
+    Join-Path $ProjectRoot "out\selection_overnight_report.csv"
+} else {
+    $OvernightReportPath
+}
 $baseArgs = @(
     "main.py",
     "--market", $Market.ToLowerInvariant(),
     "--collect-seconds", "$CollectSeconds",
     "--final-picks", "$FinalPicks",
+    "--pre-candidates", "$PreCandidates",
+    "--max-symbols-scan", "$MaxSymbolsScan",
+    "--kr-universe-size", "$KrUniverseSize",
+    "--us-universe-size", "$UsUniverseSize",
+    "--min-change-pct", (To-InvariantString -Value $MinChangePct),
+    "--min-gap-pct", (To-InvariantString -Value $MinGapPct),
+    "--min-prev-turnover", (To-InvariantString -Value $MinPrevTurnover),
+    "--min-strength", (To-InvariantString -Value $MinStrength),
+    "--min-vol-ratio", (To-InvariantString -Value $MinVolRatio),
+    "--min-bid-ask-ratio", (To-InvariantString -Value $MinBidAskRatio),
+    "--min-pass-conditions", "$MinPassConditions",
+    "--min-maintain-ratio", (To-InvariantString -Value $MinMaintainRatio),
+    "--rest-sleep", (To-InvariantString -Value $RestSleepSec),
+    "--min-exec-ticks", "$MinExecTicks",
+    "--min-orderbook-ticks", "$MinOrderbookTicks",
+    "--min-realtime-cum-volume", (To-InvariantString -Value $MinRealtimeCumVolume),
+    "--min-realtime-coverage-ratio", (To-InvariantString -Value $MinRealtimeCoverageRatio),
+    "--stage1-log-interval", "$Stage1LogInterval",
+    "--realtime-log-interval", "$RealtimeLogInterval",
+    "--overnight-report-path", $resolvedOvernightReportPath,
     "--output-json", $outputJson
 )
 if ($Market -eq "US") {
     if (-not [string]::IsNullOrWhiteSpace($UsExchange)) {
         $baseArgs += @("--exchange", $UsExchange)
     }
+    $baseArgs += @("--us-poll-interval", (To-InvariantString -Value $UsPollInterval))
 }
 if (-not [string]::IsNullOrWhiteSpace($UniverseFile)) {
     $baseArgs += @("--universe-file", $UniverseFile)
 }
+if ($AssumeOpenForTest) {
+    $baseArgs += @("--test-assume-open")
+}
+if ($AllowShortBias) {
+    $baseArgs += @("--allow-short-bias")
+} else {
+    $baseArgs += @("--long-only")
+}
+if ($AllowLowCoverage) {
+    $baseArgs += @("--allow-low-coverage")
+} else {
+    $baseArgs += @("--invalidate-on-low-coverage")
+}
+if ($Mock) {
+    $baseArgs += @("--mock")
+}
 
 Write-MonitorLog "[run] monitor_log: $script:RunLogFile"
+Write-MonitorLog (
+    "[strategy] market=$Market, collect=$CollectSeconds, final_picks=$FinalPicks, pre_candidates=$PreCandidates, " +
+    "max_scan=$MaxSymbolsScan, kr_pool=$KrUniverseSize, us_pool=$UsUniverseSize, " +
+    "change=$MinChangePct, gap=$MinGapPct, prev_turnover=$MinPrevTurnover, " +
+    "strength=$MinStrength, vol_ratio=$MinVolRatio, bid_ask_ratio=$MinBidAskRatio, " +
+    "pass_conditions=$MinPassConditions, maintain_ratio=$MinMaintainRatio, " +
+    "long_only=$(-not $AllowShortBias), allow_low_coverage=$AllowLowCoverage"
+)
 
-if ($Market -eq "US" -and $RequireUsOpen) {
+if ($Market -eq "US" -and $RequireUsOpen -and -not $AssumeOpenForTest) {
     $state = Get-UsMarketState
     $openWindow = [Math]::Max(1, $UsOpenWindowMinutes)
     $withinOpenWindow = $state.is_weekday -and ($state.minutes_from_open -ge 0) -and ($state.minutes_from_open -lt $openWindow)
@@ -402,6 +583,9 @@ if ($Market -eq "US" -and $RequireUsOpen) {
     Set-Content -Path $usDayLock -Value $lockText -Encoding UTF8
     Write-MonitorLog "[market-check] created US daily lock: $usDayLock"
 }
+elseif ($Market -eq "US" -and $RequireUsOpen -and $AssumeOpenForTest) {
+    Write-MonitorLog "[market-check] RequireUsOpen bypassed by AssumeOpenForTest."
+}
 
 $hostTag = "$env:COMPUTERNAME/$env:USERNAME"
 $exchangeLabel = if ($Market -eq "US") { $UsExchange } else { "KRX" }
@@ -411,6 +595,7 @@ if ($NotifyStart) {
         "host=$hostTag`n" +
         "market=$Market`n" +
         "exchange=$exchangeLabel`n" +
+        "assume_open_test=$AssumeOpenForTest`n" +
         "collect_seconds=$CollectSeconds`n" +
         "final_picks=$FinalPicks`n" +
         "max_attempts=$MaxAttempts"
@@ -437,10 +622,17 @@ for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
 
     try {
         $combinedOutputList = New-Object System.Collections.Generic.List[string]
-        & $PythonExe -u @baseArgs 2>&1 | ForEach-Object {
-            $line = "$_"
-            $combinedOutputList.Add($line) | Out-Null
-            $line | Tee-Object -FilePath $attemptLog -Append
+        $prevErrorActionPreference = $ErrorActionPreference
+        try {
+            # Native stderr should be captured as log lines, not treated as terminating PowerShell errors.
+            $ErrorActionPreference = "Continue"
+            & $PythonExe -u @baseArgs 2>&1 | ForEach-Object {
+                $line = "$_"
+                $combinedOutputList.Add($line) | Out-Null
+                $line | Tee-Object -FilePath $attemptLog -Append
+            }
+        } finally {
+            $ErrorActionPreference = $prevErrorActionPreference
         }
         $combinedOutput = $combinedOutputList.ToArray()
         $nativeExit = $LASTEXITCODE
@@ -450,8 +642,10 @@ for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
             $exitCode = [int]$nativeExit
         }
     } catch {
-        $combinedOutput = @($_.Exception.Message)
+        $errText = $_ | Out-String
+        $combinedOutput = @($errText)
         $combinedOutput | Tee-Object -FilePath $attemptLog
+        Write-MonitorLog "[attempt $attempt/$MaxAttempts] pipeline exception: $($_.Exception.Message)"
         $exitCode = 9009
     }
     $stopwatch.Stop()

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import time
 from datetime import datetime
 from pathlib import Path
@@ -43,6 +44,91 @@ class DayTradingSelector:
         self._price_cache: Dict[str, Optional[Dict[str, Any]]] = {}
         self._daily_bars_cache: Dict[str, List[Dict[str, Any]]] = {}
 
+    def _liquidity_cache_path(self) -> Path:
+        return Path("out") / f"kr_universe_liquidity_{self.today_kst}.csv"
+
+    def _read_liquidity_cache(self, path: Path) -> Tuple[List[str], Dict[str, str]]:
+        codes: List[str] = []
+        names: Dict[str, str] = {}
+        if not path.exists():
+            return codes, names
+        try:
+            with path.open("r", encoding="utf-8", newline="") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    code = normalize_code(row.get("code", "")).strip()
+                    if len(code) != 6 or not code.isdigit():
+                        continue
+                    if code in names:
+                        continue
+                    codes.append(code)
+                    name = str(row.get("name", "")).strip()
+                    if name:
+                        names[code] = name
+        except Exception:
+            return [], {}
+        return codes, names
+
+    def _write_liquidity_cache(self, path: Path, rows: List[Tuple[str, str, float]]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["code", "name", "prev_turnover"])
+            for code, name, turnover in rows:
+                writer.writerow([code, name, f"{turnover:.0f}"])
+
+    def _build_objective_universe(self) -> Tuple[List[str], Dict[str, str]]:
+        cache_path = self._liquidity_cache_path()
+        cached_codes, cached_names = self._read_liquidity_cache(cache_path)
+        if cached_codes:
+            target = min(self.config.kr_universe_size, len(cached_codes))
+            selected_codes = cached_codes[:target]
+            selected_names = {code: cached_names.get(code, "") for code in selected_codes}
+            print(
+                f"[universe] KR objective pool from cache: {target}/{len(cached_codes)} "
+                f"(basis=prev_day_turnover_rank)",
+                flush=True,
+            )
+            return selected_codes, selected_names
+
+        symbols_df = self.broker.fetch_symbols()
+        max_count = len(symbols_df.index) if hasattr(symbols_df, "index") else 20000
+        all_codes, all_names = extract_codes_and_names_from_df(symbols_df, max_count=max_count)
+
+        ranked: List[Tuple[str, str, float]] = []
+        total = len(all_codes)
+        progress_every = max(50, self.config.stage1_log_interval * 10)
+        for idx, code in enumerate(all_codes, start=1):
+            try:
+                prev = self.fetch_prev_day_stats(code)
+                if prev is None or prev.prev_turnover <= 0:
+                    continue
+                ranked.append((code, all_names.get(code, ""), prev.prev_turnover))
+            finally:
+                if idx % progress_every == 0 or idx == total:
+                    pct = (idx / total * 100.0) if total > 0 else 100.0
+                    print(
+                        f"[universe] liquidity-scan={idx}/{total} ({pct:.1f}%), ranked={len(ranked)}",
+                        flush=True,
+                    )
+                if self.config.rest_sleep_sec > 0:
+                    time.sleep(self.config.rest_sleep_sec)
+
+        ranked.sort(key=lambda item: item[2], reverse=True)
+        if ranked:
+            self._write_liquidity_cache(cache_path, ranked)
+
+        target = min(self.config.kr_universe_size, len(ranked))
+        selected = ranked[:target]
+        selected_codes = [code for code, _, _ in selected]
+        selected_names = {code: name for code, name, _ in selected if name}
+        print(
+            f"[universe] KR objective pool built: {len(selected_codes)}/{len(ranked)} "
+            f"(basis=prev_day_turnover_rank)",
+            flush=True,
+        )
+        return selected_codes, selected_names
+
     def load_universe(self) -> Tuple[List[str], Dict[str, str]]:
         if self.config.universe_file:
             universe_path = Path(self.config.universe_file)
@@ -67,8 +153,24 @@ class DayTradingSelector:
 
             return codes, names
 
-        symbols_df = self.broker.fetch_symbols()
-        return extract_codes_and_names_from_df(symbols_df, self.config.max_symbols_scan)
+        objective_codes, objective_names = self._build_objective_universe()
+        if not objective_codes:
+            symbols_df = self.broker.fetch_symbols()
+            codes, names = extract_codes_and_names_from_df(symbols_df, self.config.max_symbols_scan)
+            print(
+                f"[universe] fallback to raw symbol list: {len(codes)} (objective pool unavailable)",
+                flush=True,
+            )
+            return codes, names
+
+        final_codes = objective_codes[: self.config.max_symbols_scan]
+        final_names = {code: objective_names.get(code, "") for code in final_codes}
+        print(
+            f"[universe] KR objective pool selected: {len(final_codes)} "
+            f"(kr_universe_size={self.config.kr_universe_size}, max_symbols_scan={self.config.max_symbols_scan})",
+            flush=True,
+        )
+        return final_codes, final_names
 
     def fetch_prev_day_stats(self, code: str) -> Optional[PrevDayStats]:
         if code in self._daily_cache:
@@ -556,19 +658,47 @@ class DayTradingSelector:
             return stats, quality
 
         log_interval = max(1, self.config.realtime_log_interval)
-        ws = self.mojito.KoreaInvestmentWS(
-            self.config.api_key,
-            self.config.api_secret,
-            ["H0STCNT0", "H0STASP0"],
-            codes,
-            user_id=self.config.user_id,
-        )
+        try:
+            ws = self.mojito.KoreaInvestmentWS(
+                self.config.api_key,
+                self.config.api_secret,
+                ["H0STCNT0", "H0STASP0"],
+                codes,
+                user_id=self.config.user_id,
+            )
+        except Exception as exc:
+            print(f"[realtime] websocket init failed: {exc}", flush=True)
+            quality = RealtimeQuality(
+                realtime_ready=False,
+                quality_ok=False,
+                coverage_ratio=0.0,
+                eligible_count=0,
+                total_count=len(codes),
+                min_exec_ticks=self.config.min_exec_ticks,
+                min_orderbook_ticks=self.config.min_orderbook_ticks,
+                min_realtime_cum_volume=self.config.min_realtime_cum_volume,
+            )
+            return stats, quality
 
         print(
             f"[realtime] starting websocket: codes={len(codes)}, duration={self.config.collect_seconds}s, heartbeat={log_interval}s",
             flush=True,
         )
-        ws.start()
+        try:
+            ws.start()
+        except Exception as exc:
+            print(f"[realtime] websocket start failed: {exc}", flush=True)
+            quality = RealtimeQuality(
+                realtime_ready=False,
+                quality_ok=False,
+                coverage_ratio=0.0,
+                eligible_count=0,
+                total_count=len(codes),
+                min_exec_ticks=self.config.min_exec_ticks,
+                min_orderbook_ticks=self.config.min_orderbook_ticks,
+                min_realtime_cum_volume=self.config.min_realtime_cum_volume,
+            )
+            return stats, quality
         execution_events = 0
         orderbook_events = 0
         first_exec_logged = False

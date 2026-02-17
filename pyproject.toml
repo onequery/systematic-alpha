@@ -25,4 +25,4 @@ py-modules = ["main"]
 packages = ["systematic_alpha"]
 
 [tool.setuptools.package-data]
-systematic_alpha = ["data/*.txt"]
+systematic_alpha = ["data/*.txt", "data/*.csv"]

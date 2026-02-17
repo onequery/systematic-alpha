@@ -1,13 +1,10 @@
 from __future__ import annotations
 
 import argparse
-import os
-from pathlib import Path
 
 from systematic_alpha.cli import run
 from systematic_alpha.credentials import load_credentials
 from systematic_alpha.dotenv import load_dotenv
-from systematic_alpha.helpers import env_bool, env_float, env_int
 from systematic_alpha.models import StrategyConfig
 
 
@@ -18,117 +15,129 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--market",
         choices=["kr", "us"],
-        default=os.getenv("MARKET", "kr").strip().lower(),
+        default="kr",
         help="Target market: kr or us.",
     )
     parser.add_argument("--key-file", type=str, default=None, help="Path to KIS key file.")
     parser.add_argument(
         "--universe-file",
         type=str,
-        default=os.getenv("UNIVERSE_CODES_FILE"),
+        default=None,
         help="Optional text/csv file containing symbols (KR 6-digit codes or US tickers).",
     )
     parser.add_argument(
         "--us-universe-file",
         type=str,
-        default=os.getenv("US_UNIVERSE_FILE"),
-        help="Optional text/csv file containing US symbols (used when --market us).",
+        default=None,
+        help="Optional text/csv file containing US symbols (used when --market us, override objective pool).",
     )
     parser.add_argument(
         "--exchange",
         type=str,
-        default=os.getenv("US_EXCHANGE", "NASD"),
+        default="NASD",
         help="US exchange for KIS overseas routing (NASD/NYSE/AMEX).",
     )
     parser.add_argument(
         "--us-poll-interval",
         type=float,
-        default=env_float("US_POLL_INTERVAL", 2.0),
+        default=2.0,
         help="US realtime polling interval in seconds (REST polling mode).",
     )
     parser.add_argument(
         "--collect-seconds",
         type=int,
-        default=env_int("COLLECT_SECONDS", 600),
+        default=600,
         help="Realtime collection duration in seconds.",
     )
     parser.add_argument(
         "--max-symbols-scan",
         type=int,
-        default=env_int("MAX_SYMBOLS_SCAN", 400),
+        default=500,
         help="Maximum symbol count to scan in stage1.",
+    )
+    parser.add_argument(
+        "--kr-universe-size",
+        type=int,
+        default=500,
+        help="Objective KR universe size before stage1 scan (liquidity-ranked).",
+    )
+    parser.add_argument(
+        "--us-universe-size",
+        type=int,
+        default=500,
+        help="Objective US universe size before stage1 scan (S&P 500 based).",
     )
     parser.add_argument(
         "--pre-candidates",
         type=int,
-        default=env_int("PRE_CANDIDATES", 40),
+        default=40,
         help="Max candidate count after stage1.",
     )
     parser.add_argument(
         "--final-picks",
         type=int,
-        default=env_int("FINAL_PICKS", 3),
+        default=3,
         help="Number of final picks.",
     )
     parser.add_argument(
         "--min-change-pct",
         type=float,
-        default=env_float("MIN_CHANGE_PCT", 3.0),
+        default=3.0,
         help="Current-day change %% threshold. In long-only mode, change must be >= threshold.",
     )
     parser.add_argument(
         "--min-gap-pct",
         type=float,
-        default=env_float("MIN_GAP_PCT", 2.0),
+        default=2.0,
         help="Opening gap %% threshold. In long-only mode, gap must be >= threshold.",
     )
     parser.add_argument(
         "--min-prev-turnover",
         type=float,
-        default=env_float("MIN_PREV_TURNOVER", 10_000_000_000),
+        default=10_000_000_000,
         help="Previous day turnover threshold (quote-currency). Default is 10,000,000,000.",
     )
     parser.add_argument(
         "--min-strength",
         type=float,
-        default=env_float("MIN_STRENGTH", 100.0),
+        default=100.0,
         help="Execution strength threshold.",
     )
     parser.add_argument(
         "--min-vol-ratio",
         type=float,
-        default=env_float("MIN_VOL_RATIO", 0.10),
+        default=0.10,
         help="Intraday volume ratio threshold (today volume / prev day volume).",
     )
     parser.add_argument(
         "--min-bid-ask-ratio",
         type=float,
-        default=env_float("MIN_BID_ASK_RATIO", 1.2),
+        default=1.2,
         help="Bid/ask remaining quantity ratio threshold.",
     )
     parser.add_argument(
         "--min-pass-conditions",
         type=int,
-        default=env_int("MIN_PASS_CONDITIONS", 5),
+        default=5,
         help="Pass cut for 8-condition realtime mode.",
     )
     parser.add_argument(
         "--min-maintain-ratio",
         type=float,
-        default=env_float("MIN_MAINTAIN_RATIO", 0.6),
+        default=0.6,
         help="Required hit ratio for 'maintained' conditions.",
     )
     parser.add_argument(
         "--rest-sleep",
         type=float,
-        default=env_float("REST_SLEEP_SEC", 0.03),
+        default=0.03,
         help="Small delay between REST calls to reduce burst rate.",
     )
     parser.add_argument(
         "--long-only",
         dest="long_only",
         action="store_true",
-        default=env_bool("LONG_ONLY", True),
+        default=True,
         help="Use long-only directional filters (change/gap must be positive and above thresholds).",
     )
     parser.add_argument(
@@ -140,32 +149,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--min-exec-ticks",
         type=int,
-        default=env_int("MIN_EXEC_TICKS", 30),
+        default=30,
         help="Minimum execution tick samples per symbol for realtime quality eligibility.",
     )
     parser.add_argument(
         "--min-orderbook-ticks",
         type=int,
-        default=env_int("MIN_ORDERBOOK_TICKS", 30),
+        default=30,
         help="Minimum orderbook tick samples per symbol for realtime quality eligibility.",
     )
     parser.add_argument(
         "--min-realtime-cum-volume",
         type=float,
-        default=env_float("MIN_REALTIME_CUM_VOLUME", 1.0),
+        default=1.0,
         help="Minimum cumulative realtime trade volume per symbol for realtime quality eligibility.",
     )
     parser.add_argument(
         "--min-realtime-coverage-ratio",
         type=float,
-        default=env_float("MIN_REALTIME_COVERAGE_RATIO", 0.8),
+        default=0.8,
         help="Minimum eligible symbol ratio required to validate realtime signal quality.",
     )
     parser.add_argument(
         "--invalidate-on-low-coverage",
         dest="invalidate_on_low_coverage",
         action="store_true",
-        default=env_bool("INVALIDATE_ON_LOW_COVERAGE", True),
+        default=True,
         help="If realtime coverage is too low, invalidate today's signal and emit no picks.",
     )
     parser.add_argument(
@@ -177,38 +186,51 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--stage1-log-interval",
         type=int,
-        default=env_int("STAGE1_LOG_INTERVAL", 20),
+        default=20,
         help="Print stage1 scan progress every N symbols.",
     )
     parser.add_argument(
         "--realtime-log-interval",
         type=int,
-        default=env_int("REALTIME_LOG_INTERVAL", 10),
+        default=10,
         help="Print realtime collection heartbeat every N seconds.",
     )
     parser.add_argument(
         "--mock",
         action="store_true",
-        default=os.getenv("KIS_MOCK", "0") == "1",
+        default=False,
         help="Use KIS mock server for REST calls.",
     )
     parser.add_argument(
         "--user-id",
         type=str,
-        default=os.getenv("KIS_USER_ID"),
+        default=None,
         help="Optional user id for websocket notice subscription.",
     )
     parser.add_argument(
         "--output-json",
         type=str,
-        default=os.getenv("SELECTION_OUTPUT_JSON"),
+        default=None,
         help="Optional output json file path.",
     )
     parser.add_argument(
         "--overnight-report-path",
         type=str,
-        default=os.getenv("OVERNIGHT_REPORT_PATH", "./out/selection_overnight_report.csv"),
+        default="./out/selection_overnight_report.csv",
         help="CSV path for selected-symbol overnight performance tracking report.",
+    )
+    parser.add_argument(
+        "--test-assume-open",
+        dest="test_assume_open",
+        action="store_true",
+        default=False,
+        help="Testing mode: assume market-open conditions and inject realtime-like fallback when closed.",
+    )
+    parser.add_argument(
+        "--normal-market-mode",
+        dest="test_assume_open",
+        action="store_false",
+        help="Disable test-assume-open behavior.",
     )
     return parser.parse_args()
 
@@ -221,8 +243,6 @@ def build_config(args: argparse.Namespace) -> StrategyConfig:
     if market == "US":
         if args.us_universe_file:
             universe_file = args.us_universe_file
-        elif not universe_file:
-            universe_file = str(Path("systematic_alpha") / "data" / "us_universe_default.txt")
     return StrategyConfig(
         market=market,
         api_key=api_key,
@@ -232,6 +252,8 @@ def build_config(args: argparse.Namespace) -> StrategyConfig:
         mock=args.mock,
         us_exchange=args.exchange,
         us_poll_interval=max(0.2, args.us_poll_interval),
+        kr_universe_size=max(50, args.kr_universe_size),
+        us_universe_size=max(50, args.us_universe_size),
         universe_file=universe_file,
         max_symbols_scan=args.max_symbols_scan,
         pre_candidates=args.pre_candidates,
@@ -258,6 +280,7 @@ def build_config(args: argparse.Namespace) -> StrategyConfig:
         realtime_log_interval=max(1, args.realtime_log_interval),
         overnight_report_path=args.overnight_report_path,
         output_json_path=args.output_json,
+        test_assume_open=args.test_assume_open,
     )
 
 

@@ -1,15 +1,13 @@
-[CmdletBinding(SupportsShouldProcess = $true)]
+[CmdletBinding()]
 param(
-    [string]$TaskName = "SystematicAlpha_0900"
+    [string]$TaskName = "SystematicAlpha_KR_Open_0900"
 )
 
 $ErrorActionPreference = "Stop"
-
-if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
-    if ($PSCmdlet.ShouldProcess($TaskName, "Remove scheduled task")) {
-        Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
-        Write-Output "Task removed: $TaskName"
-    }
-} else {
-    Write-Output "Task not found: $TaskName"
+$target = Join-Path $PSScriptRoot "remove_kr_task.ps1"
+if (-not (Test-Path $target)) {
+    throw "Target script not found: $target"
 }
+
+Write-Output "[alias] remove_task.ps1 is kept for backward compatibility. Use remove_kr_task.ps1."
+& $target -TaskName $TaskName
