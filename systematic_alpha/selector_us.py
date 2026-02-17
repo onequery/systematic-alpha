@@ -38,14 +38,14 @@ class USDayTradingSelector:
         raw_exchange = (config.us_exchange or "").strip()
         exchange_upper = raw_exchange.upper()
         exchange_map = {
-            "NASD": "나스닥",
-            "NASDAQ": "나스닥",
-            "NYSE": "뉴욕",
-            "NYS": "뉴욕",
-            "AMEX": "아멕스",
-            "AMS": "아멕스",
+            "NASD": "NASD",
+            "NASDAQ": "NASD",
+            "NYSE": "NYSE",
+            "NYS": "NYSE",
+            "AMEX": "AMEX",
+            "AMS": "AMEX",
         }
-        broker_exchange = exchange_map.get(exchange_upper, raw_exchange or "나스닥")
+        broker_exchange = exchange_map.get(exchange_upper, raw_exchange or "NASD")
         self.broker = self.mojito.KoreaInvestment(
             api_key=config.api_key,
             api_secret=config.api_secret,

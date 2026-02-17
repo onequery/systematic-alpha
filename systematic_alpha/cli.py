@@ -331,12 +331,31 @@ def build_assume_open_stage1_candidates(
     generated: List[Stage1Candidate] = []
     target = max(1, limit)
     for code in codes:
+        synthetic_seed = float(100.0 + len(generated))
         try:
             snap = selector.fetch_price_snapshot(code, use_cache=False)
             prev = selector.fetch_prev_day_stats(code)
         except Exception:
-            continue
-        if not snap or prev is None or prev.prev_close <= 0:
+            snap = None
+            prev = None
+
+        if not snap:
+            name = names.get(code, "") or code
+            generated.append(
+                Stage1Candidate(
+                    code=code,
+                    name=name,
+                    current_price=synthetic_seed,
+                    open_price=synthetic_seed,
+                    current_change_pct=0.0,
+                    gap_pct=0.0,
+                    prev_close=synthetic_seed,
+                    prev_day_volume=1_000_000.0,
+                    prev_day_turnover=synthetic_seed * 1_000_000.0,
+                )
+            )
+            if len(generated) >= target:
+                break
             continue
 
         price = snap.get("price")
@@ -347,10 +366,20 @@ def build_assume_open_stage1_candidates(
         if open_price is None or open_price <= 0:
             open_price = price
 
+        if prev is not None and prev.prev_close > 0:
+            prev_close = float(prev.prev_close)
+            prev_day_volume = float(prev.prev_volume)
+            prev_day_turnover = float(prev.prev_turnover)
+        else:
+            # Off-market synthetic fallback for test mode when prev-day bars are unavailable.
+            prev_close = float(open_price if open_price > 0 else price)
+            prev_day_volume = float(max(1.0, snap.get("acml_vol") or 1.0))
+            prev_day_turnover = float(max(prev_close * prev_day_volume, prev_close))
+
         change_pct = snap.get("change_pct")
         if change_pct is None:
-            change_pct = ((price - prev.prev_close) / prev.prev_close) * 100.0
-        gap_pct = ((open_price - prev.prev_close) / prev.prev_close) * 100.0
+            change_pct = ((price - prev_close) / prev_close) * 100.0 if prev_close > 0 else 0.0
+        gap_pct = ((open_price - prev_close) / prev_close) * 100.0 if prev_close > 0 else 0.0
         name = names.get(code, "") or str(snap.get("name") or "")
 
         generated.append(
@@ -361,9 +390,9 @@ def build_assume_open_stage1_candidates(
                 open_price=float(open_price),
                 current_change_pct=float(change_pct),
                 gap_pct=float(gap_pct),
-                prev_close=float(prev.prev_close),
-                prev_day_volume=float(prev.prev_volume),
-                prev_day_turnover=float(prev.prev_turnover),
+                prev_close=prev_close,
+                prev_day_volume=prev_day_volume,
+                prev_day_turnover=prev_day_turnover,
             )
         )
         if len(generated) >= target:

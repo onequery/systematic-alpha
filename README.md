@@ -15,8 +15,9 @@ This project is a CLI app (no UI). It reads secrets from `.env` and prints ranke
 - `--market kr` (default): domestic KR flow (REST + WebSocket)
 - `--market us`: overseas US flow (REST + polling)
 - Objective universe by default (no manual file required):
-  - KR: previous-day turnover rank top-N
-  - US: S&P 500 constituents top-N
+- KR: previous-day turnover rank top-N
+- US: S&P 500 constituents top-N
+- KR liquidity scan budget is capped by `max(max_symbols_scan, kr_universe_size)` to avoid full-market sweep latency.
 - Long-only directional mode by default (`change >= threshold`, `gap >= threshold`)
 - Fallback fill rule: if stage1 candidates are fewer than `--final-picks`, thresholds are relaxed step-by-step to fill missing slots.
 - Decision-time snapshot refresh: final scoring uses latest snapshot at selection completion time (not only early scan snapshot).
@@ -26,7 +27,7 @@ This project is a CLI app (no UI). It reads secrets from `.env` and prints ranke
 - Configurable thresholds via CLI arguments (scheduled runs use `scripts/run_daily.ps1` parameters)
 - JSON output export for downstream automation
 - Long-horizon analytics dataset accumulation (`out/YYYYMMDD/{kr|us}/analytics`) for post-hoc performance/strategy analysis
-- Telegram notifications for retry/failure/success status (optional)
+- Telegram notifications for stage/retry/failure/success status (optional)
 - Live progress/heartbeat logs during scan and realtime collection
 - Local `.env` loader (no external dotenv dependency)
 
@@ -140,7 +141,7 @@ Config policy:
 
 ### Telegram notifications (optional)
 
-If you want retry/failure/success alerts in Telegram:
+If you want stage/retry/failure/success alerts in Telegram:
 
 1. Create a bot in Telegram (`@BotFather`) and get bot token.
 2. Open chat with that bot once (send any message).
@@ -158,9 +159,14 @@ TELEGRAM_CHAT_ID=<your_chat_id>
 
 When configured, `scripts/run_daily.ps1` sends:
 - start notification at run begin (default)
+- stage notifications as pipeline enters `[1/4]` ~ `[4/4]`
 - retry notifications with short log tail
 - final failure notification with last error tail
 - final success notification with top picks summary + output json path
+
+When configured, prefetch scripts also send major events:
+- `scripts/prefetch_kr_universe.ps1`: start, cache-stage, success/failure
+- `scripts/prefetch_us_universe.ps1`: start, stage `1/2` and `2/2`, success/failure
 
 ## Run
 

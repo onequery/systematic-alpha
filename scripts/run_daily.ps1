@@ -342,6 +342,18 @@ function Write-MonitorLog {
     }
 }
 
+function Write-RunOutputLine {
+    param([string]$Line)
+    Write-Output $Line
+    if (-not [string]::IsNullOrWhiteSpace($script:RunLogFile)) {
+        try {
+            $Line | Out-File -FilePath $script:RunLogFile -Encoding UTF8 -Append
+        } catch {
+            # Ignore file logging failures and keep console output alive.
+        }
+    }
+}
+
 function Normalize-TelegramToken {
     param([string]$Token)
     if ([string]::IsNullOrWhiteSpace($Token)) {
@@ -486,6 +498,8 @@ foreach ($name in @("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "A
 # mojito token cache path uses "~/.cache/mojito2". Use project-local home for stability.
 $env:HOME = $ProjectRoot
 $env:USERPROFILE = $ProjectRoot
+$env:PYTHONIOENCODING = "utf-8"
+$env:PYTHONUTF8 = "1"
 
 $outputJson = Join-Path $runResultDir ("{0}_daily_{1}.json" -f $marketTag, $stamp)
 $resolvedOvernightReportPath = if ([string]::IsNullOrWhiteSpace($OvernightReportPath)) {
@@ -645,6 +659,7 @@ for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
 
     try {
         $combinedOutputList = New-Object System.Collections.Generic.List[string]
+        $stageNotified = @{}
         $prevErrorActionPreference = $ErrorActionPreference
         try {
             # Native stderr should be captured as log lines, not treated as terminating PowerShell errors.
@@ -652,7 +667,23 @@ for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
             & $PythonExe -u @baseArgs 2>&1 | ForEach-Object {
                 $line = "$_"
                 $combinedOutputList.Add($line) | Out-Null
-                $line | Tee-Object -FilePath $script:RunLogFile -Append
+                Write-RunOutputLine -Line $line
+
+                if ($line -match "\[(1/4|2/4|3/4|3\.5/4|4/4)\]") {
+                    $stageKey = $Matches[1]
+                    if (-not $stageNotified.ContainsKey($stageKey)) {
+                        $stageNotified[$stageKey] = $true
+                        Send-TelegramMessage (
+                            "[SystematicAlpha] stage`n" +
+                            "host=$hostTag`n" +
+                            "market=$Market`n" +
+                            "attempt=$attempt/$MaxAttempts`n" +
+                            "stage=$stageKey`n" +
+                            "event=$line`n" +
+                            "log=$script:RunLogFile"
+                        )
+                    }
+                }
             }
         } finally {
             $ErrorActionPreference = $prevErrorActionPreference
@@ -667,7 +698,9 @@ for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
     } catch {
         $errText = $_ | Out-String
         $combinedOutput = @($errText)
-        $combinedOutput | Tee-Object -FilePath $script:RunLogFile -Append
+        foreach ($outLine in $combinedOutput) {
+            Write-RunOutputLine -Line "$outLine"
+        }
         Write-MonitorLog "[attempt $attempt/$MaxAttempts] pipeline exception: $($_.Exception.Message)"
         $exitCode = 9009
     }

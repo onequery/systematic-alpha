@@ -220,11 +220,22 @@ class DayTradingSelector:
         symbols_df = self.broker.fetch_symbols()
         max_count = len(symbols_df.index) if hasattr(symbols_df, "index") else 20000
         all_codes, all_names = extract_codes_and_names_from_df(symbols_df, max_count=max_count)
+        scan_budget = min(
+            len(all_codes),
+            max(50, self.config.max_symbols_scan, self.config.kr_universe_size),
+        )
+        scan_codes = all_codes[:scan_budget]
+        if scan_budget < len(all_codes):
+            print(
+                f"[universe] KR liquidity scan capped: {scan_budget}/{len(all_codes)} "
+                f"(max_symbols_scan={self.config.max_symbols_scan}, kr_universe_size={self.config.kr_universe_size})",
+                flush=True,
+            )
 
         ranked: List[Tuple[str, str, float]] = []
-        total = len(all_codes)
+        total = len(scan_codes)
         progress_every = max(50, self.config.stage1_log_interval * 10)
-        for idx, code in enumerate(all_codes, start=1):
+        for idx, code in enumerate(scan_codes, start=1):
             try:
                 prev = self.fetch_prev_day_stats(code)
                 if prev is None or prev.prev_turnover <= 0:
