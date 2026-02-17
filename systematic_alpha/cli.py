@@ -9,6 +9,7 @@ from time import perf_counter
 from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
+from systematic_alpha.analytics import persist_run_analytics
 from systematic_alpha.helpers import fmt
 from systematic_alpha.models import (
     FinalSelection,
@@ -397,6 +398,7 @@ def inject_assume_open_realtime(
 
 def run(config: StrategyConfig) -> None:
     total_started = perf_counter()
+    run_started_at = datetime.now(ZoneInfo("Asia/Seoul"))
     log(
         "Run config: "
         f"market={config.market}, "
@@ -417,6 +419,70 @@ def run(config: StrategyConfig) -> None:
     else:
         selector = DayTradingSelector(mojito_module, config)
 
+    codes: List[str] = []
+    stage1_initial: List[Stage1Candidate] = []
+    stage1: List[Stage1Candidate] = []
+    decision_candidates: List[Stage1Candidate] = []
+    ranked: List[FinalSelection] = []
+    final: List[FinalSelection] = []
+    realtime_stats: Dict[str, RealtimeStats] = {}
+    fallback_added_count = 0
+    timings_sec: Dict[str, float] = {
+        "load_universe_sec": 0.0,
+        "stage1_sec": 0.0,
+        "fallback_sec": 0.0,
+        "realtime_sec": 0.0,
+        "refresh_sec": 0.0,
+        "scoring_sec": 0.0,
+    }
+    realtime_quality = RealtimeQuality(
+        realtime_ready=False,
+        quality_ok=True,
+        coverage_ratio=0.0,
+        eligible_count=0,
+        total_count=0,
+        min_exec_ticks=config.min_exec_ticks,
+        min_orderbook_ticks=config.min_orderbook_ticks,
+        min_realtime_cum_volume=config.min_realtime_cum_volume,
+    )
+
+    def persist_analytics_snapshot(decision_at: datetime, invalid_reason: Optional[str]) -> None:
+        if not config.enable_analytics_log:
+            return
+
+        run_finished_at = datetime.now(ZoneInfo("Asia/Seoul"))
+        timings_payload = dict(timings_sec)
+        timings_payload["total_sec"] = perf_counter() - total_started
+        try:
+            paths = persist_run_analytics(
+                config=config,
+                selector=selector,
+                run_started_at=run_started_at,
+                decision_at=decision_at,
+                run_finished_at=run_finished_at,
+                universe_size=len(codes),
+                stage1_initial=stage1_initial,
+                stage1_final=stage1,
+                decision_candidates=decision_candidates,
+                realtime_stats=realtime_stats,
+                realtime_quality=realtime_quality,
+                ranked=ranked,
+                final=final,
+                fallback_added_count=fallback_added_count,
+                invalid_reason=invalid_reason,
+                timings_sec=timings_payload,
+            )
+            if paths:
+                log(f"[analytics] run bundle saved: {paths['run_bundle']}")
+                log(
+                    "[analytics] tables updated: "
+                    f"summary={paths['run_summary']}, "
+                    f"stage1={paths['stage1_scan']}, "
+                    f"ranked={paths['ranked_symbols']}"
+                )
+        except Exception as exc:
+            log(f"[analytics] persist failed: {exc}")
+
     update_pending_overnight_report(selector, config.overnight_report_path)
 
     stage_started = perf_counter()
@@ -424,14 +490,18 @@ def run(config: StrategyConfig) -> None:
     codes, names = selector.load_universe()
     if not codes:
         raise RuntimeError("No symbols loaded. Provide --universe-file or check fetch_symbols().")
-    log(f"Universe size: {len(codes)} (elapsed {perf_counter() - stage_started:.1f}s)")
+    timings_sec["load_universe_sec"] = perf_counter() - stage_started
+    log(f"Universe size: {len(codes)} (elapsed {timings_sec['load_universe_sec']:.1f}s)")
 
     stage_started = perf_counter()
     log("[2/4] Stage1 filtering (change/gap/prev turnover)...")
     stage1 = selector.build_stage1_candidates(codes, names)
-    log(f"Stage1 candidates: {len(stage1)} (elapsed {perf_counter() - stage_started:.1f}s)")
+    stage1_initial = list(stage1)
+    timings_sec["stage1_sec"] = perf_counter() - stage_started
+    log(f"Stage1 candidates: {len(stage1)} (elapsed {timings_sec['stage1_sec']:.1f}s)")
 
     if len(stage1) < config.final_picks:
+        fallback_started = perf_counter()
         needed = config.final_picks - len(stage1)
         log(
             f"[fallback] stage1 candidates ({len(stage1)}) < final picks ({config.final_picks}). applying relaxed fallback rules...",
@@ -443,10 +513,12 @@ def run(config: StrategyConfig) -> None:
             needed=needed,
         )
         if fallback_candidates:
+            fallback_added_count = len(fallback_candidates)
             stage1.extend(fallback_candidates)
             log(f"[fallback] added {len(fallback_candidates)} candidates. total stage1={len(stage1)}")
         else:
             log("[fallback] no additional candidates found.")
+        timings_sec["fallback_sec"] = perf_counter() - fallback_started
 
     if not stage1 and config.test_assume_open:
         force_limit = max(config.pre_candidates, config.final_picks * 2)
@@ -482,12 +554,15 @@ def run(config: StrategyConfig) -> None:
             ranked=[],
             invalid_reason="no_stage1_candidates",
         )
+        persist_analytics_snapshot(decision_at=now, invalid_reason="no_stage1_candidates")
+        log(f"Run finished (total elapsed {perf_counter() - total_started:.1f}s)")
         return
 
     stage_started = perf_counter()
     log("[3/4] Collecting realtime data (strength/VWAP/orderbook)...")
     target_codes = [item.code for item in stage1]
     realtime_stats, realtime_quality = selector.collect_realtime(target_codes)
+    timings_sec["realtime_sec"] = perf_counter() - stage_started
     log(
         "[realtime] quality summary: "
         f"ready={realtime_quality.realtime_ready}, "
@@ -495,7 +570,7 @@ def run(config: StrategyConfig) -> None:
         f"eligible={realtime_quality.eligible_count}/{realtime_quality.total_count}, "
         f"quality_ok={realtime_quality.quality_ok}"
     )
-    log(f"[3/4] Realtime collection done (elapsed {perf_counter() - stage_started:.1f}s)")
+    log(f"[3/4] Realtime collection done (elapsed {timings_sec['realtime_sec']:.1f}s)")
 
     if config.test_assume_open and (not realtime_quality.realtime_ready or not realtime_quality.quality_ok):
         log(
@@ -536,6 +611,7 @@ def run(config: StrategyConfig) -> None:
             ranked=[],
             invalid_reason=invalid_reason,
         )
+        persist_analytics_snapshot(decision_at=now, invalid_reason=invalid_reason)
         print("\nTop codes: (none)")
         log(f"Run finished (total elapsed {perf_counter() - total_started:.1f}s)")
         return
@@ -543,14 +619,16 @@ def run(config: StrategyConfig) -> None:
     stage_started = perf_counter()
     log("[3.5/4] Refreshing stage1 snapshots at decision time...")
     decision_candidates = selector.refresh_candidates_for_decision(stage1)
-    log(f"[3.5/4] Snapshot refresh done (elapsed {perf_counter() - stage_started:.1f}s)")
+    timings_sec["refresh_sec"] = perf_counter() - stage_started
+    log(f"[3.5/4] Snapshot refresh done (elapsed {timings_sec['refresh_sec']:.1f}s)")
 
     stage_started = perf_counter()
     log("[4/4] Final scoring...")
     ranked = sort_by_recommendation(
         selector.evaluate(decision_candidates, realtime_stats, realtime_quality.realtime_ready)
     )
-    log(f"Scoring complete (elapsed {perf_counter() - stage_started:.1f}s). Ranked={len(ranked)}")
+    timings_sec["scoring_sec"] = perf_counter() - stage_started
+    log(f"Scoring complete (elapsed {timings_sec['scoring_sec']:.1f}s). Ranked={len(ranked)}")
 
     passed = [item for item in ranked if item.passed]
     final = passed[: config.final_picks]
@@ -568,5 +646,6 @@ def run(config: StrategyConfig) -> None:
         ranked=ranked,
     )
     append_selection_report_rows(selector, config.overnight_report_path, final, decision_at)
+    persist_analytics_snapshot(decision_at=decision_at, invalid_reason=None)
     print("\nTop codes:", ", ".join(item.code for item in final) if final else "(none)")
     log(f"Run finished (total elapsed {perf_counter() - total_started:.1f}s)")

@@ -43,6 +43,7 @@ class DayTradingSelector:
         self._daily_cache: Dict[str, Optional[PrevDayStats]] = {}
         self._price_cache: Dict[str, Optional[Dict[str, Any]]] = {}
         self._daily_bars_cache: Dict[str, List[Dict[str, Any]]] = {}
+        self.last_stage1_scan: List[Dict[str, Any]] = []
 
     def _liquidity_cache_path(self) -> Path:
         return Path("out") / f"kr_universe_liquidity_{self.today_kst}.csv"
@@ -451,46 +452,124 @@ class DayTradingSelector:
         min_gap_pct: float,
         min_prev_turnover: float,
         limit: int,
+        record_scan: bool = False,
     ) -> List[Stage1Candidate]:
         candidates: List[Stage1Candidate] = []
+        stage1_scan_rows: List[Dict[str, Any]] = []
         total = len(codes)
         progress_every = max(1, self.config.stage1_log_interval)
         for idx, code in enumerate(codes, start=1):
+            scan_row: Optional[Dict[str, Any]]
+            if record_scan:
+                scan_row = {
+                    "scan_index": idx,
+                    "code": code,
+                    "name": names.get(code, ""),
+                    "current_price": None,
+                    "open_price": None,
+                    "change_pct": None,
+                    "gap_pct": None,
+                    "prev_close": None,
+                    "prev_day_volume": None,
+                    "prev_day_turnover": None,
+                    "pass_change": None,
+                    "pass_gap": None,
+                    "pass_prev_turnover": None,
+                    "passed_stage1": False,
+                    "skip_reason": "",
+                    "min_change_pct": min_change_pct,
+                    "min_gap_pct": min_gap_pct,
+                    "min_prev_turnover": min_prev_turnover,
+                    "long_only": self.config.long_only,
+                }
+            else:
+                scan_row = None
+
             try:
                 snap = self.fetch_price_snapshot(code)
                 if snap is None:
+                    if scan_row is not None:
+                        scan_row["skip_reason"] = "no_price_snapshot"
+                        stage1_scan_rows.append(scan_row)
                     continue
 
                 current_price = snap["price"]
                 open_price = snap["open"]
                 change_pct = snap["change_pct"]
+                if scan_row is not None:
+                    snap_name = str(snap.get("name") or "").strip()
+                    if snap_name and not scan_row.get("name"):
+                        scan_row["name"] = snap_name
+                    scan_row["current_price"] = current_price
+                    scan_row["open_price"] = open_price
+                    scan_row["change_pct"] = change_pct
                 if current_price is None or open_price is None:
+                    if scan_row is not None:
+                        scan_row["skip_reason"] = "incomplete_price_snapshot"
+                        stage1_scan_rows.append(scan_row)
                     continue
 
-                if change_pct is not None and not self._pass_change_threshold(change_pct, min_change_pct):
-                    continue
+                if change_pct is not None:
+                    pass_change = self._pass_change_threshold(change_pct, min_change_pct)
+                    if scan_row is not None:
+                        scan_row["pass_change"] = pass_change
+                    if not pass_change:
+                        if scan_row is not None:
+                            scan_row["skip_reason"] = "change_threshold"
+                            stage1_scan_rows.append(scan_row)
+                        continue
 
                 prev = self.fetch_prev_day_stats(code)
                 if prev is None or prev.prev_close <= 0:
+                    if scan_row is not None:
+                        scan_row["skip_reason"] = "no_prev_day_stats"
+                        stage1_scan_rows.append(scan_row)
                     continue
+
+                if scan_row is not None:
+                    scan_row["prev_close"] = prev.prev_close
+                    scan_row["prev_day_volume"] = prev.prev_volume
+                    scan_row["prev_day_turnover"] = prev.prev_turnover
 
                 if change_pct is None:
                     change_pct = ((current_price - prev.prev_close) / prev.prev_close) * 100.0
+                    if scan_row is not None:
+                        scan_row["change_pct"] = change_pct
 
-                if not self._pass_change_threshold(change_pct, min_change_pct):
+                pass_change = self._pass_change_threshold(change_pct, min_change_pct)
+                if scan_row is not None:
+                    scan_row["pass_change"] = pass_change
+                if not pass_change:
+                    if scan_row is not None:
+                        scan_row["skip_reason"] = "change_threshold"
+                        stage1_scan_rows.append(scan_row)
                     continue
 
                 gap_pct = ((open_price - prev.prev_close) / prev.prev_close) * 100.0
-                if not self._pass_gap_threshold(gap_pct, min_gap_pct):
+                pass_gap = self._pass_gap_threshold(gap_pct, min_gap_pct)
+                if scan_row is not None:
+                    scan_row["gap_pct"] = gap_pct
+                    scan_row["pass_gap"] = pass_gap
+                if not pass_gap:
+                    if scan_row is not None:
+                        scan_row["skip_reason"] = "gap_threshold"
+                        stage1_scan_rows.append(scan_row)
                     continue
 
-                if prev.prev_turnover < min_prev_turnover:
+                pass_prev_turnover = prev.prev_turnover >= min_prev_turnover
+                if scan_row is not None:
+                    scan_row["pass_prev_turnover"] = pass_prev_turnover
+                if not pass_prev_turnover:
+                    if scan_row is not None:
+                        scan_row["skip_reason"] = "prev_turnover_threshold"
+                        stage1_scan_rows.append(scan_row)
                     continue
 
+                candidate_name = names.get(code, "") or str(snap.get("name") or "")
                 candidates.append(
                     Stage1Candidate(
                         code=code,
-                        name=names.get(code, "") or str(snap.get("name") or ""),
+                        name=candidate_name,
                         current_price=current_price,
                         open_price=open_price,
                         current_change_pct=change_pct,
@@ -500,6 +579,11 @@ class DayTradingSelector:
                         prev_day_turnover=prev.prev_turnover,
                     )
                 )
+                if scan_row is not None:
+                    scan_row["name"] = candidate_name or scan_row.get("name", "")
+                    scan_row["passed_stage1"] = True
+                    scan_row["skip_reason"] = ""
+                    stage1_scan_rows.append(scan_row)
             finally:
                 if idx % progress_every == 0 or idx == total:
                     pct = (idx / total * 100.0) if total > 0 else 100.0
@@ -520,6 +604,8 @@ class DayTradingSelector:
                 key=lambda c: (c.prev_day_turnover, abs(c.current_change_pct), abs(c.gap_pct)),
                 reverse=True,
             )
+        if record_scan:
+            self.last_stage1_scan = stage1_scan_rows
         return candidates[:limit]
 
     def build_stage1_candidates(
@@ -532,6 +618,7 @@ class DayTradingSelector:
             min_gap_pct=self.config.min_gap_pct,
             min_prev_turnover=self.config.min_prev_turnover,
             limit=self.config.pre_candidates,
+            record_scan=True,
         )
 
     def build_fallback_candidates(
@@ -573,6 +660,7 @@ class DayTradingSelector:
                 min_gap_pct=gap,
                 min_prev_turnover=turnover,
                 limit=fallback_pool_limit,
+                record_scan=False,
             )
             added = 0
             for candidate in profile_candidates:

@@ -25,6 +25,7 @@ This project is a CLI app (no UI). It reads secrets from `.env` and prints ranke
 - Automatic overnight performance report (`selection -> close -> next open`) in CSV.
 - Configurable thresholds via CLI arguments (scheduled runs use `scripts/run_daily.ps1` parameters)
 - JSON output export for downstream automation
+- Long-horizon analytics dataset accumulation (`out/analytics`) for post-hoc performance/strategy analysis
 - Telegram notifications for retry/failure/success status (optional)
 - Live progress/heartbeat logs during scan and realtime collection
 - Local `.env` loader (no external dotenv dependency)
@@ -70,6 +71,7 @@ Default universe policy:
 |   |-- remove_task.ps1 (alias)
 |   `-- remove_us_task.ps1
 `-- systematic_alpha/
+    |-- analytics.py
     |-- cli.py
     |-- selector.py
     |-- selector_us.py
@@ -400,12 +402,23 @@ python main.py \
   --output-json out/us_assume_open_test.json
 ```
 
+Disable analytics accumulation for one run:
+
+```bash
+python main.py --disable-analytics-log
+```
+
 ## Output
 
 - Console table with top picks
 - Optional JSON file via `--output-json`
 - Overnight performance report CSV (default): `out/selection_overnight_report.csv`
   - columns include: selection datetime, entry price, same-day close, next-day open, intraday/overnight/total returns
+- Analytics datasets (default): `out/analytics/`
+  - `run_summary.csv`: one row per run (counts, quality gate, timings, final codes)
+  - `stage1_scan.csv`: per-symbol stage1 scan result (pass/fail + skip reason + thresholds)
+  - `ranked_symbols.csv`: ranked symbols with conditions, metrics, realtime aggregates
+  - `runs/{market}_YYYYMMDD_HHMMSS_microsec.json`: full per-run bundle for deep analysis/replay
 
 Example JSON path:
 - `out/smoke_run.json`

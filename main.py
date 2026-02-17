@@ -214,6 +214,25 @@ def parse_args() -> argparse.Namespace:
         help="Optional output json file path.",
     )
     parser.add_argument(
+        "--analytics-dir",
+        type=str,
+        default="./out/analytics",
+        help="Directory where long-horizon analytics datasets are accumulated.",
+    )
+    parser.add_argument(
+        "--disable-analytics-log",
+        dest="enable_analytics_log",
+        action="store_false",
+        default=True,
+        help="Disable analytics dataset accumulation.",
+    )
+    parser.add_argument(
+        "--enable-analytics-log",
+        dest="enable_analytics_log",
+        action="store_true",
+        help="Enable analytics dataset accumulation.",
+    )
+    parser.add_argument(
         "--overnight-report-path",
         type=str,
         default="./out/selection_overnight_report.csv",
@@ -280,6 +299,8 @@ def build_config(args: argparse.Namespace) -> StrategyConfig:
         realtime_log_interval=max(1, args.realtime_log_interval),
         overnight_report_path=args.overnight_report_path,
         output_json_path=args.output_json,
+        analytics_dir=args.analytics_dir,
+        enable_analytics_log=args.enable_analytics_log,
         test_assume_open=args.test_assume_open,
     )
 

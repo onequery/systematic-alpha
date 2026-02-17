@@ -42,6 +42,8 @@ class StrategyConfig:
     realtime_log_interval: int
     overnight_report_path: Optional[str]
     output_json_path: Optional[str]
+    analytics_dir: Optional[str]
+    enable_analytics_log: bool
     test_assume_open: bool
 
 
