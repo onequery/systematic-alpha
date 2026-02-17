@@ -6,11 +6,14 @@ from typing import Dict, List, Optional
 
 @dataclass
 class StrategyConfig:
+    market: str
     api_key: str
     api_secret: str
     acc_no: str
     user_id: Optional[str]
     mock: bool
+    us_exchange: str
+    us_poll_interval: float
     universe_file: Optional[str]
     max_symbols_scan: int
     pre_candidates: int

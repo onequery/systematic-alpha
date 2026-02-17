@@ -1,0 +1,118 @@
+AAPL,Apple Inc.
+MSFT,Microsoft Corp.
+NVDA,NVIDIA Corp.
+AMZN,Amazon.com Inc.
+GOOGL,Alphabet Inc.
+META,Meta Platforms
+TSLA,Tesla Inc.
+AMD,Advanced Micro Devices
+NFLX,Netflix Inc.
+AVGO,Broadcom Inc.
+COST,Costco Wholesale
+ADBE,Adobe Inc.
+CSCO,Cisco Systems
+PEP,PepsiCo
+INTC,Intel Corp.
+QCOM,Qualcomm
+AMGN,Amgen
+TXN,Texas Instruments
+BKNG,Booking Holdings
+PYPL,PayPal
+SBUX,Starbucks
+CMCSA,Comcast
+INTU,Intuit
+AMAT,Applied Materials
+MU,Micron Technology
+GILD,Gilead Sciences
+ADI,Analog Devices
+LRCX,Lam Research
+MDLZ,Mondelez
+REGN,Regeneron
+VRTX,Vertex Pharma
+ISRG,Intuitive Surgical
+PANW,Palo Alto Networks
+KLAC,KLA
+SNPS,Synopsys
+CDNS,Cadence Design
+MELI,MercadoLibre
+ASML,ASML Holding
+CRWD,CrowdStrike
+MAR,Marriott
+ORLY,O'Reilly Auto
+MNST,Monster Beverage
+FTNT,Fortinet
+ABNB,Airbnb
+CTAS,Cintas
+ADP,Automatic Data Processing
+PAYX,Paychex
+ROST,Ross Stores
+ODFL,Old Dominion Freight
+JPM,JPMorgan Chase
+BAC,Bank of America
+WFC,Wells Fargo
+C,Citigroup
+GS,Goldman Sachs
+MS,Morgan Stanley
+BLK,BlackRock
+SCHW,Charles Schwab
+USB,U.S. Bancorp
+PNC,PNC Financial
+V,Visa
+MA,Mastercard
+AXP,American Express
+SQ,Block
+COIN,Coinbase
+SOFI,SoFi
+HOOD,Robinhood
+SHOP,Shopify
+UBER,Uber
+JNJ,Johnson & Johnson
+PFE,Pfizer
+MRK,Merck
+LLY,Eli Lilly
+ABBV,AbbVie
+BMY,Bristol-Myers Squibb
+UNH,UnitedHealth
+CVS,CVS Health
+TMO,Thermo Fisher
+DHR,Danaher
+XOM,Exxon Mobil
+CVX,Chevron
+COP,ConocoPhillips
+SLB,SLB
+EOG,EOG Resources
+MPC,Marathon Petroleum
+PSX,Phillips 66
+VLO,Valero Energy
+HAL,Halliburton
+OXY,Occidental Petroleum
+WMT,Walmart
+TGT,Target
+HD,Home Depot
+LOW,Lowe's
+NKE,Nike
+DIS,Walt Disney
+KO,Coca-Cola
+MCD,McDonald's
+PG,Procter & Gamble
+BA,Boeing
+CAT,Caterpillar
+DE,Deere
+GE,GE Aerospace
+MMM,3M
+HON,Honeywell
+LMT,Lockheed Martin
+NOC,Northrop Grumman
+RTX,RTX
+UNP,Union Pacific
+SPY,SPDR S&P 500 ETF
+QQQ,Invesco QQQ
+IWM,iShares Russell 2000 ETF
+DIA,SPDR Dow Jones ETF
+TQQQ,ProShares UltraPro QQQ
+SQQQ,ProShares UltraPro Short QQQ
+SOXL,Direxion Daily Semiconductor Bull
+SOXS,Direxion Daily Semiconductor Bear
+SMH,VanEck Semiconductor ETF
+XLF,Financial Select Sector SPDR
+XLK,Technology Select Sector SPDR

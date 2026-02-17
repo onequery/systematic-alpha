@@ -1,6 +1,12 @@
-param(
+﻿param(
     [string]$ProjectRoot = (Split-Path -Parent $PSScriptRoot),
     [string]$PythonExe = "",
+    [ValidateSet("KR", "US")]
+    [string]$Market = "KR",
+    [string]$UsExchange = "NASD",
+    [string]$UniverseFile = "",
+    [switch]$RequireUsOpen = $false,
+    [int]$UsOpenWindowMinutes = 20,
     [int]$CollectSeconds = 600,
     [int]$FinalPicks = 3,
     [int]$StartDelaySeconds = 5,
@@ -11,7 +17,6 @@ param(
     [int]$NotifyTailLines = 20,
     [switch]$NotifyStart = $true
 )
-
 $ErrorActionPreference = "Stop"
 $script:RunLogFile = $null
 
@@ -252,9 +257,36 @@ function Wait-WithProgress {
     Write-MonitorLog "[$Label] elapsed=${total}s/${total}s, remaining=0s"
 }
 
+function Get-UsMarketState {
+    $tz = [System.TimeZoneInfo]::FindSystemTimeZoneById("Eastern Standard Time")
+    $nowLocal = Get-Date
+    $nowEt = [System.TimeZoneInfo]::ConvertTime($nowLocal, $tz)
+    $isWeekday = $nowEt.DayOfWeek -in @(
+        [DayOfWeek]::Monday,
+        [DayOfWeek]::Tuesday,
+        [DayOfWeek]::Wednesday,
+        [DayOfWeek]::Thursday,
+        [DayOfWeek]::Friday
+    )
+    $openEt = Get-Date -Date $nowEt.Date -Hour 9 -Minute 30 -Second 0
+    $closeEt = Get-Date -Date $nowEt.Date -Hour 16 -Minute 0 -Second 0
+    $isOpen = $isWeekday -and ($nowEt -ge $openEt) -and ($nowEt -lt $closeEt)
+    $minutesFromOpen = [int][Math]::Round(($nowEt - $openEt).TotalMinutes)
+    return @{
+        now_et = $nowEt
+        is_weekday = $isWeekday
+        open_et = $openEt
+        close_et = $closeEt
+        is_regular_open = $isOpen
+        minutes_from_open = $minutesFromOpen
+    }
+}
+
 if (-not (Test-Path $ProjectRoot)) {
     throw "ProjectRoot not found: $ProjectRoot"
 }
+
+$Market = $Market.Trim().ToUpperInvariant()
 
 if ([string]::IsNullOrWhiteSpace($PythonExe)) {
     $defaultPython = "C:\Users\heesu\anaconda3\envs\systematic-alpha\python.exe"
@@ -306,22 +338,79 @@ $null = New-Item -ItemType Directory -Force -Path (Join-Path $ProjectRoot "logs"
 $null = New-Item -ItemType Directory -Force -Path (Join-Path $ProjectRoot "out")
 
 $stamp = Get-Date -Format "yyyyMMdd_HHmmss"
-$script:RunLogFile = Join-Path $ProjectRoot ("logs\runner_{0}.log" -f $stamp)
-$outputJson = Join-Path $ProjectRoot ("out\daily_{0}.json" -f $stamp)
+$marketTag = if ($Market -eq "US") { "us" } else { "kr" }
+$script:RunLogFile = Join-Path $ProjectRoot ("logs\runner_{0}_{1}.log" -f $marketTag, $stamp)
+$outputJson = Join-Path $ProjectRoot ("out\{0}_daily_{1}.json" -f $marketTag, $stamp)
 $baseArgs = @(
     "main.py",
+    "--market", $Market.ToLowerInvariant(),
     "--collect-seconds", "$CollectSeconds",
     "--final-picks", "$FinalPicks",
     "--output-json", $outputJson
 )
+if ($Market -eq "US") {
+    if (-not [string]::IsNullOrWhiteSpace($UsExchange)) {
+        $baseArgs += @("--exchange", $UsExchange)
+    }
+}
+if (-not [string]::IsNullOrWhiteSpace($UniverseFile)) {
+    $baseArgs += @("--universe-file", $UniverseFile)
+}
 
 Write-MonitorLog "[run] monitor_log: $script:RunLogFile"
 
+if ($Market -eq "US" -and $RequireUsOpen) {
+    $state = Get-UsMarketState
+    $openWindow = [Math]::Max(1, $UsOpenWindowMinutes)
+    $withinOpenWindow = $state.is_weekday -and ($state.minutes_from_open -ge 0) -and ($state.minutes_from_open -lt $openWindow)
+    Write-MonitorLog (
+        "[market-check] US now(et)={0:yyyy-MM-dd HH:mm:ss}, open={1:HH:mm}, close={2:HH:mm}, weekday={3}, regular_open={4}, minutes_from_open={5}, open_window={6}m, within_open_window={7}" -f `
+            $state.now_et, $state.open_et, $state.close_et, $state.is_weekday, $state.is_regular_open, $state.minutes_from_open, $openWindow, $withinOpenWindow
+    )
+    if (-not $withinOpenWindow) {
+        Write-MonitorLog "[market-check] outside US open window. skipping run."
+        if ($script:TelegramEnabled) {
+            Send-TelegramMessage (
+                "[SystematicAlpha] skipped`n" +
+                "reason=outside US open window`n" +
+                ("now_et={0:yyyy-MM-dd HH:mm:ss}" -f $state.now_et) + "`n" +
+                ("minutes_from_open={0}, window={1}" -f $state.minutes_from_open, $openWindow)
+            )
+        }
+        exit 0
+    }
+
+    $usEtDate = $state.now_et.ToString("yyyyMMdd")
+    $usDayLock = Join-Path $ProjectRoot ("out\us_run_lock_{0}.txt" -f $usEtDate)
+    if (Test-Path $usDayLock) {
+        Write-MonitorLog "[market-check] US daily lock exists ($usDayLock). skipping duplicate run."
+        if ($script:TelegramEnabled) {
+            Send-TelegramMessage (
+                "[SystematicAlpha] skipped`n" +
+                "reason=US daily lock exists`n" +
+                ("lock={0}" -f $usDayLock)
+            )
+        }
+        exit 0
+    }
+
+    $lockText = @(
+        "created_at=" + (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+        "now_et=" + ($state.now_et.ToString("yyyy-MM-dd HH:mm:ss"))
+        "market=US"
+    ) -join "`n"
+    Set-Content -Path $usDayLock -Value $lockText -Encoding UTF8
+    Write-MonitorLog "[market-check] created US daily lock: $usDayLock"
+}
+
 $hostTag = "$env:COMPUTERNAME/$env:USERNAME"
+$exchangeLabel = if ($Market -eq "US") { $UsExchange } else { "KRX" }
 if ($NotifyStart) {
     Send-TelegramMessage (
         "[SystematicAlpha] start`n" +
         "host=$hostTag`n" +
+        "market=$Market`n" +
+        "exchange=$exchangeLabel`n" +
         "collect_seconds=$CollectSeconds`n" +
         "final_picks=$FinalPicks`n" +
         "max_attempts=$MaxAttempts"
@@ -337,7 +426,7 @@ $multiplier = [Math]::Max(1, $RetryBackoffMultiplier)
 $maxDelay = [Math]::Max(1, $MaxRetryDelaySeconds)
 
 for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
-    $attemptLog = Join-Path $ProjectRoot ("logs\daily_{0}_try{1}.log" -f $stamp, $attempt)
+    $attemptLog = Join-Path $ProjectRoot ("logs\{0}_daily_{1}_try{2}.log" -f $marketTag, $stamp, $attempt)
     $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     Write-MonitorLog "[attempt $attempt/$MaxAttempts] starting"
     Write-MonitorLog "command: $PythonExe -u $($baseArgs -join ' ')"
@@ -419,3 +508,4 @@ for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
     Wait-WithProgress -TotalSeconds $nextDelay -Label "retry-delay"
     $delay = [Math]::Min($delay * $multiplier, $maxDelay)
 }
+

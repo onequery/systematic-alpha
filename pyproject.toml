@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "systematic-alpha"
 version = "0.1.0"
-description = "KIS intraday stock selector using REST + WebSocket signals"
+description = "KIS intraday stock selector for KR/US markets using REST + realtime signals"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
@@ -23,3 +23,6 @@ systematic-alpha = "main:main"
 [tool.setuptools]
 py-modules = ["main"]
 packages = ["systematic_alpha"]
+
+[tool.setuptools.package-data]
+systematic_alpha = ["data/*.txt"]

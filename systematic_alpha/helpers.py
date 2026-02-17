@@ -72,6 +72,15 @@ def normalize_code(raw: Any) -> str:
     return text
 
 
+def normalize_symbol(raw: Any) -> str:
+    text = str(raw or "").strip().upper()
+    text = text.replace("/", ".")
+    match = re.search(r"([A-Z][A-Z0-9\.\-_]{0,14})", text)
+    if match:
+        return match.group(1)
+    return text
+
+
 def pick_first(mapping: Dict[str, Any], keys: Iterable[str]) -> Any:
     for key in keys:
         if key in mapping:
@@ -184,6 +193,58 @@ def parse_universe_file(path: Path) -> Tuple[List[str], Dict[str, str]]:
             names[code] = name
 
     return codes, names
+
+
+def parse_us_universe_file(path: Path) -> Tuple[List[str], Dict[str, str]]:
+    """
+    Parse a US stock universe file.
+
+    Supported line formats:
+    - AAPL
+    - AAPL,Apple Inc.
+    - AAPL Apple Inc.
+    """
+    symbols: List[str] = []
+    names: Dict[str, str] = {}
+    seen = set()
+
+    for raw_line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = raw_line.strip().lstrip("\ufeff")
+        if not line or line.startswith("#"):
+            continue
+
+        symbol = ""
+        name = ""
+
+        match_sep = re.match(r"^\s*([A-Za-z][A-Za-z0-9\.\-_]{0,14})\s*[,|\t]\s*(.+?)\s*$", line)
+        if match_sep:
+            symbol = normalize_symbol(match_sep.group(1))
+            name = match_sep.group(2).strip()
+        else:
+            match_space = re.match(r"^\s*([A-Za-z][A-Za-z0-9\.\-_]{0,14})\s+(.+?)\s*$", line)
+            if match_space:
+                symbol = normalize_symbol(match_space.group(1))
+                name = match_space.group(2).strip()
+            else:
+                match_symbol = re.search(r"\b[A-Za-z][A-Za-z0-9\.\-_]{0,14}\b", line)
+                if not match_symbol:
+                    continue
+                symbol = normalize_symbol(match_symbol.group(0))
+
+        if not symbol:
+            continue
+
+        if symbol in seen:
+            if name and not names.get(symbol):
+                names[symbol] = name
+            continue
+
+        seen.add(symbol)
+        symbols.append(symbol)
+        if name:
+            names[symbol] = name
+
+    return symbols, names
 
 
 def extract_codes_and_names_from_df(df: Any, max_count: int) -> Tuple[List[str], Dict[str, str]]:

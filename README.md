@@ -2,16 +2,18 @@
 
 Intraday stock candidate selector for Korea Investment & Securities (KIS) using:
 - REST data (price, daily data, symbols)
-- WebSocket data (execution, orderbook)
+- WebSocket data (KR) / REST polling (US)
 - rule-based filtering/scoring for short-term trading candidates
 
-This project is a CLI app (no UI). It reads secrets from `.env` and prints top picks.
+This project is a CLI app (no UI). It reads secrets from `.env` and prints ranked picks.
 
 ## Features
 
-- Two-stage filtering
+- Two-stage filtering (KR/US)
   - Stage 1: daily/price snapshot filters
   - Stage 2: realtime metrics (strength, VWAP, bid/ask ratio, volume ratio)
+- `--market kr` (default): domestic KR flow (REST + WebSocket)
+- `--market us`: overseas US flow (REST + polling)
 - Long-only directional mode by default (`change >= threshold`, `gap >= threshold`)
 - Fallback fill rule: if stage1 candidates are fewer than `--final-picks`, thresholds are relaxed step-by-step to fill missing slots.
 - Decision-time snapshot refresh: final scoring uses latest snapshot at selection completion time (not only early scan snapshot).
@@ -50,15 +52,20 @@ The final ranking selects top `N` symbols (`--final-picks`, default `3`).
 |-- .env.example
 |-- scripts/
 |   |-- register_task.ps1
+|   |-- register_us_task.ps1
 |   |-- run_daily.ps1
-|   `-- remove_task.ps1
+|   |-- remove_task.ps1
+|   `-- remove_us_task.ps1
 `-- systematic_alpha/
     |-- cli.py
     |-- selector.py
+    |-- selector_us.py
     |-- models.py
     |-- credentials.py
     |-- dotenv.py
     |-- helpers.py
+    |-- data/
+    |   `-- us_universe_default.txt
     `-- mojito_loader.py
 ```
 
@@ -106,6 +113,11 @@ Required keys:
 Optional:
 - `KIS_USER_ID`
 - `KIS_MOCK` (`0` or `1`)
+- market variables:
+  - `MARKET=kr|us`
+  - `US_EXCHANGE=NASD|NYSE|AMEX`
+  - `US_UNIVERSE_FILE=./systematic_alpha/data/us_universe_default.txt`
+  - `US_POLL_INTERVAL=2.0`
 - Telegram variables (`TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, etc.)
 - strategy/runtime override variables listed in `.env.example`
   - quality/monitoring/report-related:
@@ -147,12 +159,19 @@ When configured, `scripts/run_daily.ps1` sends:
 python main.py --collect-seconds 600 --final-picks 3
 ```
 
+US example:
+
+```bash
+python main.py --market us --exchange NASD --collect-seconds 600 --final-picks 3
+```
+
 ### Shell wrapper
 
 `run_main.sh` loads `.env` then executes `python main.py ...`:
 
 ```bash
 ./run_main.sh --collect-seconds 600 --final-picks 3
+./run_main.sh --market us --exchange NASD --collect-seconds 600 --final-picks 3
 ```
 
 See all options:
@@ -170,14 +189,17 @@ Supported line formats:
 
 If name is omitted, the app tries to fill it from KIS symbol master automatically.
 
-## Windows Auto Run at 09:00 (Task Scheduler)
+US (`--market us`) format:
+- `AAPL`
+- `AAPL,Apple Inc.`
+- `AAPL Apple Inc.`
+
+## Windows Auto Run (Task Scheduler)
 
 You do not need a 24/7 loop process.  
-Use a scheduled task that runs once at market open time.
+Use scheduled tasks at market-open times.
 
-### 1) Register task
-
-Run PowerShell as your normal user and execute:
+### KR 09:00 task registration
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\register_task.ps1
@@ -187,50 +209,69 @@ Default behavior:
 - task name: `SystematicAlpha_0900`
 - time: `09:00`
 - schedule: weekdays only (Mon-Fri)
-- runner: `scripts/run_daily.ps1`
+- runner: `scripts/run_daily.ps1 -Market KR`
 - python: `C:\Users\heesu\anaconda3\envs\systematic-alpha\python.exe`
 - startup delay: `5 sec` (to avoid exact open-time mismatch)
 - internal retries: up to `4` attempts (`30s`, backoff `x2`, max `180s`)
 - task-level restart: up to `2` restarts within `10 min`
 
-Custom time/task name example:
+### US open task registration (DST/STD dual trigger)
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\register_task.ps1 -TaskName "SystematicAlpha_Open" -At "09:00"
+powershell -ExecutionPolicy Bypass -File .\scripts\register_us_task.ps1
 ```
 
-### 2) Verify task registration
+Default behavior:
+- task name: `SystematicAlpha_US_Open`
+- triggers(KST): `22:30` and `23:30` on weekdays
+- runner: `scripts/run_daily.ps1 -Market US -RequireUsOpen`
+- runtime guard: open-window check (`09:30 ET + 20m`) + ET-day lock(1 run/day)
+
+Custom example:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\register_us_task.ps1 -UsExchange "NASD" -UsOpenWindowMinutes 20 -TaskName "SystematicAlpha_US"
+```
+
+### Verify registration
 
 ```powershell
 Get-ScheduledTask -TaskName "SystematicAlpha_0900"
+Get-ScheduledTask -TaskName "SystematicAlpha_US_Open"
 ```
 
-### 3) Run once now (manual test)
+### Run once now (manual test)
 
 ```powershell
 Start-ScheduledTask -TaskName "SystematicAlpha_0900"
+Start-ScheduledTask -TaskName "SystematicAlpha_US_Open"
 ```
 
-### 4) Check outputs
+### Check outputs
 
 - logs: `logs/`
-  - python run log: `logs/daily_YYYYMMDD_HHMMSS_tryN.log`
-  - runner/notification log: `logs/runner_YYYYMMDD_HHMMSS.log`
+  - python run log: `logs/{kr|us}_daily_YYYYMMDD_HHMMSS_tryN.log`
+  - runner log: `logs/runner_{kr|us}_YYYYMMDD_HHMMSS.log`
 - json results: `out/`
+  - `out/kr_daily_YYYYMMDD_HHMMSS.json`
+  - `out/us_daily_YYYYMMDD_HHMMSS.json`
 
-### 5) Remove task
+### Remove tasks
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\remove_task.ps1
+powershell -ExecutionPolicy Bypass -File .\scripts\remove_us_task.ps1
 ```
 
 Notes:
-- The "PC must be on at 09:00" condition applies only to automatic scheduled execution.
-- `remove_task.ps1` is a manual command and works immediately when you run it (not tied to 09:00).
-- If the PC is sleeping at 09:00, the scheduled run may be delayed depending on OS power/task settings.
+- The PC must be on for automatic task execution.
+- `remove_task.ps1` / `remove_us_task.ps1` are manual commands and run immediately.
+- If the PC is sleeping at trigger time, execution can be delayed by OS/task settings.
 - `scripts/run_daily.ps1` clears proxy env variables and uses project-local cache path for `mojito` token stability.
 - `scripts/run_daily.ps1` reads Telegram settings from `.env` and sends notifications automatically when configured.
 - If token issuance hits rate-limit (`EGW00133`), retry wait is automatically expanded to `65 sec`.
+- US holidays/half-days are not fully modeled in this repo.
+- US task prevents duplicate same-day runs via `out/us_run_lock_YYYYMMDD.txt` (ET date 기준).
 
 ### Reliability knobs (`scripts/run_daily.ps1`)
 
@@ -244,6 +285,12 @@ powershell -ExecutionPolicy Bypass -File .\scripts\run_daily.ps1 `
   -RetryBackoffMultiplier 2 `
   -MaxRetryDelaySeconds 180 `
   -NotifyTailLines 20
+```
+
+US manual run example:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\run_daily.ps1 -Market US -UsExchange "NASD" -RequireUsOpen -UsOpenWindowMinutes 20
 ```
 
 To disable start notification for a specific manual run:
@@ -274,6 +321,23 @@ python main.py \
   --min-gap-pct 0 \
   --min-prev-turnover 0 \
   --output-json out/smoke_run.json
+```
+
+US quick smoke example:
+
+```bash
+python main.py \
+  --market us \
+  --exchange NASD \
+  --universe-file systematic_alpha/data/us_universe_default.txt \
+  --max-symbols-scan 3 \
+  --pre-candidates 3 \
+  --final-picks 3 \
+  --collect-seconds 0 \
+  --min-change-pct 0 \
+  --min-gap-pct 0 \
+  --min-prev-turnover 0 \
+  --output-json out/us_smoke_run.json
 ```
 
 ## Output

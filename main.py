@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+from pathlib import Path
 
 from systematic_alpha.cli import run
 from systematic_alpha.credentials import load_credentials
@@ -12,14 +13,38 @@ from systematic_alpha.models import StrategyConfig
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="KIS intraday scalping selector (REST + WebSocket, mojito2)."
+        description="KIS intraday selector for KR/US markets (REST + WebSocket/polling, mojito2)."
+    )
+    parser.add_argument(
+        "--market",
+        choices=["kr", "us"],
+        default=os.getenv("MARKET", "kr").strip().lower(),
+        help="Target market: kr or us.",
     )
     parser.add_argument("--key-file", type=str, default=None, help="Path to KIS key file.")
     parser.add_argument(
         "--universe-file",
         type=str,
         default=os.getenv("UNIVERSE_CODES_FILE"),
-        help="Optional text/csv file containing 6-digit stock codes.",
+        help="Optional text/csv file containing symbols (KR 6-digit codes or US tickers).",
+    )
+    parser.add_argument(
+        "--us-universe-file",
+        type=str,
+        default=os.getenv("US_UNIVERSE_FILE"),
+        help="Optional text/csv file containing US symbols (used when --market us).",
+    )
+    parser.add_argument(
+        "--exchange",
+        type=str,
+        default=os.getenv("US_EXCHANGE", "NASD"),
+        help="US exchange for KIS overseas routing (NASD/NYSE/AMEX).",
+    )
+    parser.add_argument(
+        "--us-poll-interval",
+        type=float,
+        default=env_float("US_POLL_INTERVAL", 2.0),
+        help="US realtime polling interval in seconds (REST polling mode).",
     )
     parser.add_argument(
         "--collect-seconds",
@@ -61,7 +86,7 @@ def parse_args() -> argparse.Namespace:
         "--min-prev-turnover",
         type=float,
         default=env_float("MIN_PREV_TURNOVER", 10_000_000_000),
-        help="Previous day turnover threshold (KRW). Default is 10,000,000,000.",
+        help="Previous day turnover threshold (quote-currency). Default is 10,000,000,000.",
     )
     parser.add_argument(
         "--min-strength",
@@ -191,13 +216,23 @@ def parse_args() -> argparse.Namespace:
 def build_config(args: argparse.Namespace) -> StrategyConfig:
     api_key, api_secret, acc_no, file_user_id = load_credentials(args.key_file)
     user_id = args.user_id or file_user_id
+    market = args.market.strip().upper()
+    universe_file = args.universe_file
+    if market == "US":
+        if args.us_universe_file:
+            universe_file = args.us_universe_file
+        elif not universe_file:
+            universe_file = str(Path("systematic_alpha") / "data" / "us_universe_default.txt")
     return StrategyConfig(
+        market=market,
         api_key=api_key,
         api_secret=api_secret,
         acc_no=acc_no,
         user_id=user_id,
         mock=args.mock,
-        universe_file=args.universe_file,
+        us_exchange=args.exchange,
+        us_poll_interval=max(0.2, args.us_poll_interval),
+        universe_file=universe_file,
         max_symbols_scan=args.max_symbols_scan,
         pre_candidates=args.pre_candidates,
         final_picks=args.final_picks,

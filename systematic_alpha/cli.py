@@ -6,15 +6,17 @@ from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 from time import perf_counter
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
 from systematic_alpha.helpers import fmt
 from systematic_alpha.models import FinalSelection, RealtimeQuality, StrategyConfig
 from systematic_alpha.mojito_loader import import_mojito_module
 from systematic_alpha.selector import DayTradingSelector
+from systematic_alpha.selector_us import USDayTradingSelector
 
 REPORT_FIELDS = [
+    "market",
     "selection_datetime",
     "selection_date",
     "code",
@@ -86,6 +88,8 @@ def save_json_output(
     out_path.write_text(
         json.dumps(
             {
+                "market": config.market,
+                "exchange": config.us_exchange if config.market == "US" else "KRX",
                 "generated_at": datetime.now(ZoneInfo("Asia/Seoul")).isoformat(),
                 "decision_at": decision_at.isoformat(),
                 "signal_valid": invalid_reason is None,
@@ -233,7 +237,7 @@ def update_pending_overnight_report(selector: DayTradingSelector, report_path: O
 
 
 def append_selection_report_rows(
-    selector: DayTradingSelector,
+    selector: Any,
     report_path: Optional[str],
     final: List[FinalSelection],
     decision_at: datetime,
@@ -252,6 +256,7 @@ def append_selection_report_rows(
         status = _resolve_report_status(metrics)
         rows.append(
             {
+                "market": selector.config.market,
                 "selection_datetime": decision_at.isoformat(),
                 "selection_date": selection_date,
                 "code": item.code,
@@ -282,6 +287,8 @@ def run(config: StrategyConfig) -> None:
     total_started = perf_counter()
     log(
         "Run config: "
+        f"market={config.market}, "
+        f"exchange={config.us_exchange if config.market == 'US' else 'KRX'}, "
         f"collect={config.collect_seconds}s, "
         f"final_picks={config.final_picks}, pre_candidates={config.pre_candidates}, "
         f"max_symbols_scan={config.max_symbols_scan}, "
@@ -292,7 +299,10 @@ def run(config: StrategyConfig) -> None:
         f"realtime_log_interval={config.realtime_log_interval}s"
     )
     mojito_module = import_mojito_module()
-    selector = DayTradingSelector(mojito_module, config)
+    if config.market == "US":
+        selector = USDayTradingSelector(mojito_module, config)
+    else:
+        selector = DayTradingSelector(mojito_module, config)
 
     update_pending_overnight_report(selector, config.overnight_report_path)
 

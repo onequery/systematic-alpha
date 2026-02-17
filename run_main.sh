@@ -15,8 +15,12 @@ Examples:
   ./run_main.sh --help
 
 Common args:
+  --market kr|us
   --key-file PATH
   --universe-file PATH
+  --us-universe-file PATH
+  --exchange TEXT
+  --us-poll-interval FLOAT
   --collect-seconds INT
   --max-symbols-scan INT
   --pre-candidates INT
