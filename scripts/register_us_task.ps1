@@ -12,6 +12,11 @@ param(
     [string]$PythonExe = "C:\Users\heesu\anaconda3\envs\systematic-alpha\python.exe",
     [string]$UsExchange = "NASD",
     [int]$UsOpenWindowMinutes = 20,
+    [switch]$NotifySkips = $false,
+    [int]$UsPrefetchLeadMinutes = 60,
+    [int]$UsPrefetchWindowMinutes = 45,
+    [int]$PrefetchMinSuccessCount = 20,
+    [double]$PrefetchMinSuccessRatio = 0.2,
     [int]$UsUniverseSize = 500,
     [int]$MaxSymbolsScan = 500,
     [switch]$WeekdaysOnly = $true,
@@ -56,9 +61,12 @@ $prefetchAtDstTime = Parse-TimeToDate -At $PrefetchAtDst
 $prefetchAtStdTime = Parse-TimeToDate -At $PrefetchAtStd
 
 $psExe = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
-$actionArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$RunScriptPath`" -PythonExe `"$PythonExe`" -Market US -UsExchange `"$UsExchange`" -UsUniverseSize $UsUniverseSize -MaxSymbolsScan $MaxSymbolsScan -RequireUsOpen -UsOpenWindowMinutes $UsOpenWindowMinutes -StartDelaySeconds $StartDelaySeconds -MaxAttempts $MaxAttempts -RetryDelaySeconds $RetryDelaySeconds -RetryBackoffMultiplier $RetryBackoffMultiplier -MaxRetryDelaySeconds $MaxRetryDelaySeconds"
+$prefetchMinSuccessRatioText = $PrefetchMinSuccessRatio.ToString([System.Globalization.CultureInfo]::InvariantCulture)
+$notifySkipsArg = if ($NotifySkips) { "-NotifySkips" } else { "" }
+$actionArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$RunScriptPath`" -PythonExe `"$PythonExe`" -Market US -UsExchange `"$UsExchange`" -UsUniverseSize $UsUniverseSize -MaxSymbolsScan $MaxSymbolsScan -RequireUsOpen -UsOpenWindowMinutes $UsOpenWindowMinutes $notifySkipsArg -StartDelaySeconds $StartDelaySeconds -MaxAttempts $MaxAttempts -RetryDelaySeconds $RetryDelaySeconds -RetryBackoffMultiplier $RetryBackoffMultiplier -MaxRetryDelaySeconds $MaxRetryDelaySeconds"
 $action = New-ScheduledTaskAction -Execute $psExe -Argument $actionArgs
-$prefetchActionArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$PrefetchScriptPath`" -ProjectRoot `"$projectRoot`" -PythonExe `"$PythonExe`" -UsExchange `"$UsExchange`" -UsUniverseSize $UsUniverseSize -MaxSymbolsScan $MaxSymbolsScan"
+$prefetchNotifySkipsArg = if ($NotifySkips) { "-NotifySkips" } else { "" }
+$prefetchActionArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$PrefetchScriptPath`" -ProjectRoot `"$projectRoot`" -PythonExe `"$PythonExe`" -UsExchange `"$UsExchange`" -UsUniverseSize $UsUniverseSize -MaxSymbolsScan $MaxSymbolsScan -RequireUsPrefetchWindow -UsPrefetchLeadMinutes $UsPrefetchLeadMinutes -UsPrefetchWindowMinutes $UsPrefetchWindowMinutes -PrefetchMinSuccessCount $PrefetchMinSuccessCount -PrefetchMinSuccessRatio $prefetchMinSuccessRatioText $prefetchNotifySkipsArg"
 $prefetchAction = New-ScheduledTaskAction -Execute $psExe -Argument $prefetchActionArgs
 
 if ($WeekdaysOnly) {
@@ -101,19 +109,22 @@ if ($RegisterPrefetch) {
 Write-Output "Task registered: $TaskName"
 Write-Output "Market: US"
 Write-Output "US exchange: $UsExchange"
-Write-Output "Triggers(KST): $AtDst and $AtStd (DST/STD dual-trigger)"
+Write-Output "Triggers(KST): $AtDst and $AtStd (DST/STD dual-trigger, effective 1 run/day by open-window guard)"
 if ($WeekdaysOnly) {
     Write-Output "Schedule: Weekdays (Mon-Fri)"
 } else {
     Write-Output "Schedule: Daily"
 }
 Write-Output "Execution guard: run_daily.ps1 -RequireUsOpen -UsOpenWindowMinutes $UsOpenWindowMinutes (open-window + daily-lock)"
+Write-Output "Skip notifications: $NotifySkips"
 Write-Output "US setup prep: us_universe_size=$UsUniverseSize, max_symbols_scan=$MaxSymbolsScan"
 Write-Output "Retry config: start_delay=${StartDelaySeconds}s, max_attempts=$MaxAttempts, retry_delay=${RetryDelaySeconds}s, backoff=x$RetryBackoffMultiplier, max_retry_delay=${MaxRetryDelaySeconds}s"
 Write-Output "Command: $psExe $actionArgs"
 if ($RegisterPrefetch) {
     Write-Output "Prefetch task registered: $PrefetchTaskName"
-    Write-Output "Prefetch triggers(KST): $PrefetchAtDst and $PrefetchAtStd (DST/STD dual-trigger)"
+    Write-Output "Prefetch triggers(KST): $PrefetchAtDst and $PrefetchAtStd (DST/STD dual-trigger, effective 1 prefetch/day by prefetch-window guard)"
+    Write-Output "Prefetch guard: target_minutes_from_open=-$UsPrefetchLeadMinutes +/- $UsPrefetchWindowMinutes"
+    Write-Output "Prefetch cache threshold: min_success_count=$PrefetchMinSuccessCount, min_success_ratio=$PrefetchMinSuccessRatio"
     Write-Output "Prefetch command: $psExe $prefetchActionArgs"
 }
 Write-Output ""

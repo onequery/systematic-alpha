@@ -78,6 +78,8 @@ def main() -> int:
     parser.add_argument("--us-exchange", type=str, default="NASD")
     parser.add_argument("--us-universe-size", type=int, default=500)
     parser.add_argument("--max-symbols-scan", type=int, default=500)
+    parser.add_argument("--min-success-ratio", type=float, default=0.2)
+    parser.add_argument("--min-success-count", type=int, default=20)
     parser.add_argument("--force-refresh", action="store_true", default=False)
     args = parser.parse_args()
 
@@ -118,13 +120,41 @@ def main() -> int:
         return 2
 
     prev_success, prev_total = selector.prefetch_prev_day_stats(codes, force_refresh=args.force_refresh)
+    success_ratio = (float(prev_success) / float(prev_total)) if prev_total > 0 else 0.0
     print(
-        f"[prefetch-us-cache] prev-day cache: success={prev_success}/{prev_total}, cache={prev_cache}",
+        (
+            "[prefetch-us-cache] prev-day cache: "
+            f"success={prev_success}/{prev_total} ({success_ratio:.3f}), cache={prev_cache}"
+        ),
         flush=True,
     )
+
+    if prev_total <= 0:
+        print("[prefetch-us-cache] failed: prev-day cache scan had zero symbols", flush=True)
+        return 3
+
+    min_success_count = max(1, int(args.min_success_count))
+    min_success_ratio = max(0.0, min(1.0, float(args.min_success_ratio)))
+    if prev_success < min_success_count or success_ratio < min_success_ratio:
+        print(
+            (
+                "[prefetch-us-cache] failed: prev-day cache coverage too low "
+                f"(success={prev_success}, total={prev_total}, ratio={success_ratio:.3f}, "
+                f"min_success_count={min_success_count}, min_success_ratio={min_success_ratio:.3f})"
+            ),
+            flush=True,
+        )
+        if hasattr(selector, "get_api_diagnostics"):
+            try:
+                diag = selector.get_api_diagnostics()  # type: ignore[attr-defined]
+                print(f"[prefetch-us-cache] api_diagnostics={diag}", flush=True)
+            except Exception:
+                pass
+        return 4
+
     if not prev_cache.exists():
         print(f"[prefetch-us-cache] failed: prev cache not created ({prev_cache})", flush=True)
-        return 3
+        return 5
 
     print(
         f"[prefetch-us-cache] success: selected={len(codes)}, cache={prev_cache}",

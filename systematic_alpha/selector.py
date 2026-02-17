@@ -57,7 +57,7 @@ class DayTradingSelector:
             if analytics_path.name.lower() == "analytics":
                 return analytics_path.parent
             return analytics_path
-        return Path("out") / self.today_kst / "kr"
+        return Path("out") / "kr" / self.today_kst
 
     def _cache_dir(self) -> Path:
         return self._session_root_dir() / "cache"

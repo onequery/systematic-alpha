@@ -80,6 +80,40 @@ def to_ranked_payload(items: List[FinalSelection]) -> List[dict]:
     return payload
 
 
+def summarize_stage1_scan(selector: Any) -> Dict[str, Any]:
+    rows = list(getattr(selector, "last_stage1_scan", []) or [])
+    if not rows:
+        return {}
+
+    passed_count = 0
+    reason_counts: Dict[str, int] = {}
+    for row in rows:
+        if bool(row.get("passed_stage1")):
+            passed_count += 1
+        reason = str(row.get("skip_reason") or "").strip()
+        if reason:
+            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+
+    sorted_reasons = dict(sorted(reason_counts.items(), key=lambda item: item[1], reverse=True))
+    return {
+        "scanned": len(rows),
+        "passed": passed_count,
+        "skip_reason_counts": sorted_reasons,
+    }
+
+
+def selector_api_diagnostics(selector: Any) -> Dict[str, Any]:
+    if not hasattr(selector, "get_api_diagnostics"):
+        return {}
+    try:
+        diag = selector.get_api_diagnostics()  # type: ignore[attr-defined]
+        if isinstance(diag, dict):
+            return diag
+    except Exception:
+        pass
+    return {}
+
+
 def save_json_output(
     config: StrategyConfig,
     decision_at: datetime,
@@ -87,6 +121,7 @@ def save_json_output(
     final: List[FinalSelection],
     ranked: List[FinalSelection],
     invalid_reason: Optional[str] = None,
+    debug: Optional[Dict[str, Any]] = None,
 ) -> None:
     if not config.output_json_path:
         return
@@ -106,6 +141,7 @@ def save_json_output(
                 "sorted_by": "recommendation_score_desc",
                 "final": to_ranked_payload(final),
                 "all_ranked": to_ranked_payload(ranked),
+                "debug": debug or {},
             },
             ensure_ascii=False,
             indent=2,
@@ -187,12 +223,18 @@ def _discover_market_report_paths(report_path: Optional[str], market: str) -> Li
     if not market_tag:
         return [current_path]
 
-    # Expected layout: out/YYYYMMDD/{kr|us}/selection_overnight_report.csv
+    # Expected layout: out/{kr|us}/YYYYMMDD/selection_overnight_report.csv
+    # Legacy layout: out/YYYYMMDD/{kr|us}/selection_overnight_report.csv
     # If layout differs, fallback to current path only.
     try:
         out_root = current_path.parent.parent.parent
         if out_root.exists():
-            discovered = sorted(out_root.glob(f"*/{market_tag}/selection_overnight_report.csv"))
+            discovered = sorted(
+                set(
+                    list(out_root.glob(f"{market_tag}/*/selection_overnight_report.csv"))
+                    + list(out_root.glob(f"*/{market_tag}/selection_overnight_report.csv"))
+                )
+            )
             if current_path not in discovered:
                 discovered.append(current_path)
             return sorted(set(discovered))
@@ -488,6 +530,7 @@ def run(config: StrategyConfig) -> None:
     final: List[FinalSelection] = []
     realtime_stats: Dict[str, RealtimeStats] = {}
     fallback_added_count = 0
+    stage1_scan_summary: Dict[str, Any] = {}
     timings_sec: Dict[str, float] = {
         "load_universe_sec": 0.0,
         "stage1_sec": 0.0,
@@ -506,6 +549,16 @@ def run(config: StrategyConfig) -> None:
         min_orderbook_ticks=config.min_orderbook_ticks,
         min_realtime_cum_volume=config.min_realtime_cum_volume,
     )
+
+    def build_debug_payload() -> Dict[str, Any]:
+        payload: Dict[str, Any] = {}
+        summary = summarize_stage1_scan(selector)
+        if summary:
+            payload["stage1_scan_summary"] = summary
+        api_diag = selector_api_diagnostics(selector)
+        if api_diag:
+            payload["api_diagnostics"] = api_diag
+        return payload
 
     def persist_analytics_snapshot(decision_at: datetime, invalid_reason: Optional[str]) -> None:
         if not config.enable_analytics_log:
@@ -558,8 +611,18 @@ def run(config: StrategyConfig) -> None:
     log("[2/4] Stage1 filtering (change/gap/prev turnover)...")
     stage1 = selector.build_stage1_candidates(codes, names)
     stage1_initial = list(stage1)
+    stage1_scan_summary = summarize_stage1_scan(selector)
     timings_sec["stage1_sec"] = perf_counter() - stage_started
     log(f"Stage1 candidates: {len(stage1)} (elapsed {timings_sec['stage1_sec']:.1f}s)")
+    if stage1_scan_summary:
+        top_skip_counts = list(stage1_scan_summary.get("skip_reason_counts", {}).items())[:3]
+        top_skip_text = ", ".join(f"{k}={v}" for k, v in top_skip_counts) if top_skip_counts else "none"
+        log(
+            "[stage1] scan summary: "
+            f"scanned={stage1_scan_summary.get('scanned', 0)}, "
+            f"passed={stage1_scan_summary.get('passed', 0)}, "
+            f"top_skips={top_skip_text}"
+        )
 
     if len(stage1) < config.final_picks:
         fallback_started = perf_counter()
@@ -596,6 +659,9 @@ def run(config: StrategyConfig) -> None:
 
     if not stage1:
         log("No candidates passed stage1 thresholds.")
+        api_diag = selector_api_diagnostics(selector)
+        if api_diag:
+            log(f"[api-diag] {api_diag}")
         now = datetime.now(ZoneInfo("Asia/Seoul"))
         no_realtime = RealtimeQuality(
             realtime_ready=False,
@@ -614,6 +680,7 @@ def run(config: StrategyConfig) -> None:
             final=[],
             ranked=[],
             invalid_reason="no_stage1_candidates",
+            debug=build_debug_payload(),
         )
         persist_analytics_snapshot(decision_at=now, invalid_reason="no_stage1_candidates")
         log(f"Run finished (total elapsed {perf_counter() - total_started:.1f}s)")
@@ -671,6 +738,7 @@ def run(config: StrategyConfig) -> None:
             final=[],
             ranked=[],
             invalid_reason=invalid_reason,
+            debug=build_debug_payload(),
         )
         persist_analytics_snapshot(decision_at=now, invalid_reason=invalid_reason)
         print("\nTop codes: (none)")
@@ -705,6 +773,7 @@ def run(config: StrategyConfig) -> None:
         realtime_quality=realtime_quality,
         final=final,
         ranked=ranked,
+        debug=build_debug_payload(),
     )
     append_selection_report_rows(selector, config.overnight_report_path, final, decision_at)
     persist_analytics_snapshot(decision_at=decision_at, invalid_reason=None)

@@ -220,7 +220,7 @@ def parse_args() -> argparse.Namespace:
         "--analytics-dir",
         type=str,
         default=None,
-        help="Directory where analytics datasets are accumulated. Default: out/YYYYMMDD/{kr|us}/analytics",
+        help="Directory where analytics datasets are accumulated. Default: out/{kr|us}/YYYYMMDD/analytics",
     )
     parser.add_argument(
         "--disable-analytics-log",
@@ -239,7 +239,7 @@ def parse_args() -> argparse.Namespace:
         "--overnight-report-path",
         type=str,
         default=None,
-        help="CSV path for overnight performance tracking. Default: out/YYYYMMDD/{kr|us}/selection_overnight_report.csv",
+        help="CSV path for overnight performance tracking. Default: out/{kr|us}/YYYYMMDD/selection_overnight_report.csv",
     )
     parser.add_argument(
         "--test-assume-open",
@@ -263,7 +263,7 @@ def build_config(args: argparse.Namespace) -> StrategyConfig:
     market = args.market.strip().upper()
     market_tag = market.lower()
     run_date = datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y%m%d")
-    out_base_dir = Path("out") / run_date / market_tag
+    out_base_dir = Path("out") / market_tag / run_date
     analytics_dir = args.analytics_dir or str(out_base_dir / "analytics")
     overnight_report_path = args.overnight_report_path or str(out_base_dir / "selection_overnight_report.csv")
     universe_file = args.universe_file

@@ -38,14 +38,14 @@ class USDayTradingSelector:
         raw_exchange = (config.us_exchange or "").strip()
         exchange_upper = raw_exchange.upper()
         exchange_map = {
-            "NASD": "NASD",
-            "NASDAQ": "NASD",
-            "NYSE": "NYSE",
-            "NYS": "NYSE",
-            "AMEX": "AMEX",
-            "AMS": "AMEX",
+            "NASD": "나스닥",
+            "NASDAQ": "나스닥",
+            "NYSE": "뉴욕",
+            "NYS": "뉴욕",
+            "AMEX": "아멕스",
+            "AMS": "아멕스",
         }
-        broker_exchange = exchange_map.get(exchange_upper, raw_exchange or "NASD")
+        broker_exchange = exchange_map.get(exchange_upper, raw_exchange or "나스닥")
         self.broker = self.mojito.KoreaInvestment(
             api_key=config.api_key,
             api_secret=config.api_secret,
@@ -53,6 +53,7 @@ class USDayTradingSelector:
             exchange=broker_exchange,
             mock=config.mock,
         )
+        self._broker_exchange = broker_exchange
         self.today_us = datetime.now(ZoneInfo("America/New_York")).strftime("%Y%m%d")
         self.today_kst = datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y%m%d")
         self._daily_cache: Dict[str, Optional[PrevDayStats]] = {}
@@ -61,7 +62,28 @@ class USDayTradingSelector:
         self._daily_bars_cache: Dict[str, List[Dict[str, Any]]] = {}
         self._orderbook_available = False
         self.last_stage1_scan: List[Dict[str, Any]] = []
+        self._api_diag_counts: Dict[str, int] = {}
+        self._api_diag_samples: List[Dict[str, str]] = []
         self._load_prev_stats_cache()
+
+    def _record_api_diag(self, key: str, code: str, detail: str = "") -> None:
+        self._api_diag_counts[key] = self._api_diag_counts.get(key, 0) + 1
+        if detail and len(self._api_diag_samples) < 60:
+            self._api_diag_samples.append(
+                {
+                    "key": key,
+                    "code": code,
+                    "detail": detail[:500],
+                }
+            )
+
+    def get_api_diagnostics(self) -> Dict[str, Any]:
+        return {
+            "exchange_input": self.config.us_exchange,
+            "exchange_broker": self._broker_exchange,
+            "counts": dict(self._api_diag_counts),
+            "sample_errors": list(self._api_diag_samples),
+        }
 
     def _session_root_dir(self) -> Path:
         if self.config.output_json_path:
@@ -74,7 +96,7 @@ class USDayTradingSelector:
             if analytics_path.name.lower() == "analytics":
                 return analytics_path.parent
             return analytics_path
-        return Path("out") / self.today_kst / "us"
+        return Path("out") / "us" / self.today_kst
 
     def _cache_dir(self) -> Path:
         return self._session_root_dir() / "cache"
@@ -496,7 +518,8 @@ class USDayTradingSelector:
 
         try:
             resp = self.broker.fetch_price(code)
-        except Exception:
+        except Exception as exc:
+            self._record_api_diag("fetch_price_exception", code, repr(exc))
             self._price_cache[code] = None
             return None
 
@@ -504,11 +527,19 @@ class USDayTradingSelector:
         if not payload and isinstance(resp, dict):
             payload = resp
         if not payload:
+            detail = ""
+            if isinstance(resp, dict):
+                detail = f"rt_cd={resp.get('rt_cd')} msg_cd={resp.get('msg_cd')} msg1={resp.get('msg1')}"
+            self._record_api_diag("fetch_price_empty_payload", code, detail)
             self._price_cache[code] = None
             return None
 
         parsed = self._parse_price_payload(payload)
         if parsed.get("price") is None:
+            detail = ""
+            if isinstance(resp, dict):
+                detail = f"rt_cd={resp.get('rt_cd')} msg_cd={resp.get('msg_cd')} msg1={resp.get('msg1')}"
+            self._record_api_diag("fetch_price_no_price_field", code, detail)
             self._price_cache[code] = None
             return None
 
@@ -533,7 +564,8 @@ class USDayTradingSelector:
 
         try:
             resp = self.broker.fetch_price_detail_oversea(code)
-        except Exception:
+        except Exception as exc:
+            self._record_api_diag("fetch_price_detail_exception", code, repr(exc))
             self._detail_cache[code] = None
             return None
 
@@ -541,6 +573,10 @@ class USDayTradingSelector:
         if not payload and isinstance(resp, dict):
             payload = resp
         if not payload:
+            detail = ""
+            if isinstance(resp, dict):
+                detail = f"rt_cd={resp.get('rt_cd')} msg_cd={resp.get('msg_cd')} msg1={resp.get('msg1')}"
+            self._record_api_diag("fetch_price_detail_empty_payload", code, detail)
             self._detail_cache[code] = None
             return None
 
@@ -554,11 +590,17 @@ class USDayTradingSelector:
 
         try:
             resp = self.broker.fetch_ohlcv_oversea(code, timeframe="D", adj_price=True)
-        except Exception:
+        except Exception as exc:
+            self._record_api_diag("fetch_prev_day_exception", code, repr(exc))
             self._daily_cache[code] = None
             return None
 
         rows = latest_list_of_dict(resp if isinstance(resp, dict) else {})
+        if not rows:
+            detail = ""
+            if isinstance(resp, dict):
+                detail = f"rt_cd={resp.get('rt_cd')} msg_cd={resp.get('msg_cd')} msg1={resp.get('msg1')}"
+            self._record_api_diag("fetch_prev_day_empty_rows", code, detail)
         parsed_rows: List[Tuple[str, float, float, float, Optional[float]]] = []
         for row in rows:
             date_key = pick_first(
@@ -632,6 +674,7 @@ class USDayTradingSelector:
             parsed_rows.append((date, close, volume, turnover, day_change_pct))
 
         if not parsed_rows:
+            self._record_api_diag("fetch_prev_day_no_parsed_rows", code, "parsed_rows=0")
             self._daily_cache[code] = None
             return None
 
@@ -639,6 +682,7 @@ class USDayTradingSelector:
         past_rows = [row for row in parsed_rows if row[0] < self.today_us]
         target_rows = past_rows if past_rows else parsed_rows
         if not target_rows:
+            self._record_api_diag("fetch_prev_day_no_target_rows", code, "target_rows=0")
             self._daily_cache[code] = None
             return None
 

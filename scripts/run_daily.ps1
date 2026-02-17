@@ -41,7 +41,8 @@
     [int]$RetryBackoffMultiplier = 2,
     [int]$MaxRetryDelaySeconds = 180,
     [int]$NotifyTailLines = 20,
-    [switch]$NotifyStart = $true
+    [switch]$NotifyStart = $true,
+    [switch]$NotifySkips = $false
 )
 $ErrorActionPreference = "Stop"
 $script:RunLogFile = $null
@@ -441,10 +442,10 @@ $marketTag = if ($Market -eq "US") { "us" } else { "kr" }
 
 $logRootDir = Join-Path $ProjectRoot "logs"
 $outRootDir = Join-Path $ProjectRoot "out"
-$runDateDirForLog = Join-Path $logRootDir $runDate
-$runDateDirForOut = Join-Path $outRootDir $runDate
-$runLogDir = Join-Path $runDateDirForLog $marketTag
-$runOutMarketDir = Join-Path $runDateDirForOut $marketTag
+$runMarketDirForLog = Join-Path $logRootDir $marketTag
+$runMarketDirForOut = Join-Path $outRootDir $marketTag
+$runLogDir = Join-Path $runMarketDirForLog $runDate
+$runOutMarketDir = Join-Path $runMarketDirForOut $runDate
 $runResultDir = Join-Path $runOutMarketDir "results"
 
 $null = New-Item -ItemType Directory -Force -Path $runLogDir
@@ -586,7 +587,7 @@ if ($Market -eq "US" -and $RequireUsOpen -and -not $AssumeOpenForTest) {
     )
     if (-not $withinOpenWindow) {
         Write-MonitorLog "[market-check] outside US open window. skipping run."
-        if ($script:TelegramEnabled) {
+        if ($script:TelegramEnabled -and $NotifySkips) {
             Send-TelegramMessage (
                 "[SystematicAlpha] skipped`n" +
                 "reason=outside US open window`n" +
@@ -603,7 +604,7 @@ if ($Market -eq "US" -and $RequireUsOpen -and -not $AssumeOpenForTest) {
     $usDayLock = Join-Path $runtimeDir ("us_run_lock_{0}.txt" -f $usEtDate)
     if (Test-Path $usDayLock) {
         Write-MonitorLog "[market-check] US daily lock exists ($usDayLock). skipping duplicate run."
-        if ($script:TelegramEnabled) {
+        if ($script:TelegramEnabled -and $NotifySkips) {
             Send-TelegramMessage (
                 "[SystematicAlpha] skipped`n" +
                 "reason=US daily lock exists`n" +

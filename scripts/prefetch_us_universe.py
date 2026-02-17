@@ -86,7 +86,7 @@ def main() -> int:
     project_root = Path(args.project_root).resolve()
     out_dir = project_root / "out"
     today_kst = datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y%m%d")
-    out_path = out_dir / today_kst / "us" / "cache" / "us_sp500_constituents.csv"
+    out_path = out_dir / "us" / today_kst / "cache" / "us_sp500_constituents.csv"
     min_count = max(1, args.min_count)
 
     print(f"[prefetch] source={args.source_url}", flush=True)

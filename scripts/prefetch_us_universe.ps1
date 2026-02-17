@@ -4,7 +4,14 @@ param(
     [string]$UsExchange = "NASD",
     [int]$UsUniverseSize = 500,
     [int]$MaxSymbolsScan = 500,
-    [switch]$ForceRefresh = $false
+    [switch]$ForceRefresh = $false,
+    [switch]$RequireUsPrefetchWindow = $true,
+    [int]$UsPrefetchLeadMinutes = 60,
+    [int]$UsPrefetchWindowMinutes = 45,
+    [int]$PrefetchMinSuccessCount = 20,
+    [double]$PrefetchMinSuccessRatio = 0.2,
+    [switch]$AssumeOpenForTest = $false,
+    [switch]$NotifySkips = $false
 )
 
 $ErrorActionPreference = "Stop"
@@ -245,6 +252,27 @@ function Send-TelegramMessage {
     }
 }
 
+function Get-UsMarketState {
+    $tz = [System.TimeZoneInfo]::FindSystemTimeZoneById("Eastern Standard Time")
+    $nowLocal = Get-Date
+    $nowEt = [System.TimeZoneInfo]::ConvertTime($nowLocal, $tz)
+    $isWeekday = $nowEt.DayOfWeek -in @(
+        [DayOfWeek]::Monday,
+        [DayOfWeek]::Tuesday,
+        [DayOfWeek]::Wednesday,
+        [DayOfWeek]::Thursday,
+        [DayOfWeek]::Friday
+    )
+    $openEt = Get-Date -Date $nowEt.Date -Hour 9 -Minute 30 -Second 0
+    $minutesFromOpen = [int][Math]::Round(($nowEt - $openEt).TotalMinutes)
+    return @{
+        now_et = $nowEt
+        is_weekday = $isWeekday
+        open_et = $openEt
+        minutes_from_open = $minutesFromOpen
+    }
+}
+
 if (-not (Test-Path $ProjectRoot)) {
     throw "ProjectRoot not found: $ProjectRoot"
 }
@@ -265,10 +293,13 @@ $nowKst = [System.TimeZoneInfo]::ConvertTime((Get-Date), $kstTz)
 $runDate = $nowKst.ToString("yyyyMMdd")
 $stamp = $nowKst.ToString("yyyyMMdd_HHmmss")
 
-$logDateDir = Join-Path (Join-Path $ProjectRoot "logs") $runDate
-$logDir = Join-Path $logDateDir "us"
+$logMarketDir = Join-Path (Join-Path $ProjectRoot "logs") "us"
+$logDir = Join-Path $logMarketDir $runDate
 $null = New-Item -ItemType Directory -Force -Path $logDir
 $null = New-Item -ItemType Directory -Force -Path (Join-Path $ProjectRoot "out")
+$runOutMarketDir = Join-Path (Join-Path (Join-Path $ProjectRoot "out") "us") $runDate
+$runtimeDir = Join-Path $runOutMarketDir "runtime"
+$null = New-Item -ItemType Directory -Force -Path $runtimeDir
 
 foreach ($name in @("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY", "all_proxy")) {
     if (Test-Path "Env:$name") {
@@ -283,6 +314,7 @@ $env:PYTHONIOENCODING = "utf-8"
 $env:PYTHONUTF8 = "1"
 
 $script:LogFile = Join-Path $logDir ("prefetch_us_{0}.log" -f $stamp)
+$prefetchMinSuccessRatioText = $PrefetchMinSuccessRatio.ToString([System.Globalization.CultureInfo]::InvariantCulture)
 $universeArgs = @(
     "scripts\prefetch_us_universe.py",
     "--project-root", $ProjectRoot
@@ -292,7 +324,9 @@ $cacheArgs = @(
     "--project-root", $ProjectRoot,
     "--us-exchange", $UsExchange,
     "--us-universe-size", "$UsUniverseSize",
-    "--max-symbols-scan", "$MaxSymbolsScan"
+    "--max-symbols-scan", "$MaxSymbolsScan",
+    "--min-success-count", "$PrefetchMinSuccessCount",
+    "--min-success-ratio", "$prefetchMinSuccessRatioText"
 )
 if ($ForceRefresh) {
     $cacheArgs += "--force-refresh"
@@ -317,6 +351,60 @@ if ([string]::IsNullOrWhiteSpace($env:TELEGRAM_ENABLED)) {
     $script:TelegramEnabled = $enabledByKeys
 } else {
     $script:TelegramEnabled = (Test-Truthy $env:TELEGRAM_ENABLED) -and $enabledByKeys
+}
+
+$prefetchLockPath = ""
+$prefetchLockAcquired = $false
+if ($RequireUsPrefetchWindow -and -not $AssumeOpenForTest) {
+    $state = Get-UsMarketState
+    $leadMinutes = [Math]::Abs($UsPrefetchLeadMinutes)
+    $windowMinutes = [Math]::Max(1, $UsPrefetchWindowMinutes)
+    $targetMinutesFromOpen = -$leadMinutes
+    $deltaMinutes = [Math]::Abs($state.minutes_from_open - $targetMinutesFromOpen)
+    $withinWindow = $state.is_weekday -and ($deltaMinutes -lt $windowMinutes)
+    Write-LogLine (
+        "[prefetch-check] now(et)={0:yyyy-MM-dd HH:mm:ss}, weekday={1}, minutes_from_open={2}, target={3}, " +
+        "window=+/-{4}, within_window={5}" -f `
+            $state.now_et, $state.is_weekday, $state.minutes_from_open, $targetMinutesFromOpen, $windowMinutes, $withinWindow
+    )
+    if (-not $withinWindow) {
+        Write-LogLine "[prefetch-check] outside prefetch window. skipping."
+        if ($script:TelegramEnabled -and $NotifySkips) {
+            Send-TelegramMessage (
+                "[SystematicAlpha] skipped`n" +
+                "reason=outside US prefetch window`n" +
+                ("now_et={0:yyyy-MM-dd HH:mm:ss}" -f $state.now_et) + "`n" +
+                ("minutes_from_open={0}, target={1}, tolerance=+/-{2}" -f $state.minutes_from_open, $targetMinutesFromOpen, $windowMinutes)
+            )
+        }
+        exit 0
+    }
+
+    $etDate = $state.now_et.ToString("yyyyMMdd")
+    $prefetchLockPath = Join-Path $runtimeDir ("us_prefetch_lock_{0}.txt" -f $etDate)
+    if (Test-Path $prefetchLockPath) {
+        Write-LogLine "[prefetch-check] prefetch lock exists ($prefetchLockPath). skipping duplicate run."
+        if ($script:TelegramEnabled -and $NotifySkips) {
+            Send-TelegramMessage (
+                "[SystematicAlpha] skipped`n" +
+                "reason=US prefetch lock exists`n" +
+                ("lock={0}" -f $prefetchLockPath)
+            )
+        }
+        exit 0
+    }
+
+    $lockText = @(
+        "created_at=" + (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+        "now_et=" + ($state.now_et.ToString("yyyy-MM-dd HH:mm:ss"))
+        "market=US"
+    ) -join "`n"
+    Set-Content -Path $prefetchLockPath -Value $lockText -Encoding UTF8
+    $prefetchLockAcquired = $true
+    Write-LogLine "[prefetch-check] created US prefetch lock: $prefetchLockPath"
+}
+elseif ($RequireUsPrefetchWindow -and $AssumeOpenForTest) {
+    Write-LogLine "[prefetch-check] prefetch window guard bypassed by AssumeOpenForTest."
 }
 
 Write-LogLine "[prefetch] command(universe): $PythonExe $($universeArgs -join ' ')"
@@ -381,6 +469,12 @@ try {
 }
 
 Write-LogLine "[prefetch] finished (exit=$exitCode)"
+if ($exitCode -ne 0 -and $prefetchLockAcquired -and -not [string]::IsNullOrWhiteSpace($prefetchLockPath)) {
+    if (Test-Path $prefetchLockPath) {
+        Remove-Item -Path $prefetchLockPath -Force -ErrorAction SilentlyContinue
+        Write-LogLine "[prefetch-check] removed prefetch lock due failure: $prefetchLockPath"
+    }
+}
 if ($exitCode -eq 0) {
     Send-TelegramMessage (
         "[SystematicAlpha] prefetch-success`n" +

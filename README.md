@@ -26,7 +26,7 @@ This project is a CLI app (no UI). It reads secrets from `.env` and prints ranke
 - Automatic overnight performance report (`selection -> close -> next open`) in CSV.
 - Configurable thresholds via CLI arguments (scheduled runs use `scripts/run_daily.ps1` parameters)
 - JSON output export for downstream automation
-- Long-horizon analytics dataset accumulation (`out/YYYYMMDD/{kr|us}/analytics`) for post-hoc performance/strategy analysis
+- Long-horizon analytics dataset accumulation (`out/{kr|us}/YYYYMMDD/analytics`) for post-hoc performance/strategy analysis
 - Telegram notifications for stage/retry/failure/success status (optional)
 - Live progress/heartbeat logs during scan and realtime collection
 - Local `.env` loader (no external dotenv dependency)
@@ -230,8 +230,8 @@ Default behavior:
 - prefetch task name: `SystematicAlpha_KR_Prefetch_Universe_0730`
 - prefetch time(KST): `07:30` on weekdays (90m buffer before KR open)
 - prefetch actions:
-  - build `out/YYYYMMDD/kr/cache/kr_universe_liquidity.csv`
-  - build `out/YYYYMMDD/kr/cache/kr_prev_day_stats.csv`
+  - build `out/kr/YYYYMMDD/cache/kr_universe_liquidity.csv`
+  - build `out/kr/YYYYMMDD/cache/kr_prev_day_stats.csv`
 - python: `C:\Users\heesu\anaconda3\envs\systematic-alpha\python.exe`
 - startup delay: `5 sec` (to avoid exact open-time mismatch)
 - internal retries: up to `4` attempts (`30s`, backoff `x2`, max `180s`)
@@ -254,16 +254,25 @@ Default behavior:
 - triggers(KST): `22:30` and `23:30` on weekdays
 - runner: `scripts/run_daily.ps1 -Market US -RequireUsOpen`
 - runtime guard: open-window check (`09:30 ET + 20m`) + ET-day lock(1 run/day)
+  - outside-window/duplicate runs are skipped silently by default (`-NotifySkips:$false`)
 - prefetch task name: `SystematicAlpha_US_Prefetch_Setup_0830ET`
 - prefetch triggers(KST): `21:30` and `22:30` on weekdays (60m buffer before US open)
+- prefetch guard: only execute near `open-60m` (default tolerance `+/-45m`) + ET-day prefetch lock(1 run/day)
 - prefetch actions:
-  - download latest S&P500 constituents into `out/YYYYMMDD/us/cache/us_sp500_constituents.csv`
-  - build `out/YYYYMMDD/us/cache/us_prev_day_stats.csv`
+  - download latest S&P500 constituents into `out/us/YYYYMMDD/cache/us_sp500_constituents.csv`
+  - build `out/us/YYYYMMDD/cache/us_prev_day_stats.csv`
+  - validate prev-day cache coverage (default: `min_success_count=20`, `min_success_ratio=0.20`)
 
 Custom example:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\register_us_task.ps1 -UsExchange "NASD" -UsOpenWindowMinutes 20 -TaskName "SystematicAlpha_US_Open_0930ET_Custom"
+```
+
+US noisy-skip 알림까지 받고 싶으면:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\register_us_task.ps1 -NotifySkips
 ```
 
 ### Verify registration
@@ -316,17 +325,23 @@ Start-ScheduledTask -TaskName "SystematicAlpha_US_Open_0930ET"
 Start-ScheduledTask -TaskName "SystematicAlpha_US_Prefetch_Setup_0830ET"
 ```
 
+US prefetch를 장외 시간에 수동 테스트하려면:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\prefetch_us_universe.ps1 -AssumeOpenForTest
+```
+
 ### Check outputs
 
-- logs (single file per run): `logs/YYYYMMDD/{kr|us}/`
-  - run log: `logs/YYYYMMDD/{kr|us}/{kr|us}_daily_YYYYMMDD_HHMMSS.log`
-  - prefetch logs: `logs/YYYYMMDD/{kr|us}/prefetch_{kr|us}_YYYYMMDD_HHMMSS.log`
-- outputs are grouped by date + market: `out/YYYYMMDD/{kr|us}/`
-  - result json: `out/YYYYMMDD/{kr|us}/results/{kr|us}_daily_YYYYMMDD_HHMMSS.json`
-  - caches: `out/YYYYMMDD/{kr|us}/cache/*.csv`
-  - overnight report: `out/YYYYMMDD/{kr|us}/selection_overnight_report.csv`
-  - analytics tables: `out/YYYYMMDD/{kr|us}/analytics/tables/*.csv`
-  - analytics run bundles: `out/YYYYMMDD/{kr|us}/analytics/runs/*.json`
+- logs (single file per run): `logs/{kr|us}/YYYYMMDD/`
+  - run log: `logs/{kr|us}/YYYYMMDD/{kr|us}_daily_YYYYMMDD_HHMMSS.log`
+  - prefetch logs: `logs/{kr|us}/YYYYMMDD/prefetch_{kr|us}_YYYYMMDD_HHMMSS.log`
+- outputs are grouped by market + date: `out/{kr|us}/YYYYMMDD/`
+  - result json: `out/{kr|us}/YYYYMMDD/results/{kr|us}_daily_YYYYMMDD_HHMMSS.json`
+  - caches: `out/{kr|us}/YYYYMMDD/cache/*.csv`
+  - overnight report: `out/{kr|us}/YYYYMMDD/selection_overnight_report.csv`
+  - analytics tables: `out/{kr|us}/YYYYMMDD/analytics/tables/*.csv`
+  - analytics run bundles: `out/{kr|us}/YYYYMMDD/analytics/runs/*.json`
 
 ### Remove tasks
 
@@ -349,15 +364,15 @@ Notes:
 - The PC must be on for automatic task execution.
 - `remove_kr_task.ps1` / `remove_us_task.ps1` are manual commands and run immediately.
 - If the PC is sleeping at trigger time, execution can be delayed by OS/task settings.
-- `out/YYYYMMDD/kr/cache/kr_universe_liquidity.csv` is daily-varying data (previous-day turnover ranking), not a static file.
+- `out/kr/YYYYMMDD/cache/kr_universe_liquidity.csv` is daily-varying data (previous-day turnover ranking), not a static file.
   - it should be refreshed each trading day before KR open (handled by KR prefetch task).
-- `out/YYYYMMDD/kr/cache/kr_prev_day_stats.csv` and `out/YYYYMMDD/us/cache/us_prev_day_stats.csv` are daily-varying caches.
+- `out/kr/YYYYMMDD/cache/kr_prev_day_stats.csv` and `out/us/YYYYMMDD/cache/us_prev_day_stats.csv` are daily-varying caches.
   - they are pre-built before market open to reduce stage1 API calls and startup latency.
 - `scripts/run_daily.ps1` clears proxy env variables and uses project-local cache path for `mojito` token stability.
 - `scripts/run_daily.ps1` reads Telegram settings from `.env` and sends notifications automatically when configured.
 - If token issuance hits rate-limit (`EGW00133`), retry wait is automatically expanded to `65 sec`.
 - US holidays/half-days are not fully modeled in this repo.
-- US task prevents duplicate same-day runs via `out/YYYYMMDD/us/runtime/us_run_lock_YYYYMMDD.txt` (ET date 기준).
+- US task prevents duplicate same-day runs via `out/us/YYYYMMDD/runtime/us_run_lock_YYYYMMDD.txt` (ET date 기준).
 - Backward-compatibility aliases are kept:
   - `register_task.ps1` -> `register_kr_task.ps1`
   - `remove_task.ps1` -> `remove_kr_task.ps1`
@@ -373,7 +388,8 @@ powershell -ExecutionPolicy Bypass -File .\scripts\run_daily.ps1 `
   -RetryDelaySeconds 30 `
   -RetryBackoffMultiplier 2 `
   -MaxRetryDelaySeconds 180 `
-  -NotifyTailLines 20
+  -NotifyTailLines 20 `
+  -NotifySkips:$false
 ```
 
 You can also tune strategy hyperparameters in the same script call:
@@ -419,7 +435,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\run_daily.ps1 -NotifyStart:$f
 
 Execution monitor behavior:
 - `run_daily.ps1` now streams Python output in real time (no end-of-run dump).
-- each run writes into one single log file (`logs/YYYYMMDD/{kr|us}/{kr|us}_daily_*.log`), including monitor + Python output.
+- each run writes into one single log file (`logs/{kr|us}/YYYYMMDD/{kr|us}_daily_*.log`), including monitor + Python output.
 - each attempt prints start time, command line, and elapsed seconds.
 - startup/retry waiting now prints elapsed/remaining seconds every second.
 - stage1 scan prints progress every `STAGE1_LOG_INTERVAL` symbols (default `20`).
@@ -481,17 +497,17 @@ python main.py --disable-analytics-log
 - Console table with top picks
 - Optional JSON file via `--output-json`
 - Overnight performance report CSV:
-  - market/day file: `out/YYYYMMDD/{kr|us}/selection_overnight_report.csv`
+  - market/day file: `out/{kr|us}/YYYYMMDD/selection_overnight_report.csv`
   - columns include: selection datetime, entry price, same-day close, next-day open, intraday/overnight/total returns
-- Analytics datasets (default): `out/YYYYMMDD/{kr|us}/analytics/`
-  - `tables/run_summary.csv`: run summary table for that date+market
-  - `tables/stage1_scan.csv`: stage1 scan diagnostics for that date+market
-  - `tables/ranked_symbols.csv`: ranking dataset for that date+market
+- Analytics datasets (default): `out/{kr|us}/YYYYMMDD/analytics/`
+  - `tables/run_summary.csv`: run summary table for that market+date
+  - `tables/stage1_scan.csv`: stage1 scan diagnostics for that market+date
+  - `tables/ranked_symbols.csv`: ranking dataset for that market+date
   - `runs/{market}_YYYYMMDD_HHMMSS_microsec.json`: full per-run bundle
 
 Example JSON path:
 - `out/smoke_run.json`
-- scheduled run example: `out/YYYYMMDD/kr/results/kr_daily_YYYYMMDD_HHMMSS.json`
+- scheduled run example: `out/kr/YYYYMMDD/results/kr_daily_YYYYMMDD_HHMMSS.json`
 
 ## Troubleshooting
 
@@ -529,6 +545,7 @@ Example JSON path:
 ## Disclaimer
 
 This repository is for research/automation purposes only and is not financial advice.
+
 
 
 
