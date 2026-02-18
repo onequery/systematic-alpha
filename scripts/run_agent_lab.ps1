@@ -280,6 +280,138 @@ function Build-ProposalSummaryMessage {
     return ($lines -join "`n")
 }
 
+function Get-WeeklyCouncilPayload {
+    param(
+        [string]$ProjectRootPath,
+        [string]$WeekId
+    )
+    $name = ("weekly_council_{0}.json" -f $WeekId.Replace("-", "_"))
+    $root = Join-Path $ProjectRootPath "out\agent_lab"
+    if (-not (Test-Path $root)) {
+        return $null
+    }
+    $files = Get-ChildItem -Path $root -Recurse -File -Filter $name | Sort-Object LastWriteTime, FullName
+    if (-not $files -or $files.Count -eq 0) {
+        return $null
+    }
+    $path = $files[-1].FullName
+    try {
+        $obj = Get-Content -Path $path -Raw -Encoding UTF8 | ConvertFrom-Json
+        return @{
+            path = $path
+            data = $obj
+        }
+    } catch {
+        return $null
+    }
+}
+
+function Build-WeeklyCouncilSummaryMessage {
+    param(
+        [string]$ProjectRootPath,
+        [string]$WeekId
+    )
+    $bundle = Get-WeeklyCouncilPayload -ProjectRootPath $ProjectRootPath -WeekId $WeekId
+    if ($null -eq $bundle) {
+        return "[AgentLab] weekly-council complete`nweek=$WeekId`n(summary file not found)"
+    }
+
+    $obj = $bundle.data
+    $lines = @(
+        "[AgentLab] weekly-council"
+        ("week={0}" -f [string]$obj.week_id)
+        ("champion={0}" -f [string]$obj.champion_agent_id)
+    )
+
+    $promoted = @()
+    if ($null -ne $obj.promoted_versions) {
+        $promoted = @($obj.promoted_versions.PSObject.Properties | ForEach-Object { "{0}:{1}" -f $_.Name, $_.Value })
+    }
+    if ($promoted.Count -gt 0) {
+        $lines += ("promoted=" + ($promoted -join ", "))
+    } else {
+        $lines += "promoted=(none)"
+    }
+
+    $moderatorSummary = ""
+    if ($null -ne $obj.discussion -and $null -ne $obj.discussion.moderator) {
+        $moderatorSummary = [string]$obj.discussion.moderator.summary
+    }
+    if (-not [string]::IsNullOrWhiteSpace($moderatorSummary)) {
+        $lines += ("moderator=" + $moderatorSummary)
+    }
+
+    if ($null -ne $obj.discussion -and $null -ne $obj.discussion.rounds) {
+        $rounds = @($obj.discussion.rounds)
+        if ($rounds.Count -gt 0) {
+            foreach ($round in $rounds | Select-Object -First 2) {
+                $roundNo = [string]$round.round
+                $phase = [string]$round.phase
+                $lines += ("round{0}_{1}" -f $roundNo, $phase)
+                $speeches = @()
+                if ($null -ne $round.speeches) {
+                    $speeches = @($round.speeches)
+                }
+                foreach ($speech in $speeches | Select-Object -First 3) {
+                    $aid = [string]$speech.agent_id
+                    $text = ""
+                    if (-not [string]::IsNullOrWhiteSpace([string]$speech.thesis)) {
+                        $text = [string]$speech.thesis
+                    } elseif (-not [string]::IsNullOrWhiteSpace([string]$speech.rebuttal)) {
+                        $text = [string]$speech.rebuttal
+                    }
+                    if ($text.Length -gt 160) {
+                        $text = $text.Substring(0, 160) + "..."
+                    }
+                    if (-not [string]::IsNullOrWhiteSpace($text)) {
+                        $lines += ("{0}: {1}" -f $aid, $text)
+                    }
+                }
+            }
+        }
+    }
+
+    $alerts = @()
+    if ($null -ne $obj.llm_alerts) {
+        $alerts = @($obj.llm_alerts)
+    }
+    if ($alerts.Count -gt 0) {
+        $lines += ("llm_alerts=" + $alerts.Count)
+        $topAlerts = $alerts | Select-Object -First 3
+        foreach ($a in $topAlerts) {
+            $lines += ("alert: agent={0}, phase={1}, reason={2}" -f [string]$a.agent_id, [string]$a.phase, [string]$a.reason)
+        }
+    } else {
+        $lines += "llm_alerts=0"
+    }
+
+    return ($lines -join "`n")
+}
+
+function Get-WeeklyCouncilTokenAlerts {
+    param(
+        [string]$ProjectRootPath,
+        [string]$WeekId
+    )
+    $bundle = Get-WeeklyCouncilPayload -ProjectRootPath $ProjectRootPath -WeekId $WeekId
+    if ($null -eq $bundle) {
+        return @()
+    }
+    $obj = $bundle.data
+    if ($null -eq $obj.llm_alerts) {
+        return @()
+    }
+    $alerts = @($obj.llm_alerts)
+    $hits = New-Object System.Collections.Generic.List[string]
+    foreach ($a in $alerts) {
+        $reason = [string]$a.reason
+        if ($reason -match "daily_budget_exceeded|insufficient_quota|quota|billing|context_length_exceeded|max_tokens|token") {
+            $hits.Add($reason)
+        }
+    }
+    return @($hits | Select-Object -Unique)
+}
+
 function Get-LatestSessionJsonPath {
     param(
         [string]$Root,
@@ -547,10 +679,18 @@ switch ($Action) {
         $result = Invoke-AgentLabCli -PyExe $PythonExe -CliArgs $args
         $code = Resolve-ExitCode -Result $result
         if ($code -eq 0) {
-            Send-TelegramMessage (
-                "[AgentLab] weekly-council complete`n" +
-                "week=$weekValue"
-            )
+            Send-TelegramMessage (Build-WeeklyCouncilSummaryMessage -ProjectRootPath $ProjectRoot -WeekId $weekValue)
+            $tokenAlerts = @(Get-WeeklyCouncilTokenAlerts -ProjectRootPath $ProjectRoot -WeekId $weekValue)
+            if ($tokenAlerts.Count -gt 0) {
+                $topAlerts = @($tokenAlerts | Select-Object -First 3)
+                Send-TelegramMessage (
+                    "[AgentLab] alert`n" +
+                    "OpenAI token/quota limit issue detected during weekly-council.`n" +
+                    "week=$weekValue`n" +
+                    "reasons=$($topAlerts -join '; ')`n" +
+                    "action=Increase OPENAI_MAX_DAILY_COST, check OpenAI quota/billing, or reduce meeting frequency."
+                )
+            }
         }
         exit $code
     }

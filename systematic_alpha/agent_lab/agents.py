@@ -20,22 +20,22 @@ def build_default_agent_profiles(total_capital_krw: float, count: int = 3) -> Li
         (
             "agent_a",
             "Agent-A",
-            "모멘텀/수급 강화형",
-            "초기 모멘텀과 체결 강도를 중시한다. 상위 신호를 빠르게 추종한다.",
+            "momentum_and_flow",
+            "Prioritize early momentum and execution strength. Follow strong signals quickly.",
             "aggressive",
         ),
         (
             "agent_b",
             "Agent-B",
-            "리스크 우선/보수형",
-            "조건 충족 안정성을 우선하며 과도한 변동성과 저품질 신호를 회피한다.",
+            "risk_first_conservative",
+            "Prioritize stability and avoid unstable high-volatility setups.",
             "conservative",
         ),
         (
             "agent_c",
             "Agent-C",
-            "반대가설 탐색/다양성 확보형",
-            "상위 신호에 편중되지 않도록 대체 가설을 선택해 포트폴리오 다양성을 확보한다.",
+            "counter_hypothesis_diversifier",
+            "Avoid crowding. Select alternatives for diversification and robustness.",
             "diversifier",
         ),
     ]
@@ -119,6 +119,13 @@ def _extract_ranked_candidates(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     return out
 
 
+def _short_text(text: str, limit: int = 220) -> str:
+    t = str(text or "").strip()
+    if len(t) <= limit:
+        return t
+    return t[:limit] + "..."
+
+
 class AgentDecisionEngine:
     def __init__(self, llm: LLMClient, strategy_registry: StrategyRegistry):
         self.llm = llm
@@ -199,6 +206,204 @@ class AgentDecisionEngine:
         )
         return orders, rationale
 
+    def _normalize_param_changes(self, raw: Any) -> Dict[str, Any]:
+        if not isinstance(raw, dict):
+            return {}
+        out: Dict[str, Any] = {}
+        for key, value in raw.items():
+            if key not in ALLOWED_PARAM_RANGES:
+                continue
+            out[key] = value
+        return out
+
+    def _debate_payload(self, response: Dict[str, Any], fallback: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, str]]:
+        mode = str(response.get("mode", "fallback") or "fallback")
+        reason = str(response.get("reason", "") or "")
+        result = response.get("result", fallback)
+        if not isinstance(result, dict):
+            result = dict(fallback)
+        return result, {"mode": mode, "reason": reason}
+
+    def run_weekly_council_debate(
+        self,
+        *,
+        agent_profiles: List[AgentProfile],
+        active_params_map: Dict[str, Dict[str, Any]],
+        scored_rows: List[Dict[str, Any]],
+        score_board: Dict[str, float],
+        week_id: str,
+    ) -> Dict[str, Any]:
+        row_by_agent = {str(row.get("agent_id", "")): row for row in scored_rows}
+        llm_warnings: List[Dict[str, str]] = []
+        rounds: List[Dict[str, Any]] = []
+
+        opening_speeches: List[Dict[str, Any]] = []
+        for profile in agent_profiles:
+            aid = profile.agent_id
+            fallback = {
+                "thesis": f"{profile.name}: fallback thesis (LLM unavailable).",
+                "risk_notes": ["Fallback mode active."],
+                "param_changes": {},
+                "confidence": 0.4,
+            }
+            system_prompt = (
+                "You are one trader agent in a weekly quant strategy council. "
+                "Return compact JSON only."
+            )
+            user_prompt = (
+                f"week_id={week_id}\n"
+                f"agent_id={aid}\n"
+                f"role={profile.role}\n"
+                f"risk_style={profile.risk_style}\n"
+                f"score={float(score_board.get(aid, 0.0)):.6f}\n"
+                f"metrics={row_by_agent.get(aid, {})}\n"
+                f"active_params={active_params_map.get(aid, {})}\n"
+                f"allowed_param_keys={list(ALLOWED_PARAM_RANGES.keys())}\n\n"
+                "Output JSON schema:\n"
+                "{"
+                '"thesis": string, '
+                '"risk_notes": [string], '
+                '"param_changes": {key:value}, '
+                '"confidence": number(0~1)'
+                "}\n"
+                "Do not add keys outside schema."
+            )
+            resp = self.llm.generate_json(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                fallback=fallback,
+                temperature=0.3,
+            )
+            parsed, meta = self._debate_payload(resp, fallback)
+            if meta["mode"] != "live":
+                llm_warnings.append(
+                    {"agent_id": aid, "phase": "opening", "reason": meta["reason"] or "fallback"}
+                )
+            speech = {
+                "agent_id": aid,
+                "mode": meta["mode"],
+                "reason": meta["reason"],
+                "thesis": _short_text(str(parsed.get("thesis", fallback["thesis"]))),
+                "risk_notes": parsed.get("risk_notes", fallback["risk_notes"]),
+                "param_changes": self._normalize_param_changes(parsed.get("param_changes", {})),
+                "confidence": float(parsed.get("confidence", fallback["confidence"]) or fallback["confidence"]),
+            }
+            opening_speeches.append(speech)
+
+        rounds.append({"round": 1, "phase": "opening", "speeches": opening_speeches})
+
+        rebuttal_speeches: List[Dict[str, Any]] = []
+        for profile in agent_profiles:
+            aid = profile.agent_id
+            peer_openings = [x for x in opening_speeches if x["agent_id"] != aid]
+            fallback = {
+                "rebuttal": f"{profile.name}: fallback rebuttal (LLM unavailable).",
+                "counter_points": [],
+                "param_changes": {},
+            }
+            system_prompt = (
+                "You are one trader agent in a weekly quant strategy debate. "
+                "Review peer claims and return compact JSON only."
+            )
+            user_prompt = (
+                f"week_id={week_id}\n"
+                f"agent_id={aid}\n"
+                f"role={profile.role}\n"
+                f"active_params={active_params_map.get(aid, {})}\n"
+                f"peer_openings={peer_openings}\n"
+                f"allowed_param_keys={list(ALLOWED_PARAM_RANGES.keys())}\n\n"
+                "Output JSON schema:\n"
+                "{"
+                '"rebuttal": string, '
+                '"counter_points": [string], '
+                '"param_changes": {key:value}'
+                "}\n"
+                "Do not add keys outside schema."
+            )
+            resp = self.llm.generate_json(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                fallback=fallback,
+                temperature=0.3,
+            )
+            parsed, meta = self._debate_payload(resp, fallback)
+            if meta["mode"] != "live":
+                llm_warnings.append(
+                    {"agent_id": aid, "phase": "rebuttal", "reason": meta["reason"] or "fallback"}
+                )
+            rebuttal = {
+                "agent_id": aid,
+                "mode": meta["mode"],
+                "reason": meta["reason"],
+                "rebuttal": _short_text(str(parsed.get("rebuttal", fallback["rebuttal"]))),
+                "counter_points": parsed.get("counter_points", fallback["counter_points"]),
+                "param_changes": self._normalize_param_changes(parsed.get("param_changes", {})),
+            }
+            rebuttal_speeches.append(rebuttal)
+
+        rounds.append({"round": 2, "phase": "rebuttal", "speeches": rebuttal_speeches})
+
+        moderator_fallback = {
+            "summary": "Fallback moderator summary: retain stable constraints and review risk events.",
+            "consensus_actions": [],
+            "risk_watch": ["LLM fallback mode during council."],
+        }
+        moderator_resp = self.llm.generate_json(
+            system_prompt=(
+                "You are the moderator of a quant trading weekly council. "
+                "Return compact JSON only."
+            ),
+            user_prompt=(
+                f"week_id={week_id}\n"
+                f"score_board={score_board}\n"
+                f"opening_speeches={opening_speeches}\n"
+                f"rebuttal_speeches={rebuttal_speeches}\n\n"
+                "Output JSON schema:\n"
+                "{"
+                '"summary": string, '
+                '"consensus_actions": [string], '
+                '"risk_watch": [string]'
+                "}\n"
+                "Do not add keys outside schema."
+            ),
+            fallback=moderator_fallback,
+            temperature=0.2,
+        )
+        moderator_parsed, moderator_meta = self._debate_payload(moderator_resp, moderator_fallback)
+        if moderator_meta["mode"] != "live":
+            llm_warnings.append(
+                {"agent_id": "moderator", "phase": "summary", "reason": moderator_meta["reason"] or "fallback"}
+            )
+        moderator = {
+            "mode": moderator_meta["mode"],
+            "reason": moderator_meta["reason"],
+            "summary": _short_text(str(moderator_parsed.get("summary", moderator_fallback["summary"])), limit=400),
+            "consensus_actions": moderator_parsed.get("consensus_actions", moderator_fallback["consensus_actions"]),
+            "risk_watch": moderator_parsed.get("risk_watch", moderator_fallback["risk_watch"]),
+        }
+
+        suggested_params: Dict[str, Dict[str, Any]] = {}
+        for profile in agent_profiles:
+            aid = profile.agent_id
+            merged = dict(active_params_map.get(aid, {}))
+            open_row = next((x for x in opening_speeches if x["agent_id"] == aid), {})
+            rebut_row = next((x for x in rebuttal_speeches if x["agent_id"] == aid), {})
+            for key, value in (open_row.get("param_changes") or {}).items():
+                if key in ALLOWED_PARAM_RANGES:
+                    merged[key] = value
+            for key, value in (rebut_row.get("param_changes") or {}).items():
+                if key in ALLOWED_PARAM_RANGES:
+                    merged[key] = value
+            suggested_params[aid] = self.registry.clamp_params(merged)
+
+        return {
+            "week_id": week_id,
+            "rounds": rounds,
+            "moderator": moderator,
+            "agent_param_suggestions": suggested_params,
+            "llm_warnings": llm_warnings,
+        }
+
     def suggest_weekly_params(
         self,
         *,
@@ -233,3 +438,4 @@ class AgentDecisionEngine:
             if key in ALLOWED_PARAM_RANGES:
                 merged[key] = val
         return self.registry.clamp_params(merged)
+

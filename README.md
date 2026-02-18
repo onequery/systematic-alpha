@@ -19,6 +19,7 @@ Manual "top-3 picks for discretionary trading" is no longer the primary workflow
   - `agent_a`: momentum/flow bias
   - `agent_b`: risk-first conservative bias
   - `agent_c`: counter-hypothesis/diversification bias
+  - Runs multi-round weekly council debate and strategy updates.
   - Generates order proposals, review reports, and weekly council decisions.
 
 ## Install
@@ -88,7 +89,9 @@ When Telegram is configured, Agent Lab sends:
 - Agent proposal summary (`BUY/SELL symbol x qty`)
 - Failure events (ingest/propose/review)
 - Daily review completion
-- Weekly council completion
+- Weekly council debate summary (champion, promoted versions, moderator summary)
+- Weekly debate excerpts (opening/rebuttal, short form)
+- OpenAI token/quota alerts during council (daily budget, quota, token/context limits)
 
 ## Important Paths
 

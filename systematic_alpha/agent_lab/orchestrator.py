@@ -509,6 +509,35 @@ class AgentLabOrchestrator:
         )
         champion = str(scored_rows[0]["agent_id"]) if scored_rows else ""
         promoted_versions: Dict[str, str] = {}
+        active_strategy_map: Dict[str, Dict[str, Any]] = {}
+        agent_profiles: List[Any] = []
+        for agent in agents:
+            aid = str(agent["agent_id"])
+            active_strategy_map[aid] = self.registry.get_active_strategy(aid)
+            agent_profiles.append(profile_from_agent_row(agent))
+
+        discussion = self.agent_engine.run_weekly_council_debate(
+            agent_profiles=agent_profiles,
+            active_params_map={aid: dict(v["params"]) for aid, v in active_strategy_map.items()},
+            scored_rows=scored_rows,
+            score_board=scores,
+            week_id=week_id,
+        )
+        llm_alerts = list(discussion.get("llm_warnings", []) or [])
+        for alert in llm_alerts:
+            reason = str(alert.get("reason", "") or "")
+            if "daily_budget_exceeded" in reason:
+                self.storage.log_event(
+                    "llm_budget_alert",
+                    {
+                        "week_id": week_id,
+                        "agent_id": str(alert.get("agent_id", "")),
+                        "phase": str(alert.get("phase", "")),
+                        "reason": reason,
+                    },
+                    now_iso(),
+                )
+
         prev_week = (week_start - timedelta(days=1)).isocalendar()
         prev_week_id = f"{prev_week.year}-W{prev_week.week:02d}"
         prev_decision = self.storage.query_one(
@@ -532,14 +561,10 @@ class AgentLabOrchestrator:
 
         for agent in agents:
             aid = str(agent["agent_id"])
-            profile = profile_from_agent_row(agent)
-            active = self.registry.get_active_strategy(aid)
+            active = active_strategy_map[aid]
             row = next((x for x in scored_rows if x["agent_id"] == aid), {})
-            params = self.agent_engine.suggest_weekly_params(
-                agent=profile,
-                active_params=dict(active["params"]),
-                last_week_metrics=row,
-            )
+            suggested_map = discussion.get("agent_param_suggestions", {}) or {}
+            params = dict(suggested_map.get(aid) or active["params"])
             current_score = float(scores.get(aid, 0.0))
             current_risk = int(row.get("risk_violations", 0) or 0) if row else 0
             prev_score = float(prev_scores.get(aid, 0.0))
@@ -572,12 +597,17 @@ class AgentLabOrchestrator:
             "promoted_versions": promoted_versions,
             "promotion_score_threshold": PROMOTION_SCORE_THRESHOLD,
             "promotion_rule": "current_score>=threshold && prev_score>=threshold && current_week_risk_violations==0 && prev_week_risk_violations==0",
+            "discussion": discussion,
+            "llm_alerts": llm_alerts,
         }
         markdown = (
             f"# Weekly Council {week_id}\n\n"
             f"- Champion: `{champion}`\n"
             f"- Scores: `{scores}`\n"
             f"- Promoted Versions: `{promoted_versions}`\n"
+            f"- LLM Alerts: `{len(llm_alerts)}`\n\n"
+            "## Moderator Summary\n"
+            f"{str((discussion.get('moderator') or {}).get('summary') or '')}\n"
         )
         stamp = week_end.strftime("%Y%m%d")
         self.storage.upsert_weekly_council(week_id, champion, decision, markdown, now_iso())

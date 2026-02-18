@@ -77,6 +77,17 @@ class LLMClient:
                 "result": fallback,
             }
         if not self._within_budget():
+            current_cost = self._current_daily_cost()
+            self.storage.log_event(
+                event_type="llm_budget_exceeded",
+                payload={
+                    "date": _today(),
+                    "model": self.model,
+                    "current_cost_usd": current_cost,
+                    "max_daily_cost_usd": self.max_daily_cost,
+                },
+                created_at=datetime.now().isoformat(timespec="seconds"),
+            )
             return {
                 "mode": "fallback",
                 "reason": "daily_budget_exceeded",
@@ -127,4 +138,3 @@ class LLMClient:
                 "reason": f"llm_error:{exc}",
                 "result": fallback,
             }
-
