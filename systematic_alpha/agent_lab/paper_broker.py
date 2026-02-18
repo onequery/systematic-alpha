@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import os
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -29,10 +30,36 @@ class PaperBroker:
             self._creds = {}
 
     def _exchange_label(self, market: str) -> str:
+        # self-heal:us-exchange-resolver-v1
         if market.upper() == "KR":
             return "서울"
-        mapping = {"NASD": "나스닥", "NASDAQ": "나스닥", "NYSE": "뉴욕", "AMEX": "아멕스"}
-        return mapping.get(self.us_exchange, "나스닥")
+
+        normalized = {
+            "NASD": "NASD",
+            "NASDAQ": "NASD",
+            "NYSE": "NYSE",
+            "NYS": "NYSE",
+            "AMEX": "AMEX",
+            "AMS": "AMEX",
+        }.get(self.us_exchange.upper(), self.us_exchange.upper())
+
+        try:
+            mojito = import_mojito_module()
+            ki = importlib.import_module(mojito.__name__ + ".koreainvestment")
+            exchange_code3 = getattr(ki, "EXCHANGE_CODE3", {})
+            if isinstance(exchange_code3, dict):
+                for label, code in exchange_code3.items():
+                    if str(code).upper() == normalized:
+                        return str(label)
+        except Exception:
+            pass
+
+        fallback = {
+            "NASD": "나스닥",
+            "NYSE": "뉴욕",
+            "AMEX": "아멕스",
+        }
+        return fallback.get(normalized, "나스닥")
 
     def _get_broker(self, market: str):
         key = market.upper()

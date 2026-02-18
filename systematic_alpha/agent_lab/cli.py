@@ -7,6 +7,9 @@ from typing import Any, Dict
 
 from systematic_alpha.dotenv import load_dotenv
 from systematic_alpha.agent_lab.orchestrator import AgentLabOrchestrator
+from systematic_alpha.agent_lab.self_heal import run_data_reception_self_heal
+from systematic_alpha.agent_lab.telegram_chat import run_telegram_chat_worker
+from systematic_alpha.network_env import apply_network_env_guard
 
 
 def _echo(payload: Dict[str, Any]) -> None:
@@ -49,12 +52,51 @@ def parse_args() -> argparse.Namespace:
     p_report.add_argument("--from", dest="date_from", type=str, required=True)
     p_report.add_argument("--to", dest="date_to", type=str, required=True)
 
+    p_chat = sub.add_parser("telegram-chat")
+    p_chat.add_argument("--poll-timeout", type=int, default=25)
+    p_chat.add_argument("--idle-sleep", type=float, default=1.0)
+    p_chat.add_argument("--memory-limit", type=int, default=20)
+    p_chat.add_argument("--once", action="store_true")
+
+    p_heal = sub.add_parser("self-heal")
+    p_heal.add_argument("--market", type=str, choices=["KR", "US", "kr", "us"], required=True)
+    p_heal.add_argument("--date", type=str, required=True)
+    p_heal.add_argument("--log-path", type=str, default="")
+    p_heal.add_argument("--output-json", type=str, default="")
+    p_heal.add_argument("--failure-tail", type=str, default="")
+    p_heal.add_argument("--no-auto-apply", action="store_true")
+
     return parser.parse_args()
 
 
 def main() -> None:
     load_dotenv(".env", override=False)
+    # self-heal:network-guard-v1
+    apply_network_env_guard()
     args = parse_args()
+    if args.command == "telegram-chat":
+        payload = run_telegram_chat_worker(
+            project_root=Path(args.project_root),
+            poll_timeout=args.poll_timeout,
+            idle_sleep=args.idle_sleep,
+            memory_limit=args.memory_limit,
+            once=bool(args.once),
+        )
+        _echo(payload)
+        return
+    if args.command == "self-heal":
+        payload = run_data_reception_self_heal(
+            project_root=Path(args.project_root),
+            market=str(args.market).upper(),
+            run_date=args.date,
+            log_path=str(args.log_path or "").strip() or None,
+            output_json_path=str(args.output_json or "").strip() or None,
+            failure_tail=args.failure_tail or "",
+            auto_apply=not bool(args.no_auto_apply),
+        )
+        _echo(payload)
+        return
+
     orchestrator = AgentLabOrchestrator(project_root=Path(args.project_root))
     try:
         cmd = args.command

@@ -11,4 +11,6 @@ __all__ = [
     "paper_broker",
     "accounting",
     "orchestrator",
+    "telegram_chat",
+    "self_heal",
 ]

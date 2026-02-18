@@ -9,7 +9,8 @@ $taskNames = @(
     "${TaskPrefix}_KR_PostOpen_0920",
     "${TaskPrefix}_US_PostOpen_0930ET",
     "${TaskPrefix}_DailyReview_0710",
-    "${TaskPrefix}_WeeklyCouncil_Sat0800"
+    "${TaskPrefix}_WeeklyCouncil_Sat0800",
+    "${TaskPrefix}_TelegramChat_Logon"
 )
 
 foreach ($name in $taskNames) {
@@ -22,4 +23,3 @@ foreach ($name in $taskNames) {
         Write-Output "Task not found: $name"
     }
 }
-

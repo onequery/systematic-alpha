@@ -51,6 +51,8 @@ Optional for LLM-assisted agent updates:
 - `OPENAI_API_KEY=...`
 - `OPENAI_MODEL=gpt-4o-mini`
 - `OPENAI_MAX_DAILY_COST=5.0`
+- `AGENT_LAB_TELEGRAM_USE_ENV_PROXY=0` (default; set `1` only if your network requires env proxy)
+- `SYSTEMATIC_ALPHA_PROXY_MODE=auto` (`auto|off|clear_all`, network guard for broken proxy env)
 
 ## One Command: Activate Everything
 
@@ -63,6 +65,7 @@ This command registers all required tasks and initializes Agent Lab:
 - KR signal generation tasks
 - US signal generation tasks
 - Agent Lab post-session/review/weekly tasks
+- Agent Lab Telegram chat worker task (logon trigger)
 - Agent initialization (`agent_a`, `agent_b`, `agent_c`)
 
 Default behavior:
@@ -92,6 +95,8 @@ When Telegram is configured, Agent Lab sends:
 - Weekly council debate summary (champion, promoted versions, moderator summary)
 - Weekly debate excerpts (opening/rebuttal, short form)
 - OpenAI token/quota alerts during council (daily budget, quota, token/context limits)
+- Interactive chat replies from agents (`/ask`, `/plan`, `/status`)
+- Automatic data-reception self-heal events (critical failure detection + safe patch attempts)
 
 ## Important Paths
 
@@ -114,7 +119,28 @@ powershell -ExecutionPolicy Bypass -File .\scripts\run_agent_lab.ps1 -Action ing
 # review / council
 powershell -ExecutionPolicy Bypass -File .\scripts\run_agent_lab.ps1 -Action daily-review -Date YYYYMMDD
 powershell -ExecutionPolicy Bypass -File .\scripts\run_agent_lab.ps1 -Action weekly-council -Week YYYY-Www
+
+# self-heal (manual trigger)
+python -m systematic_alpha.agent_lab.cli --project-root . self-heal --market KR --date YYYYMMDD --log-path <log_file> --output-json <result_json>
+
+# Telegram interactive worker
+powershell -ExecutionPolicy Bypass -File .\scripts\run_agent_lab.ps1 -Action telegram-chat
 ```
+
+## Telegram Agent Chat Commands
+
+Send these commands in the configured Telegram chat:
+
+- `/help`
+- `/agents`
+- `/status`
+- `/status agent_a`
+- `/plan agent_b`
+- `/ask agent_c Why did you avoid the top symbol today?`
+- `/memory agent_a`
+
+Identity and memory are persisted in `state/agent_lab/agents/<agent_id>/`.
+If you stop and restart tasks for code updates, agents warm-start from identity + recent memory + latest checkpoint.
 
 ## Note on Legacy Signal Code
 

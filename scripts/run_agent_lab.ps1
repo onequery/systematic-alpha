@@ -2,7 +2,7 @@
 param(
     [string]$ProjectRoot = (Split-Path -Parent $PSScriptRoot),
     [string]$PythonExe = "",
-    [ValidateSet("init", "ingest-propose", "approve-orders", "daily-review", "weekly-council", "report")]
+    [ValidateSet("init", "ingest-propose", "approve-orders", "daily-review", "weekly-council", "report", "telegram-chat")]
     [string]$Action = "ingest-propose",
     [ValidateSet("KR", "US")]
     [string]$Market = "KR",
@@ -19,7 +19,11 @@ param(
     [int]$WaitTimeoutSeconds = 3600,
     [int]$PollIntervalSeconds = 15,
     [switch]$UseDailyLock = $true,
-    [switch]$DisableTelegram = $false
+    [switch]$DisableTelegram = $false,
+    [int]$ChatPollTimeoutSeconds = 25,
+    [double]$ChatIdleSleepSeconds = 1.0,
+    [int]$ChatMemoryLimit = 20,
+    [switch]$ChatOnce = $false
 )
 
 $ErrorActionPreference = "Stop"
@@ -708,6 +712,21 @@ switch ($Action) {
                 "to=$toValue"
             )
         }
+        exit $code
+    }
+
+    "telegram-chat" {
+        $args = $commonPrefix + @(
+            "telegram-chat",
+            "--poll-timeout", "$ChatPollTimeoutSeconds",
+            "--idle-sleep", "$ChatIdleSleepSeconds",
+            "--memory-limit", "$ChatMemoryLimit"
+        )
+        if ($ChatOnce) {
+            $args += "--once"
+        }
+        $result = Invoke-AgentLabCli -PyExe $PythonExe -CliArgs $args
+        $code = Resolve-ExitCode -Result $result
         exit $code
     }
 }

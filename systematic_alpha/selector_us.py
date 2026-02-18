@@ -1,6 +1,7 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import csv
+import importlib
 import time
 from datetime import datetime
 from pathlib import Path
@@ -30,22 +31,42 @@ from systematic_alpha.models import (
 SP500_SOURCE_URL = "https://datahub.io/core/s-and-p-500-companies/r/constituents.csv"
 SP500_BUNDLED_SNAPSHOT_PATH = Path(__file__).resolve().parent / "data" / "us_sp500_snapshot.csv"
 
+def _resolve_us_exchange_for_mojito(mojito_module, raw_exchange: str) -> str:
+    # self-heal:us-exchange-resolver-v1
+    raw = str(raw_exchange or "").strip()
+    upper = raw.upper()
+    normalized = {
+        "NASD": "NASD",
+        "NASDAQ": "NASD",
+        "NYSE": "NYSE",
+        "NYS": "NYSE",
+        "AMEX": "AMEX",
+        "AMS": "AMEX",
+    }.get(upper, upper)
+
+    try:
+        ki = importlib.import_module(mojito_module.__name__ + ".koreainvestment")
+        exchange_code3 = getattr(ki, "EXCHANGE_CODE3", {})
+        if isinstance(exchange_code3, dict):
+            for label, code in exchange_code3.items():
+                if str(code).upper() == normalized:
+                    return str(label)
+    except Exception:
+        pass
+
+    fallback = {
+        "NASD": "나스닥",
+        "NYSE": "뉴욕",
+        "AMEX": "아멕스",
+    }
+    return fallback.get(normalized, raw or "나스닥")
+
 
 class USDayTradingSelector:
     def __init__(self, mojito_module, config: StrategyConfig):
         self.mojito = mojito_module
         self.config = config
-        raw_exchange = (config.us_exchange or "").strip()
-        exchange_upper = raw_exchange.upper()
-        exchange_map = {
-            "NASD": "나스닥",
-            "NASDAQ": "나스닥",
-            "NYSE": "뉴욕",
-            "NYS": "뉴욕",
-            "AMEX": "아멕스",
-            "AMS": "아멕스",
-        }
-        broker_exchange = exchange_map.get(exchange_upper, raw_exchange or "나스닥")
+        broker_exchange = _resolve_us_exchange_for_mojito(self.mojito, config.us_exchange or "")
         self.broker = self.mojito.KoreaInvestment(
             api_key=config.api_key,
             api_secret=config.api_secret,
@@ -1393,3 +1414,4 @@ class USDayTradingSelector:
             reverse=True,
         )
         return results
+

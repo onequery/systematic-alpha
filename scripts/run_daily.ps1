@@ -43,6 +43,7 @@
     [int]$NotifyTailLines = 20,
     [switch]$NotifyStart = $true,
     [switch]$NotifySkips = $false,
+    [switch]$EnableAgentSelfHeal = $true,
     [switch]$DisableTelegram = $false
 )
 $ErrorActionPreference = "Stop"
@@ -396,6 +397,119 @@ function Write-RunOutputLine {
     }
 }
 
+function Invoke-AgentSelfHeal {
+    param(
+        [string]$MarketValue,
+        [string]$RunDateValue,
+        [string]$LogPath,
+        [string]$OutputJsonPath,
+        [string]$FailureTail,
+        [string]$HostTag,
+        [int]$AttemptValue,
+        [int]$MaxAttemptsValue
+    )
+
+    if (-not $EnableAgentSelfHeal) {
+        return $null
+    }
+    if ([string]::IsNullOrWhiteSpace($PythonExe)) {
+        Write-MonitorLog "[self-heal] skipped: python executable is empty."
+        return $null
+    }
+
+    $tailCompact = $FailureTail
+    if (-not [string]::IsNullOrWhiteSpace($tailCompact)) {
+        $tailCompact = $tailCompact -replace "`r", " "
+        $tailCompact = $tailCompact -replace "`n", " | "
+        $tailCompact = Truncate-Text -Text $tailCompact -MaxChars 1800
+    }
+
+    $cliArgs = @(
+        "-m", "systematic_alpha.agent_lab.cli",
+        "--project-root", $ProjectRoot,
+        "self-heal",
+        "--market", $MarketValue,
+        "--date", $RunDateValue
+    )
+    if (-not [string]::IsNullOrWhiteSpace($LogPath)) {
+        $cliArgs += @("--log-path", $LogPath)
+    }
+    if (-not [string]::IsNullOrWhiteSpace($OutputJsonPath)) {
+        $cliArgs += @("--output-json", $OutputJsonPath)
+    }
+    if (-not [string]::IsNullOrWhiteSpace($tailCompact)) {
+        $cliArgs += @("--failure-tail", $tailCompact)
+    }
+
+    Write-MonitorLog "[self-heal] running rule-based agent self-heal."
+    $lines = @()
+    $exitCode = 1
+    try {
+        $result = & $PythonExe @cliArgs 2>&1
+        if ($result) {
+            foreach ($line in @($result | ForEach-Object { "$_" })) {
+                $lines += $line
+                Write-RunOutputLine -Line $line
+            }
+        }
+        $nativeExit = $LASTEXITCODE
+        if ($null -eq $nativeExit) {
+            $exitCode = 0
+        } else {
+            $exitCode = [int]$nativeExit
+        }
+    } catch {
+        Write-MonitorLog "[self-heal] command exception: $($_.Exception.Message)"
+        return $null
+    }
+    if ($exitCode -ne 0) {
+        Write-MonitorLog "[self-heal] failed with exit=$exitCode."
+        return $null
+    }
+
+    $text = ($lines -join "`n")
+    if ([string]::IsNullOrWhiteSpace($text)) {
+        Write-MonitorLog "[self-heal] empty output."
+        return $null
+    }
+    try {
+        $obj = $text | ConvertFrom-Json -ErrorAction Stop
+    } catch {
+        Write-MonitorLog "[self-heal] output parse failed: $($_.Exception.Message)"
+        return $null
+    }
+
+    $issueCount = 0
+    $appliedCount = 0
+    $artifactPath = ""
+    if ($null -ne $obj.issue_count) { $issueCount = [int]$obj.issue_count }
+    if ($null -ne $obj.applied_count) { $appliedCount = [int]$obj.applied_count }
+    if ($null -ne $obj.artifact_path) { $artifactPath = [string]$obj.artifact_path }
+
+    if ($issueCount -gt 0 -or $appliedCount -gt 0) {
+        $issueCodes = @()
+        if ($null -ne $obj.issues) {
+            foreach ($it in @($obj.issues)) {
+                if ($null -ne $it.code) {
+                    $issueCodes += [string]$it.code
+                }
+            }
+        }
+        $issueCodeText = if ($issueCodes.Count -gt 0) { ($issueCodes -join ",") } else { "-" }
+        Send-TelegramMessage (
+            "[SystematicAlpha] self-heal`n" +
+            "host=$HostTag`n" +
+            "market=$MarketValue`n" +
+            "attempt=$AttemptValue/$MaxAttemptsValue`n" +
+            "issues=$issueCount`n" +
+            "applied=$appliedCount`n" +
+            "issue_codes=$issueCodeText`n" +
+            "artifact=$artifactPath"
+        )
+    }
+    return $obj
+}
+
 function Normalize-TelegramToken {
     param([string]$Token)
     if ([string]::IsNullOrWhiteSpace($Token)) {
@@ -620,7 +734,7 @@ Write-MonitorLog (
     "change=$MinChangePct, gap=$MinGapPct, prev_turnover=$MinPrevTurnover, " +
     "strength=$MinStrength, vol_ratio=$MinVolRatio, bid_ask_ratio=$MinBidAskRatio, " +
     "pass_conditions=$MinPassConditions, maintain_ratio=$MinMaintainRatio, " +
-    "long_only=$(-not $AllowShortBias), allow_low_coverage=$AllowLowCoverage"
+    "long_only=$(-not $AllowShortBias), allow_low_coverage=$AllowLowCoverage, self_heal=$EnableAgentSelfHeal"
 )
 
 if ($Market -eq "US" -and $RequireUsOpen -and -not $AssumeOpenForTest) {
@@ -754,6 +868,20 @@ for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
     $stopwatch.Stop()
     Write-MonitorLog ("[attempt $attempt/$MaxAttempts] finished (exit=$exitCode, elapsed={0:n1}s)" -f $stopwatch.Elapsed.TotalSeconds)
 
+    $selfHealResult = $null
+    if ($exitCode -ne 0) {
+        $healTail = Get-OutputTail -Lines $combinedOutput -TailLines ([Math]::Max($NotifyTailLines, 60))
+        $selfHealResult = Invoke-AgentSelfHeal `
+            -MarketValue $Market `
+            -RunDateValue $runDate `
+            -LogPath $script:RunLogFile `
+            -OutputJsonPath $outputJson `
+            -FailureTail $healTail `
+            -HostTag $hostTag `
+            -AttemptValue $attempt `
+            -MaxAttemptsValue $MaxAttempts
+    }
+
     if ($exitCode -eq 0) {
         Write-MonitorLog "[success] completed on attempt $attempt."
         $summary = Get-SelectionSummary -JsonPath $outputJson -TopN $FinalPicks
@@ -788,6 +916,12 @@ for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
     if ($rawText -match "EGW00133") {
         # KIS token endpoint rate limit: at most once per minute.
         $nextDelay = [Math]::Max($nextDelay, 65)
+    }
+    if ($null -ne $selfHealResult -and $null -ne $selfHealResult.applied_count) {
+        if ([int]$selfHealResult.applied_count -gt 0) {
+            # If a patch has been applied, retry quickly to validate effect.
+            $nextDelay = [Math]::Min($nextDelay, 8)
+        }
     }
 
     Write-MonitorLog "[retry] attempt failed (exit=$exitCode). waiting $nextDelay sec."
