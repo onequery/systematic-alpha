@@ -42,7 +42,8 @@
     [int]$MaxRetryDelaySeconds = 180,
     [int]$NotifyTailLines = 20,
     [switch]$NotifyStart = $true,
-    [switch]$NotifySkips = $false
+    [switch]$NotifySkips = $false,
+    [switch]$DisableTelegram = $false
 )
 $ErrorActionPreference = "Stop"
 $script:RunLogFile = $null
@@ -522,6 +523,11 @@ if ([string]::IsNullOrWhiteSpace($env:TELEGRAM_ENABLED)) {
     $script:TelegramEnabled = $enabledByKeys
 } else {
     $script:TelegramEnabled = (Test-Truthy $env:TELEGRAM_ENABLED) -and $enabledByKeys
+}
+
+if ($DisableTelegram) {
+    $script:TelegramEnabled = $false
+    Write-MonitorLog "[notify] telegram disabled by -DisableTelegram."
 }
 
 if ($script:TelegramEnabled) {

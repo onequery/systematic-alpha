@@ -1,658 +1,123 @@
-﻿# systematic-alpha
+# systematic-alpha (Agent-First)
 
-Intraday stock candidate selector for Korea Investment & Securities (KIS) using:
-- REST data (price, daily data, symbols)
-- WebSocket data (KR) / REST polling (US)
-- rule-based filtering/scoring for short-term trading candidates
+This project is operated in **Agent mode**.
 
-This project is a CLI app (no UI). It reads secrets from `.env` and prints ranked picks.
+- KR/US market signals are generated internally.
+- `Agent Lab` (3 agents) consumes those signals and proposes BUY/SELL actions.
+- Telegram notifications are focused on agent proposals and agent workflow events.
 
-## Features
+Manual "top-3 picks for discretionary trading" is no longer the primary workflow in this repository.
 
-- Two-stage filtering (KR/US)
-  - Stage 1: daily/price snapshot filters
-  - Stage 2: realtime metrics (strength, VWAP, bid/ask ratio, volume ratio)
-- `--market kr` (default): domestic KR flow (REST + WebSocket)
-- `--market us`: overseas US flow (REST + polling)
-- Objective universe by default (no manual file required):
-- KR: previous-day turnover rank top-N
-- US: S&P 500 constituents top-N
-- KR liquidity scan budget is capped by `max(max_symbols_scan, kr_universe_size)` to avoid full-market sweep latency.
-- Long-only directional mode by default (`change >= threshold`, `gap >= threshold`)
-- Fallback fill rule: if stage1 candidates are fewer than `--final-picks`, thresholds are relaxed step-by-step to fill missing slots.
-- Decision-time snapshot refresh: final scoring uses latest snapshot at selection completion time (not only early scan snapshot).
-- Realtime quality gate: if eligible realtime coverage is below threshold (default `0.8`), signal can be invalidated for the day.
-- Off-market test mode (`--test-assume-open`) to force full pipeline execution when market is closed.
-- Automatic overnight performance report (`selection -> close -> next open`) in CSV.
-- Configurable thresholds via CLI arguments (scheduled runs use `scripts/run_daily.ps1` parameters)
-- JSON output export for downstream automation
-- Long-horizon analytics dataset accumulation (`out/{kr|us}/YYYYMMDD/analytics`) for post-hoc performance/strategy analysis
-- Telegram notifications for stage/retry/failure/success status (optional)
-- Live progress/heartbeat logs during scan and realtime collection
-- Local `.env` loader (no external dotenv dependency)
-- `Agent Lab` multi-agent research/paper-trading layer (3 agents + orchestrator + risk/accounting/state)
+## Core Architecture
 
-## Strategy Summary
+- `Signal Engine` (internal dependency)
+  - Produces KR/US session JSON signals.
+  - Output examples:
+    - `out/kr/YYYYMMDD/results/*.json`
+    - `out/us/YYYYMMDD/results/*.json`
+- `Agent Lab` (primary operation layer)
+  - `agent_a`: momentum/flow bias
+  - `agent_b`: risk-first conservative bias
+  - `agent_c`: counter-hypothesis/diversification bias
+  - Generates order proposals, review reports, and weekly council decisions.
 
-The default rules are aligned with a numeric intraday workflow:
-- daily change threshold
-- opening gap threshold
-- previous-day turnover threshold
-- execution strength maintenance
-- intraday volume ratio
-- bid/ask remaining ratio
-- price vs VWAP
-- low-break check
-
-Default directional behavior is long-only.  
-At final scoring, `change/gap` are recomputed from the latest snapshot at the actual selection-computation completion time.
-
-The final ranking selects top `N` symbols (`--final-picks`, default `3`).
-
-Default universe policy:
-- KR objective pool: top `KR_UNIVERSE_SIZE` by previous-day turnover (default `500`), then truncated by `MAX_SYMBOLS_SCAN`.
-- US objective pool: top `US_UNIVERSE_SIZE` from S&P 500 constituents (default `500`), then truncated by `MAX_SYMBOLS_SCAN`.
-- Manual override remains available via `--universe-file` / `--us-universe-file`.
-
-## Project Structure
-
-```text
-.
-|-- main.py
-|-- run_main.sh
-|-- requirements.txt
-|-- .env.example
-|-- scripts/
-|   |-- register_kr_task.ps1
-|   |-- register_task.ps1 (alias)
-|   |-- register_us_task.ps1
-|   |-- prefetch_kr_universe.ps1
-|   |-- prefetch_kr_universe.py
-|   |-- prefetch_us_universe.ps1
-|   |-- prefetch_us_universe.py
-|   |-- prefetch_us_market_cache.py
-|   |-- run_daily.ps1
-|   |-- run_agent_lab.ps1
-|   |-- register_agent_lab_tasks.ps1
-|   |-- remove_kr_task.ps1
-|   |-- remove_agent_lab_tasks.ps1
-|   |-- remove_task.ps1 (alias)
-|   `-- remove_us_task.ps1
-`-- systematic_alpha/
-    |-- analytics.py
-    |-- cli.py
-    |-- selector.py
-    |-- selector_us.py
-    |-- models.py
-    |-- credentials.py
-    |-- dotenv.py
-    |-- helpers.py
-    |-- agent_lab/
-    |   |-- cli.py
-    |   |-- orchestrator.py
-    |   |-- agents.py
-    |   |-- llm_client.py
-    |   |-- strategy_registry.py
-    |   |-- paper_broker.py
-    |   |-- risk_engine.py
-    |   |-- accounting.py
-    |   |-- storage.py
-    |   |-- schemas.py
-    |   `-- identity.py
-    |-- data/
-    |   |-- us_sp500_snapshot.csv
-    |   `-- us_universe_default.txt
-    `-- mojito_loader.py
-```
-
-## Prerequisites
-
-- Python `>= 3.10` (tested on `3.12`)
-- KIS API credentials
-- Network access to KIS OpenAPI endpoints
-- `mojito2` package (installed via `requirements.txt`)
-
-## Installation
-
-### 1) Create/activate environment (example: conda)
+## Install
 
 ```bash
 conda create -n systematic-alpha python=3.12 -y
 conda activate systematic-alpha
-```
-
-### 2) Install dependencies
-
-```bash
 pip install -r requirements.txt
 ```
 
-## Configuration
+## Environment
 
-Copy `.env.example` to `.env` and fill credentials:
+Copy `.env.example` to `.env`, then fill secrets.
 
-```bash
-cp .env.example .env
-```
+Required:
 
-PowerShell equivalent:
-
-```powershell
-Copy-Item .env.example .env
-```
-
-Required keys:
 - `KIS_APP_KEY`
 - `KIS_APP_SECRET`
-- `KIS_ACC_NO` (format: `12345678-01`)
+- `KIS_ACC_NO`
 
-Optional:
-- `KIS_USER_ID`
-- Telegram variables (`TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, etc.)
+Recommended for notifications:
 
-Config policy:
-- `.env`: secrets only (KIS credentials, Telegram token/chat id).
-- `scripts/run_daily.ps1`: strategy/runtime hyperparameters (source of truth for scheduled runs).
-- `scripts/run_daily.ps1` intentionally whitelists and imports only sensitive keys from `.env`.
+- `TELEGRAM_BOT_TOKEN`
+- `TELEGRAM_CHAT_ID`
 
-### Telegram notifications (optional)
+Optional for LLM-assisted agent updates:
 
-If you want stage/retry/failure/success alerts in Telegram:
+- `AGENT_LAB_ENABLED=1`
+- `OPENAI_API_KEY=...`
+- `OPENAI_MODEL=gpt-4o-mini`
+- `OPENAI_MAX_DAILY_COST=5.0`
 
-1. Create a bot in Telegram (`@BotFather`) and get bot token.
-2. Open chat with that bot once (send any message).
-3. Get your `chat_id` from bot updates.
-4. Add values to `.env`:
-
-```env
-TELEGRAM_ENABLED=1
-TELEGRAM_BOT_TOKEN=<your_bot_token>   # no leading "bot"
-TELEGRAM_CHAT_ID=<your_chat_id>
-# optional:
-# TELEGRAM_THREAD_ID=<topic_thread_id>
-# TELEGRAM_DISABLE_NOTIFICATION=1
-```
-
-When configured, `scripts/run_daily.ps1` sends:
-- start notification at run begin (default)
-- stage notifications as pipeline enters `[1/4]` ~ `[4/4]`
-- retry notifications with short log tail
-- final failure notification with last error tail
-- final success notification with top picks summary + output json path
-
-When configured, prefetch scripts also send major events:
-- `scripts/prefetch_kr_universe.ps1`: start, cache-stage, success/failure
-- `scripts/prefetch_us_universe.ps1`: start, stage `1/2` and `2/2`, success/failure
-
-## Run
-
-### Direct Python
-
-```bash
-python main.py --collect-seconds 600 --final-picks 3
-```
-
-US example:
-
-```bash
-python main.py --market us --exchange NASD --collect-seconds 600 --final-picks 3
-```
-
-### Shell wrapper
-
-`run_main.sh` loads `.env` then executes `python main.py ...`:
-
-```bash
-./run_main.sh --collect-seconds 600 --final-picks 3
-./run_main.sh --market us --exchange NASD --collect-seconds 600 --final-picks 3
-```
-
-See all options:
-
-```bash
-python main.py --help
-```
-
-## Agent Lab (Multi-Agent Strategy Research)
-
-`Agent Lab` adds a persistent multi-agent layer on top of the existing KR/US selector.
-
-- 3 trader agents:
-  - `agent_a`: momentum/flow bias
-  - `agent_b`: risk-first conservative bias
-  - `agent_c`: counter-hypothesis/diversification bias
-- 1 orchestrator + risk engine + accounting engine
-- identity/memory/checkpoint persistence for long-horizon experiments
-- initial 4 weeks are approval-based only (`PENDING_APPROVAL`)
-
-### Storage Layout
-
-- SQLite: `state/agent_lab/agent_lab.sqlite`
-- Identity docs: `state/agent_lab/agents/<agent_id>/identity.md`
-- Memory log: `state/agent_lab/agents/<agent_id>/memory.jsonl`
-- Checkpoints: `state/agent_lab/checkpoints/checkpoint_YYYY-Www.json`
-- Artifacts: `out/agent_lab/YYYYMMDD/*.json|*.md`
-- Logs: `logs/agent_lab/YYYYMMDD/agent_lab_*.log`
-
-### Environment Keys (`.env`)
-
-```env
-AGENT_LAB_ENABLED=1
-OPENAI_API_KEY=sk-...
-OPENAI_MODEL=gpt-4o-mini
-OPENAI_MAX_DAILY_COST=5.0
-```
-
-Optional:
-
-```env
-AGENT_LAB_EXECUTION_MODE=simulated   # simulated | mojito_mock
-AGENT_LAB_US_EXCHANGE=NASD
-AGENT_LAB_USDKRW_DEFAULT=1300
-```
-
-### Agent Lab CLI
-
-```bash
-python -m systematic_alpha.agent_lab.cli init --capital-krw 10000000 --agents 3
-python -m systematic_alpha.agent_lab.cli ingest-session --market KR --date YYYYMMDD
-python -m systematic_alpha.agent_lab.cli ingest-session --market US --date YYYYMMDD
-python -m systematic_alpha.agent_lab.cli propose-orders --market KR --date YYYYMMDD
-python -m systematic_alpha.agent_lab.cli propose-orders --market US --date YYYYMMDD
-python -m systematic_alpha.agent_lab.cli approve-orders --proposal-id <id>
-python -m systematic_alpha.agent_lab.cli daily-review --date YYYYMMDD
-python -m systematic_alpha.agent_lab.cli weekly-council --week YYYY-Www
-python -m systematic_alpha.agent_lab.cli report --from YYYYMMDD --to YYYYMMDD
-```
-
-PowerShell wrapper:
+## One Command: Activate Everything
 
 ```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\register_all_tasks.ps1
+```
+
+This command registers all required tasks and initializes Agent Lab:
+
+- KR signal generation tasks
+- US signal generation tasks
+- Agent Lab post-session/review/weekly tasks
+- Agent initialization (`agent_a`, `agent_b`, `agent_c`)
+
+Default behavior:
+
+- Base KR/US selector Telegram notifications are disabled.
+- Agent Lab notifications remain enabled (if Telegram is configured).
+
+## One Command: Remove Everything
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\remove_all_tasks.ps1
+```
+
+## Check Registered Tasks
+
+```powershell
+Get-ScheduledTask -TaskName "SystematicAlpha*" | Format-Table TaskName, State -AutoSize
+```
+
+## Agent Notifications
+
+When Telegram is configured, Agent Lab sends:
+
+- Agent proposal summary (`BUY/SELL symbol x qty`)
+- Failure events (ingest/propose/review)
+- Daily review completion
+- Weekly council completion
+
+## Important Paths
+
+- Agent DB: `state/agent_lab/agent_lab.sqlite`
+- Agent identity: `state/agent_lab/agents/<agent_id>/identity.md`
+- Agent memory: `state/agent_lab/agents/<agent_id>/memory.jsonl`
+- Agent artifacts: `out/agent_lab/YYYYMMDD/`
+- Agent logs: `logs/agent_lab/YYYYMMDD/`
+
+## Manual Agent Commands (Optional)
+
+```powershell
+# initialize
 powershell -ExecutionPolicy Bypass -File .\scripts\run_agent_lab.ps1 -Action init -CapitalKrw 10000000 -Agents 3
-powershell -ExecutionPolicy Bypass -File .\scripts\run_agent_lab.ps1 -Action ingest-propose -Market KR
-powershell -ExecutionPolicy Bypass -File .\scripts\run_agent_lab.ps1 -Action ingest-propose -Market US
-powershell -ExecutionPolicy Bypass -File .\scripts\run_agent_lab.ps1 -Action daily-review
-powershell -ExecutionPolicy Bypass -File .\scripts\run_agent_lab.ps1 -Action weekly-council
+
+# ingest + propose
+powershell -ExecutionPolicy Bypass -File .\scripts\run_agent_lab.ps1 -Action ingest-propose -Market KR -Date YYYYMMDD
+powershell -ExecutionPolicy Bypass -File .\scripts\run_agent_lab.ps1 -Action ingest-propose -Market US -Date YYYYMMDD
+
+# review / council
+powershell -ExecutionPolicy Bypass -File .\scripts\run_agent_lab.ps1 -Action daily-review -Date YYYYMMDD
+powershell -ExecutionPolicy Bypass -File .\scripts\run_agent_lab.ps1 -Action weekly-council -Week YYYY-Www
 ```
 
-Before scheduling, run `init` once to bootstrap agents/strategy state.
+## Note on Legacy Signal Code
 
-### Agent Lab Scheduled Tasks
-
-Register:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\register_agent_lab_tasks.ps1
-```
-
-Default task set:
-
-- `SystematicAlpha_AgentLab_KR_PostOpen_0920` (weekday 09:20 KST)
-- `SystematicAlpha_AgentLab_US_PostOpen_0930ET` (weekday 22:45/23:45 KST dual-trigger + daily lock)
-- `SystematicAlpha_AgentLab_DailyReview_0710` (daily 07:10 KST)
-- `SystematicAlpha_AgentLab_WeeklyCouncil_Sat0800` (Saturday 08:00 KST)
-
-Remove:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\remove_agent_lab_tasks.ps1
-```
-
-Verify:
-
-```powershell
-Get-ScheduledTask -TaskName "SystematicAlpha_AgentLab*" | Format-Table TaskName, State -AutoSize
-```
-
-### Universe file format (`--universe-file`)
-
-Supported line formats:
-- `005930`
-- `005930,SAMSUNG_ELEC`
-- `005930 SAMSUNG_ELEC`
-
-If name is omitted, the app tries to fill it from KIS symbol master automatically.
-
-US (`--market us`) format:
-- `AAPL`
-- `AAPL,Apple Inc.`
-- `AAPL Apple Inc.`
-
-## Windows Auto Run (Task Scheduler)
-
-You do not need a 24/7 loop process.  
-Use scheduled tasks at market-open times.
-
-### KR 09:00 task registration
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\register_kr_task.ps1
-```
-
-Default behavior:
-- task name: `SystematicAlpha_KR_Open_0900`
-- time: `09:00`
-- schedule: weekdays only (Mon-Fri)
-- runner: `scripts/run_daily.ps1 -Market KR`
-- prefetch task name: `SystematicAlpha_KR_Prefetch_Universe_0730`
-- prefetch time(KST): `07:30` on weekdays (90m buffer before KR open)
-- prefetch actions:
-  - build `out/kr/YYYYMMDD/cache/kr_universe_liquidity.csv`
-  - build `out/kr/YYYYMMDD/cache/kr_prev_day_stats.csv`
-- python: `C:\Users\heesu\anaconda3\envs\systematic-alpha\python.exe`
-- startup delay: `5 sec` (to avoid exact open-time mismatch)
-- internal retries: up to `4` attempts (`30s`, backoff `x2`, max `180s`)
-- task-level restart: up to `2` restarts within `10 min`
-
-To register KR open task without prefetch:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\register_kr_task.ps1 -RegisterPrefetch:$false
-```
-
-### US open task registration (DST/STD dual trigger)
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\register_us_task.ps1
-```
-
-Default behavior:
-- task name: `SystematicAlpha_US_Open_0930ET`
-- triggers(KST): `22:30` and `23:30` on weekdays
-- runner: `scripts/run_daily.ps1 -Market US -RequireUsOpen`
-- runtime guard: open-window check (`09:30 ET + 20m`) + ET-day lock(1 run/day)
-  - outside-window/duplicate runs are skipped silently by default (`-NotifySkips:$false`)
-- prefetch task name: `SystematicAlpha_US_Prefetch_Setup_0830ET`
-- prefetch triggers(KST): `21:30` and `22:30` on weekdays (60m buffer before US open)
-- prefetch guard: only execute near `open-60m` (default tolerance `+/-45m`) + ET-day prefetch lock(1 run/day)
-- prefetch actions:
-  - download latest S&P500 constituents into `out/us/YYYYMMDD/cache/us_sp500_constituents.csv`
-  - build `out/us/YYYYMMDD/cache/us_prev_day_stats.csv`
-  - validate prev-day cache coverage (default: `min_success_count=20`, `min_success_ratio=0.20`)
-
-Custom example:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\register_us_task.ps1 -UsExchange "NASD" -UsOpenWindowMinutes 20 -TaskName "SystematicAlpha_US_Open_0930ET_Custom"
-```
-
-US noisy-skip 알림까지 받고 싶으면:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\register_us_task.ps1 -NotifySkips
-```
-
-### Verify registration
-
-```powershell
-Get-ScheduledTask -TaskName "SystematicAlpha_KR_Open_0900"
-Get-ScheduledTask -TaskName "SystematicAlpha_KR_Prefetch_Universe_0730"
-Get-ScheduledTask -TaskName "SystematicAlpha_US_Open_0930ET"
-Get-ScheduledTask -TaskName "SystematicAlpha_US_Prefetch_Setup_0830ET"
-```
-
-### Task list and state
-
-- `All registered tasks` means every task currently saved in Windows Task Scheduler (ready/running/disabled all included).
-- `Currently running tasks` means only tasks whose state is `Running` right now.
-
-Show all registered tasks:
-
-```powershell
-Get-ScheduledTask | Sort-Object TaskPath, TaskName | Format-Table TaskPath, TaskName, State -AutoSize
-```
-
-Show only currently running tasks:
-
-```powershell
-Get-ScheduledTask | Where-Object { $_.State -eq "Running" } | Format-Table TaskPath, TaskName, State -AutoSize
-```
-
-Show only this project's tasks with run history:
-
-```powershell
-Get-ScheduledTask -TaskName "SystematicAlpha*" | ForEach-Object {
-  $info = Get-ScheduledTaskInfo -TaskName $_.TaskName -TaskPath $_.TaskPath
-  [PSCustomObject]@{
-    TaskName       = $_.TaskName
-    State          = $_.State
-    NextRunTime    = $info.NextRunTime
-    LastRunTime    = $info.LastRunTime
-    LastTaskResult = $info.LastTaskResult
-  }
-} | Format-Table -AutoSize
-```
-
-### Run once now (manual test)
-
-```powershell
-Start-ScheduledTask -TaskName "SystematicAlpha_KR_Open_0900"
-Start-ScheduledTask -TaskName "SystematicAlpha_KR_Prefetch_Universe_0730"
-Start-ScheduledTask -TaskName "SystematicAlpha_US_Open_0930ET"
-Start-ScheduledTask -TaskName "SystematicAlpha_US_Prefetch_Setup_0830ET"
-```
-
-US prefetch를 장외 시간에 수동 테스트하려면:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\prefetch_us_universe.ps1 -AssumeOpenForTest
-```
-
-### Check outputs
-
-- logs (single file per run): `logs/{kr|us}/YYYYMMDD/`
-  - run log: `logs/{kr|us}/YYYYMMDD/{kr|us}_daily_YYYYMMDD_HHMMSS.log`
-  - prefetch logs: `logs/{kr|us}/YYYYMMDD/prefetch_{kr|us}_YYYYMMDD_HHMMSS.log`
-- outputs are grouped by market + date: `out/{kr|us}/YYYYMMDD/`
-  - result json: `out/{kr|us}/YYYYMMDD/results/{kr|us}_daily_YYYYMMDD_HHMMSS.json`
-  - caches: `out/{kr|us}/YYYYMMDD/cache/*.csv`
-  - overnight report: `out/{kr|us}/YYYYMMDD/selection_overnight_report.csv`
-  - analytics tables: `out/{kr|us}/YYYYMMDD/analytics/tables/*.csv`
-  - analytics run bundles: `out/{kr|us}/YYYYMMDD/analytics/runs/*.json`
-
-### Remove tasks
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\remove_kr_task.ps1
-powershell -ExecutionPolicy Bypass -File .\scripts\remove_us_task.ps1
-```
-
-`remove_kr_task.ps1` removes both:
-- `SystematicAlpha_KR_Open_0900`
-- `SystematicAlpha_KR_Prefetch_Universe_0730`
-
-To register only US open task without prefetch task:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\register_us_task.ps1 -RegisterPrefetch:$false
-```
-
-Notes:
-- The PC must be on for automatic task execution.
-- `remove_kr_task.ps1` / `remove_us_task.ps1` are manual commands and run immediately.
-- If the PC is sleeping at trigger time, execution can be delayed by OS/task settings.
-- `out/kr/YYYYMMDD/cache/kr_universe_liquidity.csv` is daily-varying data (previous-day turnover ranking), not a static file.
-  - it should be refreshed each trading day before KR open (handled by KR prefetch task).
-- `out/kr/YYYYMMDD/cache/kr_prev_day_stats.csv` and `out/us/YYYYMMDD/cache/us_prev_day_stats.csv` are daily-varying caches.
-  - they are pre-built before market open to reduce stage1 API calls and startup latency.
-- `scripts/run_daily.ps1` clears proxy env variables and uses project-local cache path for `mojito` token stability.
-- `scripts/run_daily.ps1` reads Telegram settings from `.env` and sends notifications automatically when configured.
-- If token issuance hits rate-limit (`EGW00133`), retry wait is automatically expanded to `65 sec`.
-- US holidays/half-days are not fully modeled in this repo.
-- US task prevents duplicate same-day runs via `out/us/YYYYMMDD/runtime/us_run_lock_YYYYMMDD.txt` (ET date 기준).
-- Backward-compatibility aliases are kept:
-  - `register_task.ps1` -> `register_kr_task.ps1`
-  - `remove_task.ps1` -> `remove_kr_task.ps1`
-
-### Reliability knobs (`scripts/run_daily.ps1`)
-
-You can tune retry behavior manually:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\run_daily.ps1 `
-  -StartDelaySeconds 5 `
-  -MaxAttempts 4 `
-  -RetryDelaySeconds 30 `
-  -RetryBackoffMultiplier 2 `
-  -MaxRetryDelaySeconds 180 `
-  -NotifyTailLines 20 `
-  -NotifySkips:$false
-```
-
-You can also tune strategy hyperparameters in the same script call:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\run_daily.ps1 `
-  -Market KR `
-  -CollectSeconds 600 `
-  -FinalPicks 3 `
-  -PreCandidates 40 `
-  -MaxSymbolsScan 500 `
-  -KrUniverseSize 500 `
-  -MinChangePct 3.0 `
-  -MinGapPct 2.0 `
-  -MinPrevTurnover 10000000000 `
-  -MinStrength 100 `
-  -MinVolRatio 0.10 `
-  -MinBidAskRatio 1.2 `
-  -MinPassConditions 5 `
-  -MinMaintainRatio 0.6 `
-  -MinExecTicks 30 `
-  -MinOrderbookTicks 30 `
-  -MinRealtimeCoverageRatio 0.8
-```
-
-US manual run example:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\run_daily.ps1 -Market US -UsExchange "NASD" -RequireUsOpen -UsOpenWindowMinutes 20
-```
-
-US off-market forced test example:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\run_daily.ps1 -Market US -UsExchange "NASD" -AssumeOpenForTest
-```
-
-To disable start notification for a specific manual run:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\run_daily.ps1 -NotifyStart:$false
-```
-
-Execution monitor behavior:
-- `run_daily.ps1` now streams Python output in real time (no end-of-run dump).
-- each run writes into one single log file (`logs/{kr|us}/YYYYMMDD/{kr|us}_daily_*.log`), including monitor + Python output.
-- each attempt prints start time, command line, and elapsed seconds.
-- startup/retry waiting now prints elapsed/remaining seconds every second.
-- stage1 scan prints progress every `STAGE1_LOG_INTERVAL` symbols (default `20`).
-- realtime collection prints heartbeat every `REALTIME_LOG_INTERVAL` seconds (default `10`).
-
-## Smoke Run (off-market quick check)
-
-Use very small universe and disable realtime collection:
-
-```bash
-python main.py \
-  --universe-file smoke_codes.txt \
-  --max-symbols-scan 3 \
-  --pre-candidates 3 \
-  --final-picks 3 \
-  --collect-seconds 0 \
-  --min-change-pct 0 \
-  --min-gap-pct 0 \
-  --min-prev-turnover 0 \
-  --output-json out/smoke_run.json
-```
-
-US quick smoke example:
-
-```bash
-python main.py \
-  --market us \
-  --exchange NASD \
-  --max-symbols-scan 3 \
-  --pre-candidates 3 \
-  --final-picks 3 \
-  --collect-seconds 0 \
-  --min-change-pct 0 \
-  --min-gap-pct 0 \
-  --min-prev-turnover 0 \
-  --output-json out/us_smoke_run.json
-```
-
-Off-market full-pipeline test example (force assume market-open conditions):
-
-```bash
-python main.py \
-  --market us \
-  --exchange NASD \
-  --collect-seconds 120 \
-  --final-picks 3 \
-  --test-assume-open \
-  --output-json out/us_assume_open_test.json
-```
-
-Disable analytics accumulation for one run:
-
-```bash
-python main.py --disable-analytics-log
-```
-
-## Output
-
-- Console table with top picks
-- Optional JSON file via `--output-json`
-- Overnight performance report CSV:
-  - market/day file: `out/{kr|us}/YYYYMMDD/selection_overnight_report.csv`
-  - columns include: selection datetime, entry price, same-day close, next-day open, intraday/overnight/total returns
-- Analytics datasets (default): `out/{kr|us}/YYYYMMDD/analytics/`
-  - `tables/run_summary.csv`: run summary table for that market+date
-  - `tables/stage1_scan.csv`: stage1 scan diagnostics for that market+date
-  - `tables/ranked_symbols.csv`: ranking dataset for that market+date
-  - `runs/{market}_YYYYMMDD_HHMMSS_microsec.json`: full per-run bundle
-
-Example JSON path:
-- `out/smoke_run.json`
-- scheduled run example: `out/kr/YYYYMMDD/results/kr_daily_YYYYMMDD_HHMMSS.json`
-
-## Troubleshooting
-
-- `KeyError: 'access_token'`:
-  - usually token endpoint returned an error payload (not token payload)
-  - check credentials and API rate limits
-- KIS token issue `EGW00133`:
-  - token issuance is limited (retry after around 1 minute)
-- Proxy failures (`127.0.0.1:9` etc):
-  - clear `HTTP_PROXY` / `HTTPS_PROXY` variables
-- Permission errors on cache path:
-  - ensure user has write permission to home cache path
-
-## Security Notes
-
-- Never commit `.env` to git
-- Rotate keys immediately if exposed
-- Treat output files as potentially sensitive (strategy + symbols)
-
-## GitHub Publish Checklist
-
-- Confirm secrets are only in `.env` (not in tracked files).
-- Confirm generated outputs are ignored (`logs/`, `out/`, `*.mst`, `.cache/`).
-- Run:
-  - `git status`
-  - `python main.py --help`
-- Review staged diff before push:
-  - `git diff --staged`
-
-## Third-Party Code
-
-- This project depends on `mojito2` from PyPI.
-- `systematic_alpha/mojito_loader.py` also supports an optional local `./mojito` override for development; that folder is excluded from git by default.
+The legacy KR/US selector code is still required because Agent Lab currently ingests its signal outputs.
+So selector code remains in the repository as an internal dependency.
 
 ## Disclaimer
 
-This repository is for research/automation purposes only and is not financial advice.
-
-
-
-
+This repository is for research and automation purposes only, not investment advice.

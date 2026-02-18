@@ -18,11 +18,17 @@ param(
     [switch]$WaitForSessionResult = $true,
     [int]$WaitTimeoutSeconds = 3600,
     [int]$PollIntervalSeconds = 15,
-    [switch]$UseDailyLock = $true
+    [switch]$UseDailyLock = $true,
+    [switch]$DisableTelegram = $false
 )
 
 $ErrorActionPreference = "Stop"
 $script:RunLogFile = $null
+$script:TelegramEnabled = $false
+$script:TelegramBotToken = ""
+$script:TelegramChatId = ""
+$script:TelegramThreadId = ""
+$script:TelegramDisableNotification = $false
 
 function Get-KstNow {
     $kst = [System.TimeZoneInfo]::FindSystemTimeZoneById("Korea Standard Time")
@@ -68,6 +74,210 @@ function Resolve-PythonExe {
         return $defaultPython
     }
     return "python"
+}
+
+function Test-Truthy {
+    param([string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return $false
+    }
+    $norm = $Value.Trim().ToLowerInvariant()
+    return $norm -in @("1", "true", "yes", "y", "on")
+}
+
+function Import-DotEnv {
+    param(
+        [string]$Path,
+        [string[]]$AllowedKeys = @()
+    )
+
+    if (-not (Test-Path $Path)) {
+        return
+    }
+
+    $allowLookup = $null
+    if ($AllowedKeys -and $AllowedKeys.Count -gt 0) {
+        $allowLookup = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($item in $AllowedKeys) {
+            if (-not [string]::IsNullOrWhiteSpace($item)) {
+                [void]$allowLookup.Add($item.Trim())
+            }
+        }
+    }
+
+    foreach ($raw in Get-Content -Path $Path -Encoding UTF8) {
+        $line = $raw.Trim()
+        if (-not $line -or $line.StartsWith("#")) {
+            continue
+        }
+        if ($line.StartsWith("export ")) {
+            $line = $line.Substring(7).Trim()
+        }
+        $eqIdx = $line.IndexOf("=")
+        if ($eqIdx -lt 1) {
+            continue
+        }
+        $key = $line.Substring(0, $eqIdx).Trim()
+        $value = $line.Substring($eqIdx + 1).Trim()
+        if ([string]::IsNullOrWhiteSpace($key)) {
+            continue
+        }
+        if ($allowLookup -ne $null -and -not $allowLookup.Contains($key)) {
+            continue
+        }
+        if ($value.Length -ge 2) {
+            $first = $value[0]
+            $last = $value[$value.Length - 1]
+            if (($first -eq '"' -and $last -eq '"') -or ($first -eq "'" -and $last -eq "'")) {
+                $value = $value.Substring(1, $value.Length - 2)
+            }
+        }
+        if (-not (Test-Path "Env:$key")) {
+            Set-Item -Path "Env:$key" -Value $value
+        }
+    }
+}
+
+function Normalize-TelegramToken {
+    param([string]$Token)
+    if ([string]::IsNullOrWhiteSpace($Token)) {
+        return ""
+    }
+    $clean = $Token.Trim()
+    if ($clean.StartsWith("bot", [System.StringComparison]::OrdinalIgnoreCase)) {
+        $clean = $clean.Substring(3)
+    }
+    return $clean
+}
+
+function Truncate-Text {
+    param(
+        [string]$Text,
+        [int]$MaxChars = 3000
+    )
+    if ([string]::IsNullOrWhiteSpace($Text)) {
+        return $Text
+    }
+    if ($Text.Length -le $MaxChars) {
+        return $Text
+    }
+    return $Text.Substring(0, $MaxChars) + "`n...(truncated)..."
+}
+
+function Send-TelegramMessage {
+    param([string]$Text)
+    if (-not $script:TelegramEnabled) {
+        return
+    }
+    if ([string]::IsNullOrWhiteSpace($Text)) {
+        return
+    }
+
+    $uri = "https://api.telegram.org/bot$($script:TelegramBotToken)/sendMessage"
+    $payload = @{
+        chat_id = $script:TelegramChatId
+        text = (Truncate-Text -Text $Text)
+        disable_web_page_preview = $true
+    }
+    if ($script:TelegramDisableNotification) {
+        $payload["disable_notification"] = $true
+    }
+    if (-not [string]::IsNullOrWhiteSpace($script:TelegramThreadId)) {
+        $threadValue = 0L
+        if ([int64]::TryParse($script:TelegramThreadId, [ref]$threadValue)) {
+            $payload["message_thread_id"] = $threadValue
+        }
+    }
+
+    try {
+        $resp = Invoke-RestMethod `
+            -Method Post `
+            -Uri $uri `
+            -ContentType "application/json; charset=utf-8" `
+            -Body ($payload | ConvertTo-Json -Compress) `
+            -TimeoutSec 15
+        if ($null -ne $resp -and $null -ne $resp.ok -and (-not $resp.ok)) {
+            [void](Write-MonitorLog "[telegram] api error: code=$($resp.error_code) desc=$($resp.description)")
+        }
+    } catch {
+        [void](Write-MonitorLog "[telegram] send failed: $($_.Exception.Message)")
+    }
+}
+
+function Resolve-ExitCode {
+    param([object]$Result)
+    if ($null -eq $Result) {
+        return 9009
+    }
+    $last = $Result
+    if ($Result -is [System.Array]) {
+        if ($Result.Count -gt 0) {
+            $last = $Result[$Result.Count - 1]
+        }
+    }
+    try {
+        return [int]$last
+    } catch {
+        return 9009
+    }
+}
+
+function Build-ProposalSummaryMessage {
+    param(
+        [string]$ProjectRootPath,
+        [string]$RunDate,
+        [string]$MarketValue
+    )
+    $marketTag = $MarketValue.Trim().ToLowerInvariant()
+    $path = Join-Path $ProjectRootPath ("out\agent_lab\{0}\proposals_{1}_{0}.json" -f $RunDate, $marketTag)
+    if (-not (Test-Path $path)) {
+        return "[AgentLab] propose result not found: $path"
+    }
+    try {
+        $obj = Get-Content -Path $path -Raw -Encoding UTF8 | ConvertFrom-Json
+    } catch {
+        return "[AgentLab] propose result parse failed: $path"
+    }
+    $lines = @(
+        "[AgentLab] propose"
+        "market=$MarketValue"
+        "date=$RunDate"
+    )
+    $rows = @()
+    if ($null -ne $obj.proposals) {
+        $rows = @($obj.proposals)
+    }
+    if ($rows.Count -eq 0) {
+        $lines += "proposals=0"
+        return ($lines -join "`n")
+    }
+    foreach ($row in $rows) {
+        $agent = [string]$row.agent_id
+        $status = [string]$row.status
+        $blocked = [string]$row.blocked_reason
+        $orders = @()
+        if ($null -ne $row.orders) {
+            $orders = @($row.orders)
+        }
+        if ($orders.Count -eq 0) {
+            $detail = "orders=0"
+        } else {
+            $chunks = @()
+            foreach ($order in $orders) {
+                $side = [string]$order.side
+                $symbol = [string]$order.symbol
+                $qty = [double]($order.quantity)
+                $chunks += ("{0} {1} x{2}" -f $side, $symbol, [math]::Round($qty, 4))
+            }
+            $detail = ($chunks -join ", ")
+        }
+        if ([string]::IsNullOrWhiteSpace($blocked)) {
+            $lines += ("{0}: {1} | {2}" -f $agent, $status, $detail)
+        } else {
+            $lines += ("{0}: {1} | {2} | blocked={3}" -f $agent, $status, $detail, $blocked)
+        }
+    }
+    return ($lines -join "`n")
 }
 
 function Get-LatestSessionJsonPath {
@@ -148,6 +358,32 @@ Set-Location $ProjectRoot
 $env:PYTHONIOENCODING = "utf-8"
 $env:PYTHONUTF8 = "1"
 
+Import-DotEnv -Path (Join-Path $ProjectRoot ".env") -AllowedKeys @(
+    "TELEGRAM_ENABLED",
+    "TELEGRAM_BOT_TOKEN",
+    "TELEGRAM_CHAT_ID",
+    "TELEGRAM_THREAD_ID",
+    "TELEGRAM_DISABLE_NOTIFICATION"
+)
+
+$script:TelegramBotToken = Normalize-TelegramToken ([string]$env:TELEGRAM_BOT_TOKEN)
+$script:TelegramChatId = [string]$env:TELEGRAM_CHAT_ID
+$script:TelegramThreadId = [string]$env:TELEGRAM_THREAD_ID
+$script:TelegramDisableNotification = Test-Truthy $env:TELEGRAM_DISABLE_NOTIFICATION
+
+$enabledByKeys = -not (
+    [string]::IsNullOrWhiteSpace($script:TelegramBotToken) -or
+    [string]::IsNullOrWhiteSpace($script:TelegramChatId)
+)
+if ([string]::IsNullOrWhiteSpace($env:TELEGRAM_ENABLED)) {
+    $script:TelegramEnabled = $enabledByKeys
+} else {
+    $script:TelegramEnabled = (Test-Truthy $env:TELEGRAM_ENABLED) -and $enabledByKeys
+}
+if ($DisableTelegram) {
+    $script:TelegramEnabled = $false
+}
+
 $nowKst = Get-KstNow
 $runDate = if ([string]::IsNullOrWhiteSpace($Date)) { $nowKst.ToString("yyyyMMdd") } else { $Date.Trim() }
 $runStamp = $nowKst.ToString("yyyyMMdd_HHmmss")
@@ -163,7 +399,15 @@ $commonPrefix = @("--project-root", $ProjectRoot)
 switch ($Action) {
     "init" {
         $args = $commonPrefix + @("init", "--capital-krw", "$CapitalKrw", "--agents", "$Agents")
-        $code = Invoke-AgentLabCli -PyExe $PythonExe -CliArgs $args
+        $result = Invoke-AgentLabCli -PyExe $PythonExe -CliArgs $args
+        $code = Resolve-ExitCode -Result $result
+        if ($code -eq 0) {
+            Send-TelegramMessage (
+                "[AgentLab] init success`n" +
+                "capital_krw=$CapitalKrw`n" +
+                "agents=$Agents"
+            )
+        }
         exit $code
     }
 
@@ -208,31 +452,48 @@ switch ($Action) {
         }
 
         $ingestArgs = $commonPrefix + @("ingest-session", "--market", $Market, "--date", $runDate)
-        $ingestCode = Invoke-AgentLabCli -PyExe $PythonExe -CliArgs $ingestArgs
+        $ingestResult = Invoke-AgentLabCli -PyExe $PythonExe -CliArgs $ingestArgs
+        $ingestCode = Resolve-ExitCode -Result $ingestResult
         if ($ingestCode -ne 0) {
             if ($lockCreated -and $lockPath -and (Test-Path $lockPath)) {
                 Remove-Item -Path $lockPath -Force -ErrorAction SilentlyContinue
                 Write-MonitorLog "[lock] removed due to ingest failure: $lockPath"
             }
+            Send-TelegramMessage (
+                "[AgentLab] ingest failed`n" +
+                "market=$Market`n" +
+                "date=$runDate`n" +
+                "exit_code=$ingestCode"
+            )
             exit $ingestCode
         }
         $proposeArgs = $commonPrefix + @("propose-orders", "--market", $Market, "--date", $runDate)
-        $proposeCode = Invoke-AgentLabCli -PyExe $PythonExe -CliArgs $proposeArgs
+        $proposeResult = Invoke-AgentLabCli -PyExe $PythonExe -CliArgs $proposeArgs
+        $proposeCode = Resolve-ExitCode -Result $proposeResult
         if ($proposeCode -ne 0) {
             if ($lockCreated -and $lockPath -and (Test-Path $lockPath)) {
                 Remove-Item -Path $lockPath -Force -ErrorAction SilentlyContinue
                 Write-MonitorLog "[lock] removed due to propose failure: $lockPath"
             }
-        } elseif ($lockCreated -and $lockPath -and (Test-Path $lockPath)) {
-            $lockBody = @(
-                "created_at=" + (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
-                "action=ingest-propose"
-                "market=" + $Market
-                "date=" + $runDate
-                "status=done"
-            ) -join "`n"
-            Set-Content -Path $lockPath -Value $lockBody -Encoding UTF8
-            Write-MonitorLog "[lock] updated status=done: $lockPath"
+            Send-TelegramMessage (
+                "[AgentLab] propose failed`n" +
+                "market=$Market`n" +
+                "date=$runDate`n" +
+                "exit_code=$proposeCode"
+            )
+        } else {
+            if ($lockCreated -and $lockPath -and (Test-Path $lockPath)) {
+                $lockBody = @(
+                    "created_at=" + (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+                    "action=ingest-propose"
+                    "market=" + $Market
+                    "date=" + $runDate
+                    "status=done"
+                ) -join "`n"
+                Set-Content -Path $lockPath -Value $lockBody -Encoding UTF8
+                Write-MonitorLog "[lock] updated status=done: $lockPath"
+            }
+            Send-TelegramMessage (Build-ProposalSummaryMessage -ProjectRootPath $ProjectRoot -RunDate $runDate -MarketValue $Market)
         }
         exit $proposeCode
     }
@@ -250,13 +511,28 @@ switch ($Action) {
             "--approved-by", $ApprovedBy,
             "--note", $Note
         )
-        $code = Invoke-AgentLabCli -PyExe $PythonExe -CliArgs $args
+        $result = Invoke-AgentLabCli -PyExe $PythonExe -CliArgs $args
+        $code = Resolve-ExitCode -Result $result
+        if ($code -eq 0) {
+            Send-TelegramMessage (
+                "[AgentLab] approval executed`n" +
+                "proposal_id=$ProposalId`n" +
+                "approved_by=$ApprovedBy"
+            )
+        }
         exit $code
     }
 
     "daily-review" {
         $args = $commonPrefix + @("daily-review", "--date", $runDate)
-        $code = Invoke-AgentLabCli -PyExe $PythonExe -CliArgs $args
+        $result = Invoke-AgentLabCli -PyExe $PythonExe -CliArgs $args
+        $code = Resolve-ExitCode -Result $result
+        if ($code -eq 0) {
+            Send-TelegramMessage (
+                "[AgentLab] daily-review complete`n" +
+                "date=$runDate"
+            )
+        }
         exit $code
     }
 
@@ -268,7 +544,14 @@ switch ($Action) {
             $weekValue = ("{0}-W{1:D2}" -f $isoYear, $isoWeek)
         }
         $args = $commonPrefix + @("weekly-council", "--week", $weekValue)
-        $code = Invoke-AgentLabCli -PyExe $PythonExe -CliArgs $args
+        $result = Invoke-AgentLabCli -PyExe $PythonExe -CliArgs $args
+        $code = Resolve-ExitCode -Result $result
+        if ($code -eq 0) {
+            Send-TelegramMessage (
+                "[AgentLab] weekly-council complete`n" +
+                "week=$weekValue"
+            )
+        }
         exit $code
     }
 
@@ -276,7 +559,15 @@ switch ($Action) {
         $fromValue = if ([string]::IsNullOrWhiteSpace($DateFrom)) { $runDate } else { $DateFrom.Trim() }
         $toValue = if ([string]::IsNullOrWhiteSpace($DateTo)) { $runDate } else { $DateTo.Trim() }
         $args = $commonPrefix + @("report", "--from", $fromValue, "--to", $toValue)
-        $code = Invoke-AgentLabCli -PyExe $PythonExe -CliArgs $args
+        $result = Invoke-AgentLabCli -PyExe $PythonExe -CliArgs $args
+        $code = Resolve-ExitCode -Result $result
+        if ($code -eq 0) {
+            Send-TelegramMessage (
+                "[AgentLab] report complete`n" +
+                "from=$fromValue`n" +
+                "to=$toValue"
+            )
+        }
         exit $code
     }
 }

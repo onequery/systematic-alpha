@@ -15,7 +15,8 @@ param(
     [int]$MaxAttempts = 4,
     [int]$RetryDelaySeconds = 30,
     [int]$RetryBackoffMultiplier = 2,
-    [int]$MaxRetryDelaySeconds = 180
+    [int]$MaxRetryDelaySeconds = 180,
+    [switch]$DisableTelegram = $false
 )
 
 $ErrorActionPreference = "Stop"
@@ -54,7 +55,8 @@ if ($RegisterPrefetch) {
 }
 
 $psExe = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
-$actionArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$RunScriptPath`" -PythonExe `"$PythonExe`" -Market KR -KrUniverseSize $KrUniverseSize -MaxSymbolsScan $MaxSymbolsScan -StartDelaySeconds $StartDelaySeconds -MaxAttempts $MaxAttempts -RetryDelaySeconds $RetryDelaySeconds -RetryBackoffMultiplier $RetryBackoffMultiplier -MaxRetryDelaySeconds $MaxRetryDelaySeconds"
+$disableTelegramArg = if ($DisableTelegram) { "-DisableTelegram" } else { "" }
+$actionArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$RunScriptPath`" -PythonExe `"$PythonExe`" -Market KR -KrUniverseSize $KrUniverseSize -MaxSymbolsScan $MaxSymbolsScan -StartDelaySeconds $StartDelaySeconds -MaxAttempts $MaxAttempts -RetryDelaySeconds $RetryDelaySeconds -RetryBackoffMultiplier $RetryBackoffMultiplier -MaxRetryDelaySeconds $MaxRetryDelaySeconds $disableTelegramArg"
 $prefetchActionArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$PrefetchScriptPath`" -PythonExe `"$PythonExe`" -KrUniverseSize $KrUniverseSize -MaxSymbolsScan $MaxSymbolsScan"
 
 $action = New-ScheduledTaskAction -Execute $psExe -Argument $actionArgs
@@ -106,6 +108,7 @@ if ($WeekdaysOnly) {
     Write-Output "Schedule: Daily"
 }
 Write-Output "Retry config: start_delay=${StartDelaySeconds}s, max_attempts=$MaxAttempts, retry_delay=${RetryDelaySeconds}s, backoff=x$RetryBackoffMultiplier, max_retry_delay=${MaxRetryDelaySeconds}s"
+Write-Output "Telegram disabled for base KR selector: $DisableTelegram"
 Write-Output "KR universe prep: kr_universe_size=$KrUniverseSize, max_symbols_scan=$MaxSymbolsScan"
 Write-Output "Command: $psExe $actionArgs"
 if ($RegisterPrefetch) {

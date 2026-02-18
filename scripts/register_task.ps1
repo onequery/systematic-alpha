@@ -15,7 +15,8 @@ param(
     [int]$MaxAttempts = 4,
     [int]$RetryDelaySeconds = 30,
     [int]$RetryBackoffMultiplier = 2,
-    [int]$MaxRetryDelaySeconds = 180
+    [int]$MaxRetryDelaySeconds = 180,
+    [switch]$DisableTelegram = $false
 )
 
 $ErrorActionPreference = "Stop"
@@ -41,4 +42,5 @@ Write-Output "[alias] register_task.ps1 is kept for backward compatibility. Use 
     -MaxAttempts $MaxAttempts `
     -RetryDelaySeconds $RetryDelaySeconds `
     -RetryBackoffMultiplier $RetryBackoffMultiplier `
-    -MaxRetryDelaySeconds $MaxRetryDelaySeconds
+    -MaxRetryDelaySeconds $MaxRetryDelaySeconds `
+    -DisableTelegram:$DisableTelegram

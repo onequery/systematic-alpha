@@ -24,7 +24,8 @@ param(
     [int]$MaxAttempts = 4,
     [int]$RetryDelaySeconds = 30,
     [int]$RetryBackoffMultiplier = 2,
-    [int]$MaxRetryDelaySeconds = 180
+    [int]$MaxRetryDelaySeconds = 180,
+    [switch]$DisableTelegram = $false
 )
 $ErrorActionPreference = "Stop"
 
@@ -63,7 +64,8 @@ $prefetchAtStdTime = Parse-TimeToDate -At $PrefetchAtStd
 $psExe = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
 $prefetchMinSuccessRatioText = $PrefetchMinSuccessRatio.ToString([System.Globalization.CultureInfo]::InvariantCulture)
 $notifySkipsArg = if ($NotifySkips) { "-NotifySkips" } else { "" }
-$actionArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$RunScriptPath`" -PythonExe `"$PythonExe`" -Market US -UsExchange `"$UsExchange`" -UsUniverseSize $UsUniverseSize -MaxSymbolsScan $MaxSymbolsScan -RequireUsOpen -UsOpenWindowMinutes $UsOpenWindowMinutes $notifySkipsArg -StartDelaySeconds $StartDelaySeconds -MaxAttempts $MaxAttempts -RetryDelaySeconds $RetryDelaySeconds -RetryBackoffMultiplier $RetryBackoffMultiplier -MaxRetryDelaySeconds $MaxRetryDelaySeconds"
+$disableTelegramArg = if ($DisableTelegram) { "-DisableTelegram" } else { "" }
+$actionArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$RunScriptPath`" -PythonExe `"$PythonExe`" -Market US -UsExchange `"$UsExchange`" -UsUniverseSize $UsUniverseSize -MaxSymbolsScan $MaxSymbolsScan -RequireUsOpen -UsOpenWindowMinutes $UsOpenWindowMinutes $notifySkipsArg -StartDelaySeconds $StartDelaySeconds -MaxAttempts $MaxAttempts -RetryDelaySeconds $RetryDelaySeconds -RetryBackoffMultiplier $RetryBackoffMultiplier -MaxRetryDelaySeconds $MaxRetryDelaySeconds $disableTelegramArg"
 $action = New-ScheduledTaskAction -Execute $psExe -Argument $actionArgs
 $prefetchNotifySkipsArg = if ($NotifySkips) { "-NotifySkips" } else { "" }
 $prefetchActionArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$PrefetchScriptPath`" -ProjectRoot `"$projectRoot`" -PythonExe `"$PythonExe`" -UsExchange `"$UsExchange`" -UsUniverseSize $UsUniverseSize -MaxSymbolsScan $MaxSymbolsScan -RequireUsPrefetchWindow -UsPrefetchLeadMinutes $UsPrefetchLeadMinutes -UsPrefetchWindowMinutes $UsPrefetchWindowMinutes -PrefetchMinSuccessCount $PrefetchMinSuccessCount -PrefetchMinSuccessRatio $prefetchMinSuccessRatioText $prefetchNotifySkipsArg"
@@ -117,6 +119,7 @@ if ($WeekdaysOnly) {
 }
 Write-Output "Execution guard: run_daily.ps1 -RequireUsOpen -UsOpenWindowMinutes $UsOpenWindowMinutes (open-window + daily-lock)"
 Write-Output "Skip notifications: $NotifySkips"
+Write-Output "Telegram disabled for base US selector: $DisableTelegram"
 Write-Output "US setup prep: us_universe_size=$UsUniverseSize, max_symbols_scan=$MaxSymbolsScan"
 Write-Output "Retry config: start_delay=${StartDelaySeconds}s, max_attempts=$MaxAttempts, retry_delay=${RetryDelaySeconds}s, backoff=x$RetryBackoffMultiplier, max_retry_delay=${MaxRetryDelaySeconds}s"
 Write-Output "Command: $psExe $actionArgs"
