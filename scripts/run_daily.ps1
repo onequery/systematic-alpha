@@ -173,6 +173,46 @@ function Get-SelectionSummary {
         $rows = @($obj.all_ranked)
     }
     if ($rows.Count -eq 0) {
+        $market = if ($obj.market) { ([string]$obj.market).ToUpperInvariant() } else { "-" }
+        $signalValid = $true
+        if ($null -ne $obj.signal_valid) {
+            $signalValid = [bool]$obj.signal_valid
+        }
+        $invalidReason = if ($obj.invalid_reason) { [string]$obj.invalid_reason } else { "" }
+
+        if ((-not $signalValid) -and -not [string]::IsNullOrWhiteSpace($invalidReason)) {
+            $rq = $obj.realtime_quality
+            $coverage = 0.0
+            $eligible = 0
+            $total = 0
+            if ($null -ne $rq) {
+                if ($null -ne $rq.coverage_ratio) { $coverage = [double]$rq.coverage_ratio }
+                if ($null -ne $rq.eligible_count) { $eligible = [int]$rq.eligible_count }
+                if ($null -ne $rq.total_count) { $total = [int]$rq.total_count }
+            }
+
+            if (
+                $invalidReason.StartsWith("realtime_coverage_too_low", [System.StringComparison]::OrdinalIgnoreCase) -and
+                $coverage -le 0.000001 -and
+                $eligible -eq 0 -and
+                $total -gt 0
+            ) {
+                return (
+                    "장이 오픈되지 않았거나(휴장/거래정지 포함) 실시간 체결 데이터가 없어 추천 종목을 선정할 수 없습니다. " +
+                    "market=$market, coverage=$('{0:N3}' -f $coverage), eligible=$eligible/$total, invalid_reason=$invalidReason"
+                )
+            }
+
+            if ($invalidReason -eq "no_stage1_candidates") {
+                return "추천 종목 없음: stage1 필터 통과 종목이 없습니다. (invalid_reason=no_stage1_candidates)"
+            }
+
+            return (
+                "추천 종목 산출 불가(신호 무효). " +
+                "market=$market, invalid_reason=$invalidReason, coverage=$('{0:N3}' -f $coverage), eligible=$eligible/$total"
+            )
+        }
+
         return "no ranked symbols in output json."
     }
 
