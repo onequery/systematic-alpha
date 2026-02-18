@@ -15,6 +15,7 @@ env/
 .cache/
 out/
 logs/
+state/
 smoke_codes.txt
 mojito/
 kospi_code.mst

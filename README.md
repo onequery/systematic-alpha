@@ -30,6 +30,7 @@ This project is a CLI app (no UI). It reads secrets from `.env` and prints ranke
 - Telegram notifications for stage/retry/failure/success status (optional)
 - Live progress/heartbeat logs during scan and realtime collection
 - Local `.env` loader (no external dotenv dependency)
+- `Agent Lab` multi-agent research/paper-trading layer (3 agents + orchestrator + risk/accounting/state)
 
 ## Strategy Summary
 
@@ -71,7 +72,10 @@ Default universe policy:
 |   |-- prefetch_us_universe.py
 |   |-- prefetch_us_market_cache.py
 |   |-- run_daily.ps1
+|   |-- run_agent_lab.ps1
+|   |-- register_agent_lab_tasks.ps1
 |   |-- remove_kr_task.ps1
+|   |-- remove_agent_lab_tasks.ps1
 |   |-- remove_task.ps1 (alias)
 |   `-- remove_us_task.ps1
 `-- systematic_alpha/
@@ -83,6 +87,18 @@ Default universe policy:
     |-- credentials.py
     |-- dotenv.py
     |-- helpers.py
+    |-- agent_lab/
+    |   |-- cli.py
+    |   |-- orchestrator.py
+    |   |-- agents.py
+    |   |-- llm_client.py
+    |   |-- strategy_registry.py
+    |   |-- paper_broker.py
+    |   |-- risk_engine.py
+    |   |-- accounting.py
+    |   |-- storage.py
+    |   |-- schemas.py
+    |   `-- identity.py
     |-- data/
     |   |-- us_sp500_snapshot.csv
     |   `-- us_universe_default.txt
@@ -195,6 +211,97 @@ See all options:
 
 ```bash
 python main.py --help
+```
+
+## Agent Lab (Multi-Agent Strategy Research)
+
+`Agent Lab` adds a persistent multi-agent layer on top of the existing KR/US selector.
+
+- 3 trader agents:
+  - `agent_a`: momentum/flow bias
+  - `agent_b`: risk-first conservative bias
+  - `agent_c`: counter-hypothesis/diversification bias
+- 1 orchestrator + risk engine + accounting engine
+- identity/memory/checkpoint persistence for long-horizon experiments
+- initial 4 weeks are approval-based only (`PENDING_APPROVAL`)
+
+### Storage Layout
+
+- SQLite: `state/agent_lab/agent_lab.sqlite`
+- Identity docs: `state/agent_lab/agents/<agent_id>/identity.md`
+- Memory log: `state/agent_lab/agents/<agent_id>/memory.jsonl`
+- Checkpoints: `state/agent_lab/checkpoints/checkpoint_YYYY-Www.json`
+- Artifacts: `out/agent_lab/YYYYMMDD/*.json|*.md`
+- Logs: `logs/agent_lab/YYYYMMDD/agent_lab_*.log`
+
+### Environment Keys (`.env`)
+
+```env
+AGENT_LAB_ENABLED=1
+OPENAI_API_KEY=sk-...
+OPENAI_MODEL=gpt-4o-mini
+OPENAI_MAX_DAILY_COST=5.0
+```
+
+Optional:
+
+```env
+AGENT_LAB_EXECUTION_MODE=simulated   # simulated | mojito_mock
+AGENT_LAB_US_EXCHANGE=NASD
+AGENT_LAB_USDKRW_DEFAULT=1300
+```
+
+### Agent Lab CLI
+
+```bash
+python -m systematic_alpha.agent_lab.cli init --capital-krw 10000000 --agents 3
+python -m systematic_alpha.agent_lab.cli ingest-session --market KR --date YYYYMMDD
+python -m systematic_alpha.agent_lab.cli ingest-session --market US --date YYYYMMDD
+python -m systematic_alpha.agent_lab.cli propose-orders --market KR --date YYYYMMDD
+python -m systematic_alpha.agent_lab.cli propose-orders --market US --date YYYYMMDD
+python -m systematic_alpha.agent_lab.cli approve-orders --proposal-id <id>
+python -m systematic_alpha.agent_lab.cli daily-review --date YYYYMMDD
+python -m systematic_alpha.agent_lab.cli weekly-council --week YYYY-Www
+python -m systematic_alpha.agent_lab.cli report --from YYYYMMDD --to YYYYMMDD
+```
+
+PowerShell wrapper:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\run_agent_lab.ps1 -Action init -CapitalKrw 10000000 -Agents 3
+powershell -ExecutionPolicy Bypass -File .\scripts\run_agent_lab.ps1 -Action ingest-propose -Market KR
+powershell -ExecutionPolicy Bypass -File .\scripts\run_agent_lab.ps1 -Action ingest-propose -Market US
+powershell -ExecutionPolicy Bypass -File .\scripts\run_agent_lab.ps1 -Action daily-review
+powershell -ExecutionPolicy Bypass -File .\scripts\run_agent_lab.ps1 -Action weekly-council
+```
+
+Before scheduling, run `init` once to bootstrap agents/strategy state.
+
+### Agent Lab Scheduled Tasks
+
+Register:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\register_agent_lab_tasks.ps1
+```
+
+Default task set:
+
+- `SystematicAlpha_AgentLab_KR_PostOpen_0920` (weekday 09:20 KST)
+- `SystematicAlpha_AgentLab_US_PostOpen_0930ET` (weekday 22:45/23:45 KST dual-trigger + daily lock)
+- `SystematicAlpha_AgentLab_DailyReview_0710` (daily 07:10 KST)
+- `SystematicAlpha_AgentLab_WeeklyCouncil_Sat0800` (Saturday 08:00 KST)
+
+Remove:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\remove_agent_lab_tasks.ps1
+```
+
+Verify:
+
+```powershell
+Get-ScheduledTask -TaskName "SystematicAlpha_AgentLab*" | Format-Table TaskName, State -AutoSize
 ```
 
 ### Universe file format (`--universe-file`)

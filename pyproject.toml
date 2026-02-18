@@ -15,14 +15,18 @@ dependencies = [
   "websockets>=12.0",
   "pycryptodome>=3.19.0",
   "mojito2",
+  "openai>=1.0.0",
 ]
 
 [project.scripts]
 systematic-alpha = "main:main"
+systematic-alpha-agent-lab = "systematic_alpha.agent_lab.cli:main"
 
 [tool.setuptools]
 py-modules = ["main"]
-packages = ["systematic_alpha"]
+
+[tool.setuptools.packages.find]
+include = ["systematic_alpha*"]
 
 [tool.setuptools.package-data]
 systematic_alpha = ["data/*.txt", "data/*.csv"]

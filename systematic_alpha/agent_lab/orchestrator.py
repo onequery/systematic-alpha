@@ -1,0 +1,633 @@
+from __future__ import annotations
+
+import json
+import os
+import uuid
+from datetime import date, datetime, timedelta
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+from systematic_alpha.agent_lab.accounting import AccountingEngine
+from systematic_alpha.agent_lab.agents import AgentDecisionEngine, build_default_agent_profiles, profile_from_agent_row
+from systematic_alpha.agent_lab.identity import AgentIdentityStore
+from systematic_alpha.agent_lab.llm_client import LLMClient
+from systematic_alpha.agent_lab.paper_broker import PaperBroker
+from systematic_alpha.agent_lab.risk_engine import RiskEngine
+from systematic_alpha.agent_lab.schemas import (
+    PROPOSAL_STATUS_BLOCKED,
+    PROPOSAL_STATUS_EXECUTED,
+    PROPOSAL_STATUS_PENDING_APPROVAL,
+    STATUS_DATA_QUALITY_LOW,
+    STATUS_INVALID_SIGNAL,
+    STATUS_MARKET_CLOSED,
+    STATUS_SIGNAL_OK,
+)
+from systematic_alpha.agent_lab.storage import AgentLabStorage
+from systematic_alpha.agent_lab.strategy_registry import StrategyRegistry
+
+PROMOTION_SCORE_THRESHOLD = 0.60
+
+
+def now_iso() -> str:
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def parse_week_id(week_id: str) -> Tuple[date, date]:
+    year_part, week_part = week_id.split("-W")
+    year = int(year_part)
+    week = int(week_part)
+    start = date.fromisocalendar(year, week, 1)
+    end = date.fromisocalendar(year, week, 7)
+    return start, end
+
+
+class AgentLabOrchestrator:
+    def __init__(self, project_root: str | Path):
+        self.project_root = Path(project_root).resolve()
+        self.state_root = self.project_root / "state" / "agent_lab"
+        self.out_root = self.project_root / "out" / "agent_lab"
+        self.db_path = self.state_root / "agent_lab.sqlite"
+        self.storage = AgentLabStorage(self.db_path)
+        self.registry = StrategyRegistry(self.storage)
+        self.identity = AgentIdentityStore(self.state_root, self.storage)
+        self.llm = LLMClient(self.storage)
+        self.agent_engine = AgentDecisionEngine(self.llm, self.registry)
+        self.accounting = AccountingEngine(self.storage)
+        self.risk = RiskEngine()
+        self.paper_broker = PaperBroker(self.storage)
+
+    def close(self) -> None:
+        self.storage.close()
+
+    def _artifact_dir(self, yyyymmdd: str) -> Path:
+        d = self.out_root / yyyymmdd
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def _write_json_artifact(self, yyyymmdd: str, name: str, payload: Dict[str, Any]) -> Path:
+        out = self._artifact_dir(yyyymmdd) / f"{name}.json"
+        out.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        return out
+
+    def _write_text_artifact(self, yyyymmdd: str, name: str, text: str) -> Path:
+        out = self._artifact_dir(yyyymmdd) / f"{name}.md"
+        out.write_text(text, encoding="utf-8")
+        return out
+
+    def _today_str(self) -> str:
+        return datetime.now().strftime("%Y%m%d")
+
+    def _find_session_json(self, market: str, yyyymmdd: str) -> Optional[Path]:
+        market_tag = market.strip().lower()
+        result_dir = self.project_root / "out" / market_tag / yyyymmdd / "results"
+        if not result_dir.exists():
+            return None
+        files = sorted(result_dir.glob(f"{market_tag}_daily_*.json"))
+        if not files:
+            return None
+        return files[-1]
+
+    def _classify_signal(self, payload: Dict[str, Any]) -> Tuple[str, str]:
+        signal_valid = bool(payload.get("signal_valid", True))
+        invalid_reason = str(payload.get("invalid_reason") or "")
+        if signal_valid and (payload.get("final") or payload.get("all_ranked")):
+            return STATUS_SIGNAL_OK, ""
+        if invalid_reason.startswith("realtime_coverage_too_low"):
+            rq = payload.get("realtime_quality") or {}
+            cov = float(rq.get("coverage_ratio", 0.0) or 0.0)
+            eligible = int(rq.get("eligible_count", 0) or 0)
+            total = int(rq.get("total_count", 0) or 0)
+            if cov <= 1e-6 and eligible == 0 and total > 0:
+                return STATUS_MARKET_CLOSED, invalid_reason
+            return STATUS_DATA_QUALITY_LOW, invalid_reason
+        if invalid_reason:
+            return STATUS_INVALID_SIGNAL, invalid_reason
+        return STATUS_INVALID_SIGNAL, "empty_signal_payload"
+
+    def _days_since_initialized(self, yyyymmdd: str) -> int:
+        evt = self.storage.get_latest_event("lab_initialized")
+        if not evt:
+            return 10_000
+        raw = evt.get("payload", {}).get("date", "")
+        if not raw:
+            return 10_000
+        try:
+            d0 = datetime.strptime(str(raw), "%Y%m%d").date()
+            d1 = datetime.strptime(yyyymmdd, "%Y%m%d").date()
+            return (d1 - d0).days
+        except Exception:
+            return 10_000
+
+    def _risk_violation_count(self, agent_id: str, week_start: date, week_end: date) -> int:
+        rows = self.storage.list_events(event_type="risk_violation", limit=5000)
+        start_key = week_start.strftime("%Y%m%d")
+        end_key = week_end.strftime("%Y%m%d")
+        count = 0
+        for row in rows:
+            payload = row.get("payload", {})
+            if str(payload.get("agent_id", "")) != agent_id:
+                continue
+            d = str(payload.get("session_date", ""))
+            if not d:
+                continue
+            if start_key <= d <= end_key:
+                count += 1
+        return count
+
+    def _usdkrw_rate(self, yyyymmdd: str) -> Optional[float]:
+        default_rate = float(os.getenv("AGENT_LAB_USDKRW_DEFAULT", "1300") or 1300.0)
+        latest = self.storage.get_latest_event("fx_rate_usdkrw")
+        if latest:
+            payload = latest.get("payload", {})
+            try:
+                rate = float(payload.get("rate"))
+                d0 = datetime.fromisoformat(str(latest["created_at"])).date()
+                d1 = datetime.strptime(yyyymmdd, "%Y%m%d").date()
+                if (d1 - d0).days <= 3:
+                    return rate
+            except Exception:
+                pass
+        self.storage.log_event(
+            event_type="fx_rate_usdkrw",
+            payload={"rate": default_rate, "source": "env_default", "date": yyyymmdd},
+            created_at=now_iso(),
+        )
+        return default_rate
+
+    def init_lab(self, capital_krw: float, agents: int) -> Dict[str, Any]:
+        profiles = build_default_agent_profiles(total_capital_krw=capital_krw, count=agents)
+        for p in profiles:
+            self.storage.upsert_agent(
+                agent_id=p.agent_id,
+                name=p.name,
+                role=p.role,
+                philosophy=p.philosophy,
+                allocated_capital_krw=p.allocated_capital_krw,
+                risk_style=p.risk_style,
+                constraints=p.constraints,
+                created_at=now_iso(),
+            )
+            self.identity.ensure_identity(p)
+            self.identity.append_memory(
+                p.agent_id,
+                memory_type="init",
+                content={"message": "Agent initialized.", "capital": p.allocated_capital_krw},
+                ts=now_iso(),
+            )
+
+        self.registry.initialize_default_versions([p.agent_id for p in profiles])
+        self.storage.log_event(
+            event_type="lab_initialized",
+            payload={"capital_krw": capital_krw, "agents": len(profiles), "date": self._today_str()},
+            created_at=now_iso(),
+        )
+        return {"agents": [p.agent_id for p in profiles], "capital_krw": capital_krw}
+
+    def ingest_session(self, market: str, yyyymmdd: str) -> Dict[str, Any]:
+        market = market.strip().upper()
+        path = self._find_session_json(market, yyyymmdd)
+        if path is None:
+            raise FileNotFoundError(f"session result json not found for market={market}, date={yyyymmdd}")
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        status_code, invalid_reason = self._classify_signal(payload)
+        generated_at = str(payload.get("generated_at") or now_iso())
+        signal_valid = bool(payload.get("signal_valid", False))
+        session_signal_id = self.storage.insert_session_signal(
+            market=market,
+            session_date=yyyymmdd,
+            generated_at=generated_at,
+            signal_valid=signal_valid,
+            status_code=status_code,
+            invalid_reason=invalid_reason,
+            source_json_path=str(path),
+            payload=payload,
+            created_at=now_iso(),
+        )
+        out = {
+            "session_signal_id": session_signal_id,
+            "market": market,
+            "session_date": yyyymmdd,
+            "status_code": status_code,
+            "invalid_reason": invalid_reason,
+            "source_json_path": str(path),
+        }
+        self._write_json_artifact(yyyymmdd, f"ingest_{market.lower()}_{yyyymmdd}", out)
+        self.storage.log_event("session_ingested", out, now_iso())
+        return out
+
+    def propose_orders(self, market: str, yyyymmdd: str) -> Dict[str, Any]:
+        market = market.strip().upper()
+        signal = self.storage.get_latest_session_signal(market, yyyymmdd)
+        if signal is None:
+            self.ingest_session(market, yyyymmdd)
+            signal = self.storage.get_latest_session_signal(market, yyyymmdd)
+        if signal is None:
+            raise RuntimeError("failed to load session signal")
+
+        agents = self.storage.list_agents()
+        if not agents:
+            raise RuntimeError("no agents registered. run `init` first.")
+        output_rows: List[Dict[str, Any]] = []
+        hold_mode = self._days_since_initialized(yyyymmdd) < 28
+        usdkrw = self._usdkrw_rate(yyyymmdd) if market == "US" else 1.0
+        for agent in agents:
+            agent_id = str(agent["agent_id"])
+            profile = profile_from_agent_row(agent)
+            active = self.registry.get_active_strategy(agent_id)
+            ledger = self.accounting.rebuild_agent_ledger(agent_id)
+            day_ret, week_ret = self.accounting.daily_and_weekly_return(agent_id, yyyymmdd)
+
+            proposed_orders, rationale = self.agent_engine.propose_orders(
+                agent=profile,
+                market=market,
+                session_payload=signal["payload"],
+                params=active["params"],
+                available_cash_krw=float(ledger["cash_krw"]),
+            )
+            raw_orders = [o.__dict__ for o in proposed_orders]
+            decision = self.risk.evaluate(
+                status_code=str(signal["status_code"]),
+                allocated_capital_krw=float(agent["allocated_capital_krw"]),
+                day_return_pct=float(day_ret),
+                week_return_pct=float(week_ret),
+                current_exposure_krw=float(self.accounting.current_exposure_krw(agent_id)),
+                orders=raw_orders,
+            )
+            status = PROPOSAL_STATUS_PENDING_APPROVAL if decision.allowed else PROPOSAL_STATUS_BLOCKED
+
+            proposal_uuid = str(uuid.uuid4())
+            proposal_id = self.storage.insert_order_proposal(
+                proposal_uuid=proposal_uuid,
+                agent_id=agent_id,
+                market=market,
+                session_date=yyyymmdd,
+                strategy_version_id=int(active["strategy_version_id"]),
+                status=status,
+                blocked_reason=decision.blocked_reason,
+                orders=decision.accepted_orders,
+                rationale=rationale,
+                created_at=now_iso(),
+                updated_at=now_iso(),
+            )
+            if (not decision.allowed) and decision.blocked_reason:
+                self.storage.log_event(
+                    "risk_violation",
+                    {
+                        "agent_id": agent_id,
+                        "market": market,
+                        "session_date": yyyymmdd,
+                        "status_code": signal["status_code"],
+                        "blocked_reason": decision.blocked_reason,
+                    },
+                    now_iso(),
+                )
+            self.identity.append_memory(
+                agent_id=agent_id,
+                memory_type="proposal",
+                content={
+                    "proposal_id": proposal_id,
+                    "proposal_uuid": proposal_uuid,
+                    "market": market,
+                    "session_date": yyyymmdd,
+                    "status": status,
+                    "blocked_reason": decision.blocked_reason,
+                    "accepted_orders": decision.accepted_orders,
+                    "dropped_orders": decision.dropped_orders,
+                },
+                ts=now_iso(),
+            )
+            output_rows.append(
+                {
+                    "proposal_id": proposal_id,
+                    "proposal_uuid": proposal_uuid,
+                    "agent_id": agent_id,
+                    "status": status,
+                    "blocked_reason": decision.blocked_reason,
+                    "orders": decision.accepted_orders,
+                    "risk_metrics": decision.metrics,
+                    "fx_rate": usdkrw,
+                }
+            )
+
+        payload = {
+            "market": market,
+            "date": yyyymmdd,
+            "hold_mode_pending_approval": hold_mode,
+            "proposals": output_rows,
+        }
+        self._write_json_artifact(yyyymmdd, f"proposals_{market.lower()}_{yyyymmdd}", payload)
+        self.storage.log_event("orders_proposed", payload, now_iso())
+        return payload
+
+    def approve_orders(self, proposal_identifier: str, approved_by: str = "manual", note: str = "") -> Dict[str, Any]:
+        proposal = None
+        if proposal_identifier.isdigit():
+            proposal = self.storage.get_order_proposal_by_id(int(proposal_identifier))
+        if proposal is None:
+            proposal = self.storage.get_order_proposal_by_uuid(proposal_identifier)
+        if proposal is None:
+            raise ValueError(f"proposal not found: {proposal_identifier}")
+        if str(proposal["status"]) != PROPOSAL_STATUS_PENDING_APPROVAL:
+            raise RuntimeError(f"proposal status is not pending: {proposal['status']}")
+
+        proposal_id = int(proposal["proposal_id"])
+        market = str(proposal["market"]).upper()
+        yyyymmdd = str(proposal["session_date"])
+        agent_id = str(proposal["agent_id"])
+        fx_rate = 1.0
+        if market == "US":
+            rate = self._usdkrw_rate(yyyymmdd)
+            if rate is None:
+                self.storage.update_order_proposal_status(
+                    proposal_id=proposal_id,
+                    status=PROPOSAL_STATUS_BLOCKED,
+                    blocked_reason="fx_rate_unavailable_over_3d",
+                    updated_at=now_iso(),
+                )
+                return {"proposal_id": proposal_id, "status": PROPOSAL_STATUS_BLOCKED}
+            fx_rate = float(rate)
+
+        self.storage.insert_order_approval(
+            proposal_id=proposal_id,
+            approved_by=approved_by,
+            approved_at=now_iso(),
+            decision="APPROVE",
+            note=note,
+        )
+        fills = self.paper_broker.execute_orders(
+            proposal_id=proposal_id,
+            agent_id=agent_id,
+            market=market,
+            orders=list(proposal["orders"]),
+            fx_rate=fx_rate,
+        )
+        self.storage.update_order_proposal_status(
+            proposal_id=proposal_id,
+            status=PROPOSAL_STATUS_EXECUTED,
+            blocked_reason="",
+            updated_at=now_iso(),
+        )
+        ledger = self.accounting.upsert_daily_snapshot(agent_id=agent_id, as_of_date=yyyymmdd)
+        out = {
+            "proposal_id": proposal_id,
+            "proposal_uuid": proposal["proposal_uuid"],
+            "agent_id": agent_id,
+            "status": PROPOSAL_STATUS_EXECUTED,
+            "fills": fills,
+            "equity": ledger,
+        }
+        self._write_json_artifact(yyyymmdd, f"approval_{proposal_id}", out)
+        self.storage.log_event("orders_approved", out, now_iso())
+        return out
+
+    def daily_review(self, yyyymmdd: str) -> Dict[str, Any]:
+        agents = self.storage.list_agents()
+        if not agents:
+            raise RuntimeError("no agents registered. run `init` first.")
+        rows: List[Dict[str, Any]] = []
+        for agent in agents:
+            agent_id = str(agent["agent_id"])
+            ledger = self.accounting.upsert_daily_snapshot(agent_id=agent_id, as_of_date=yyyymmdd)
+            rows.append(
+                {
+                    "agent_id": agent_id,
+                    "equity_krw": ledger["equity_krw"],
+                    "cash_krw": ledger["cash_krw"],
+                    "drawdown": ledger["drawdown"],
+                    "volatility": ledger["volatility"],
+                    "win_rate": ledger["win_rate"],
+                    "profit_factor": ledger["profit_factor"],
+                    "turnover": ledger["turnover"],
+                    "max_consecutive_loss": ledger["max_consecutive_loss"],
+                }
+            )
+            self.identity.append_memory(
+                agent_id=agent_id,
+                memory_type="daily_review",
+                content={"date": yyyymmdd, "metrics": rows[-1]},
+                ts=now_iso(),
+            )
+
+        markdown_lines = [f"# Daily Review {yyyymmdd}", "", "|Agent|Equity(KRW)|Drawdown|Volatility|WinRate|PF|Turnover|", "|---|---:|---:|---:|---:|---:|---:|"]
+        for r in rows:
+            markdown_lines.append(
+                f"|{r['agent_id']}|{r['equity_krw']:.0f}|{r['drawdown']:.4f}|{r['volatility']:.4f}|"
+                f"{r['win_rate']:.4f}|{r['profit_factor']:.4f}|{r['turnover']:.4f}|"
+            )
+        markdown = "\n".join(markdown_lines)
+        payload = {"date": yyyymmdd, "rows": rows}
+        self.storage.upsert_daily_review(yyyymmdd, payload, markdown, now_iso())
+        self._write_json_artifact(yyyymmdd, f"daily_review_{yyyymmdd}", payload)
+        self._write_text_artifact(yyyymmdd, f"daily_review_{yyyymmdd}", markdown)
+        self.storage.log_event("daily_review", payload, now_iso())
+        return payload
+
+    def _weekly_score_board(self, week_rows: List[Dict[str, Any]]) -> Dict[str, float]:
+        if not week_rows:
+            return {}
+        normalized_rows: List[Dict[str, Any]] = []
+        for row in week_rows:
+            copied = dict(row)
+            copied["_drawdown_loss"] = max(0.0, -float(row.get("drawdown", 0.0) or 0.0))
+            normalized_rows.append(copied)
+
+        metrics = ["return_pct", "_drawdown_loss", "volatility", "win_rate", "profit_factor"]
+        bounds: Dict[str, Tuple[float, float]] = {}
+        for m in metrics:
+            vals = [float(r[m]) for r in normalized_rows]
+            bounds[m] = (min(vals), max(vals))
+
+        def norm(val: float, m: str, reverse: bool = False) -> float:
+            lo, hi = bounds[m]
+            if abs(hi - lo) < 1e-12:
+                return 0.5
+            score = (val - lo) / (hi - lo)
+            return 1.0 - score if reverse else score
+
+        score_board: Dict[str, float] = {}
+        for r in normalized_rows:
+            s = (
+                0.40 * norm(float(r["return_pct"]), "return_pct")
+                + 0.25 * norm(float(r["_drawdown_loss"]), "_drawdown_loss", reverse=True)
+                + 0.15 * norm(float(r["volatility"]), "volatility", reverse=True)
+                + 0.10 * norm(float(r["win_rate"]), "win_rate")
+                + 0.10 * norm(float(r["profit_factor"]), "profit_factor")
+            )
+            score_board[str(r["agent_id"])] = s
+        return score_board
+
+    def weekly_council(self, week_id: str) -> Dict[str, Any]:
+        week_start, week_end = parse_week_id(week_id)
+        agents = self.storage.list_agents()
+        if not agents:
+            raise RuntimeError("no agents registered. run `init` first.")
+        week_rows: List[Dict[str, Any]] = []
+        for agent in agents:
+            aid = str(agent["agent_id"])
+            curve = self.storage.list_equity_curve(
+                agent_id=aid,
+                date_from=week_start.strftime("%Y%m%d"),
+                date_to=week_end.strftime("%Y%m%d"),
+            )
+            if not curve:
+                continue
+            curve = sorted(curve, key=lambda x: str(x["as_of_date"]))
+            first_eq = float(curve[0]["equity_krw"])
+            last_eq = float(curve[-1]["equity_krw"])
+            ret = ((last_eq / first_eq) - 1.0) if first_eq > 0 else 0.0
+            row = {
+                "agent_id": aid,
+                "return_pct": ret,
+                "drawdown": float(min(float(x["drawdown"]) for x in curve)),
+                "volatility": float(curve[-1]["volatility"]),
+                "win_rate": float(curve[-1]["win_rate"]),
+                "profit_factor": float(curve[-1]["profit_factor"]),
+                "turnover": float(curve[-1]["turnover"]),
+                "max_consecutive_loss": int(curve[-1]["max_consecutive_loss"]),
+            }
+            week_rows.append(row)
+
+        scores = self._weekly_score_board(week_rows)
+        scored_rows: List[Dict[str, Any]] = []
+        for row in week_rows:
+            aid = str(row["agent_id"])
+            scored_rows.append(
+                {
+                    **row,
+                    "score": float(scores.get(aid, 0.0)),
+                    "risk_violations": self._risk_violation_count(aid, week_start, week_end),
+                }
+            )
+        scored_rows.sort(
+            key=lambda r: (
+                float(r["score"]),
+                -float(r["turnover"]),
+                -int(r["max_consecutive_loss"]),
+                -float(r["risk_violations"]),
+            ),
+            reverse=True,
+        )
+        champion = str(scored_rows[0]["agent_id"]) if scored_rows else ""
+        promoted_versions: Dict[str, str] = {}
+        prev_week = (week_start - timedelta(days=1)).isocalendar()
+        prev_week_id = f"{prev_week.year}-W{prev_week.week:02d}"
+        prev_decision = self.storage.query_one(
+            "SELECT decision_json FROM weekly_councils WHERE week_id = ?",
+            (prev_week_id,),
+        )
+        prev_scores: Dict[str, float] = {}
+        prev_risk: Dict[str, int] = {}
+        if prev_decision:
+            try:
+                decoded = json.loads(str(prev_decision.get("decision_json") or "{}"))
+                if isinstance(decoded, dict):
+                    prev_scores = dict(decoded.get("score_board", {}))
+                    prev_rows = list(decoded.get("rows_scored", []))
+                    for r in prev_rows:
+                        aid = str(r.get("agent_id", ""))
+                        prev_risk[aid] = int(r.get("risk_violations", 0) or 0)
+            except Exception:
+                prev_scores = {}
+                prev_risk = {}
+
+        for agent in agents:
+            aid = str(agent["agent_id"])
+            profile = profile_from_agent_row(agent)
+            active = self.registry.get_active_strategy(aid)
+            row = next((x for x in scored_rows if x["agent_id"] == aid), {})
+            params = self.agent_engine.suggest_weekly_params(
+                agent=profile,
+                active_params=dict(active["params"]),
+                last_week_metrics=row,
+            )
+            current_score = float(scores.get(aid, 0.0))
+            current_risk = int(row.get("risk_violations", 0) or 0) if row else 0
+            prev_score = float(prev_scores.get(aid, 0.0))
+            prev_risk_count = int(prev_risk.get(aid, 0) or 0)
+            promote = (
+                current_score >= PROMOTION_SCORE_THRESHOLD
+                and prev_score >= PROMOTION_SCORE_THRESHOLD
+                and current_risk == 0
+                and prev_risk_count == 0
+            )
+            reg = self.registry.register_strategy_version(
+                agent_id=aid,
+                params=params,
+                notes=(
+                    f"weekly council update ({week_id}); "
+                    f"score={current_score:.4f}, prev_score={prev_score:.4f}, "
+                    f"risk={current_risk}, prev_risk={prev_risk_count}, promote={promote}"
+                ),
+                promote=promote,
+            )
+            if promote:
+                promoted_versions[aid] = reg["version_tag"]
+
+        decision = {
+            "week_id": week_id,
+            "champion_agent_id": champion,
+            "score_board": scores,
+            "rows": week_rows,
+            "rows_scored": scored_rows,
+            "promoted_versions": promoted_versions,
+            "promotion_score_threshold": PROMOTION_SCORE_THRESHOLD,
+            "promotion_rule": "current_score>=threshold && prev_score>=threshold && current_week_risk_violations==0 && prev_week_risk_violations==0",
+        }
+        markdown = (
+            f"# Weekly Council {week_id}\n\n"
+            f"- Champion: `{champion}`\n"
+            f"- Scores: `{scores}`\n"
+            f"- Promoted Versions: `{promoted_versions}`\n"
+        )
+        stamp = week_end.strftime("%Y%m%d")
+        self.storage.upsert_weekly_council(week_id, champion, decision, markdown, now_iso())
+        self.identity.save_checkpoint(week_id, decision)
+        self._write_json_artifact(stamp, f"weekly_council_{week_id.replace('-', '_')}", decision)
+        self._write_text_artifact(stamp, f"weekly_council_{week_id.replace('-', '_')}", markdown)
+        self.storage.log_event("weekly_council", decision, now_iso())
+        return decision
+
+    def report(self, date_from: str, date_to: str) -> Dict[str, Any]:
+        agents = self.storage.list_agents()
+        if not agents:
+            raise RuntimeError("no agents registered. run `init` first.")
+        rows: List[Dict[str, Any]] = []
+        for agent in agents:
+            aid = str(agent["agent_id"])
+            curve = self.storage.list_equity_curve(agent_id=aid, date_from=date_from, date_to=date_to)
+            if not curve:
+                rows.append({"agent_id": aid, "has_data": False})
+                continue
+            first_eq = float(curve[0]["equity_krw"])
+            last_eq = float(curve[-1]["equity_krw"])
+            ret = ((last_eq / first_eq) - 1.0) if first_eq > 0 else 0.0
+            rows.append(
+                {
+                    "agent_id": aid,
+                    "has_data": True,
+                    "equity_start": first_eq,
+                    "equity_end": last_eq,
+                    "return_pct": ret,
+                    "mdd": min(float(x["drawdown"]) for x in curve),
+                    "volatility": float(curve[-1]["volatility"]),
+                    "win_rate": float(curve[-1]["win_rate"]),
+                    "profit_factor": float(curve[-1]["profit_factor"]),
+                    "turnover": float(curve[-1]["turnover"]),
+                    "max_consecutive_loss": int(curve[-1]["max_consecutive_loss"]),
+                }
+            )
+        payload = {"from": date_from, "to": date_to, "rows": rows}
+        out_day = self._today_str()
+        self._write_json_artifact(out_day, f"report_{date_from}_{date_to}", payload)
+        lines = [f"# Agent Lab Report {date_from}~{date_to}", "", "|Agent|Return|MDD|Vol|WinRate|PF|Turnover|", "|---|---:|---:|---:|---:|---:|---:|"]
+        for r in rows:
+            if not r.get("has_data"):
+                lines.append(f"|{r['agent_id']}|N/A|N/A|N/A|N/A|N/A|N/A|")
+            else:
+                lines.append(
+                    f"|{r['agent_id']}|{r['return_pct']:.4f}|{r['mdd']:.4f}|{r['volatility']:.4f}|"
+                    f"{r['win_rate']:.4f}|{r['profit_factor']:.4f}|{r['turnover']:.4f}|"
+                )
+        self._write_text_artifact(out_day, f"report_{date_from}_{date_to}", "\n".join(lines))
+        self.storage.log_event("report_generated", payload, now_iso())
+        return payload
