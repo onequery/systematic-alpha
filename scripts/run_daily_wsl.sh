@@ -6,8 +6,9 @@ cd "$ROOT_DIR"
 
 if [[ -f ".env" ]]; then
   set -a
-  # shellcheck disable=SC1091
-  source ".env"
+  # BOM/CRLF-safe load for .env.
+  # shellcheck disable=SC1090
+  source <(awk 'NR==1{sub(/^\xef\xbb\xbf/,"")} {sub(/\r$/,"")}1' ".env")
   set +a
 fi
 

@@ -22,7 +22,16 @@ def _truncate(text: str, max_chars: int = 3500) -> str:
     body = str(text or "")
     if len(body) <= max_chars:
         return body
-    return body[:max_chars] + "\n...(truncated)..."
+    return body[:max_chars] + "\n...(중략)..."
+
+
+def _parse_csv_set(value: str) -> set[str]:
+    out: set[str] = set()
+    for raw in str(value or "").split(","):
+        token = raw.strip().lower()
+        if token:
+            out.add(token)
+    return out
 
 
 class TelegramNotifier:
@@ -45,9 +54,20 @@ class TelegramNotifier:
         self.session = requests.Session()
         if not _truthy(os.getenv("AGENT_LAB_TELEGRAM_USE_ENV_PROXY", "0")):
             self.session.trust_env = False
+        default_events = "trade_executed,preopen_plan,session_close_report,weekly_council"
+        raw_events = os.getenv("AGENT_LAB_NOTIFY_EVENTS", default_events)
+        self.allowed_events = _parse_csv_set(raw_events)
 
-    def send(self, text: str) -> bool:
+    def _allow_event(self, event: str) -> bool:
+        if "*" in self.allowed_events:
+            return True
+        key = str(event or "").strip().lower()
+        return key in self.allowed_events
+
+    def send(self, text: str, *, event: str = "misc") -> bool:
         if not self.enabled:
+            return False
+        if not self._allow_event(event):
             return False
         payload: Dict[str, Any] = {
             "chat_id": self.chat_id,

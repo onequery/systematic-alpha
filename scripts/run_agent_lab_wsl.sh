@@ -6,8 +6,9 @@ cd "$ROOT_DIR"
 
 if [[ -f ".env" ]]; then
   set -a
-  # shellcheck disable=SC1091
-  source ".env"
+  # BOM/CRLF-safe load for .env.
+  # shellcheck disable=SC1090
+  source <(awk 'NR==1{sub(/^\xef\xbb\xbf/,"")} {sub(/\r$/,"")}1' ".env")
   set +a
 fi
 
@@ -38,6 +39,7 @@ PYTHON_BIN="$(resolve_python_bin)"
 ACTION="ingest-propose"
 MARKET="KR"
 RUN_DATE="$(TZ=Asia/Seoul date +%Y%m%d)"
+DATE_EXPLICIT="0"
 WEEK_ID=""
 CAPITAL_KRW=10000000
 AGENTS=3
@@ -56,13 +58,12 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --action) ACTION="${2:-ingest-propose}"; shift 2 ;;
     --market) MARKET="$(echo "${2:-KR}" | tr '[:lower:]' '[:upper:]')"; shift 2 ;;
-    --date) RUN_DATE="${2:-$RUN_DATE}"; shift 2 ;;
+    --date) RUN_DATE="${2:-$RUN_DATE}"; DATE_EXPLICIT="1"; shift 2 ;;
     --week) WEEK_ID="${2:-}"; shift 2 ;;
     --capital-krw) CAPITAL_KRW="${2:-10000000}"; shift 2 ;;
     --agents) AGENTS="${2:-3}"; shift 2 ;;
     --from) DATE_FROM="${2:-}"; shift 2 ;;
     --to) DATE_TO="${2:-}"; shift 2 ;;
-    --auto-approve) shift ;; # backward compatible no-op (always auto-execute)
     --chat-once) CHAT_ONCE="1"; shift ;;
     --auto-strategy-once) AUTO_STRATEGY_ONCE="1"; shift ;;
     --chat-poll-timeout) CHAT_POLL_TIMEOUT="${2:-25}"; shift 2 ;;
@@ -74,6 +75,14 @@ while [[ $# -gt 0 ]]; do
     *) echo "Unknown arg: $1" >&2; exit 2 ;;
   esac
 done
+
+if [[ "$DATE_EXPLICIT" != "1" && "$MARKET" == "US" ]]; then
+  # US close-time tasks run on KST early morning; map to previous KST session date.
+  HOUR_KST="$(TZ=Asia/Seoul date +%H)"
+  if (( 10#$HOUR_KST < 9 )); then
+    RUN_DATE="$(TZ=Asia/Seoul date -d '1 day' +%Y%m%d)"
+  fi
+fi
 
 RUN_STAMP="$(TZ=Asia/Seoul date +%Y%m%d_%H%M%S)"
 LOG_DIR="$ROOT_DIR/logs/agent_lab/$RUN_DATE"
@@ -96,7 +105,7 @@ case "$ACTION" in
     ;;
   ingest-propose)
     run_cli ingest-session --market "$MARKET" --date "$RUN_DATE"
-    run_cli propose-orders --market "$MARKET" --date "$RUN_DATE" --auto-execute
+    run_cli propose-orders --market "$MARKET" --date "$RUN_DATE"
     ;;
   daily-review)
     run_cli daily-review --date "$RUN_DATE"
@@ -112,6 +121,12 @@ case "$ACTION" in
     if [[ -z "$DATE_FROM" ]]; then DATE_FROM="$RUN_DATE"; fi
     if [[ -z "$DATE_TO" ]]; then DATE_TO="$RUN_DATE"; fi
     run_cli report --from "$DATE_FROM" --to "$DATE_TO"
+    ;;
+  preopen-plan)
+    run_cli preopen-plan --market "$MARKET" --date "$RUN_DATE"
+    ;;
+  close-report)
+    run_cli close-report --market "$MARKET" --date "$RUN_DATE"
     ;;
   telegram-chat)
     if [[ "$CHAT_ONCE" == "1" ]]; then

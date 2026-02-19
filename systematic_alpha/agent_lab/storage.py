@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from contextlib import contextmanager
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -907,3 +908,120 @@ class AgentLabStorage:
         for row in rows:
             row["payload"] = json.loads(row.pop("payload_json"))
         return rows
+
+    def cleanup_legacy_runtime_state(self, *, retain_days: int = 30, keep_agent_memories: int = 300) -> Dict[str, int]:
+        retain_days = max(1, int(retain_days))
+        keep_agent_memories = max(50, int(keep_agent_memories))
+        cutoff_dt = datetime.now() - timedelta(days=retain_days)
+        cutoff_iso = cutoff_dt.isoformat(timespec="seconds")
+        cutoff_date = cutoff_dt.strftime("%Y%m%d")
+
+        legacy_payload_markers = [
+            "%PENDING_APPROVAL%",
+            "%approval flow%",
+            "%scheduled_daily%",
+            "%not always-on loop%",
+            "%max_daily_picks=3%",
+            "%exposure_cap_ratio=0.95%",
+            "%collect_seconds=600%",
+            "%Hard Constraints%",
+        ]
+
+        removed = {
+            "order_approvals_removed": 0,
+            "order_proposals_removed": 0,
+            "session_signals_removed": 0,
+            "state_events_removed": 0,
+            "daily_reviews_removed": 0,
+            "agent_memories_trimmed": 0,
+        }
+
+        with self.tx():
+            proposal_rows = self.query_all(
+                """
+                SELECT op.proposal_id
+                FROM order_proposals op
+                WHERE (
+                    op.status = 'PENDING_APPROVAL'
+                    OR op.blocked_reason = 'legacy_cleanup_no_manual_approval'
+                    OR (
+                        op.status IN ('APPROVED', 'BLOCKED', 'REJECTED')
+                        AND op.created_at < ?
+                        AND NOT EXISTS (
+                            SELECT 1
+                            FROM paper_orders po
+                            WHERE po.proposal_id = op.proposal_id
+                        )
+                    )
+                )
+                """,
+                (cutoff_iso,),
+            )
+            proposal_ids = [int(row["proposal_id"]) for row in proposal_rows]
+            if proposal_ids:
+                placeholders = ",".join("?" for _ in proposal_ids)
+                cur = self.execute(
+                    f"DELETE FROM order_approvals WHERE proposal_id IN ({placeholders})",
+                    tuple(proposal_ids),
+                )
+                removed["order_approvals_removed"] = int(cur.rowcount or 0)
+                cur = self.execute(
+                    f"DELETE FROM order_proposals WHERE proposal_id IN ({placeholders})",
+                    tuple(proposal_ids),
+                )
+                removed["order_proposals_removed"] = int(cur.rowcount or 0)
+
+            cur = self.execute(
+                """
+                DELETE FROM session_signals
+                WHERE created_at < ?
+                """,
+                (cutoff_iso,),
+            )
+            removed["session_signals_removed"] = int(cur.rowcount or 0)
+
+            where_markers = " OR ".join(["payload_json LIKE ?"] * len(legacy_payload_markers))
+            cur = self.execute(
+                f"""
+                DELETE FROM state_events
+                WHERE created_at < ?
+                   OR ({where_markers})
+                """,
+                tuple([cutoff_iso] + legacy_payload_markers),
+            )
+            removed["state_events_removed"] = int(cur.rowcount or 0)
+
+            cur = self.execute(
+                """
+                DELETE FROM daily_reviews
+                WHERE review_date < ?
+                """,
+                (cutoff_date,),
+            )
+            removed["daily_reviews_removed"] = int(cur.rowcount or 0)
+
+            agents = self.query_all("SELECT agent_id FROM agents WHERE is_active = 1")
+            for agent in agents:
+                aid = str(agent.get("agent_id", ""))
+                if not aid:
+                    continue
+                stale_rows = self.query_all(
+                    """
+                    SELECT memory_id
+                    FROM agent_memories
+                    WHERE agent_id = ?
+                    ORDER BY created_at DESC, memory_id DESC
+                    LIMIT -1 OFFSET ?
+                    """,
+                    (aid, keep_agent_memories),
+                )
+                stale_ids = [int(row["memory_id"]) for row in stale_rows]
+                if stale_ids:
+                    placeholders = ",".join("?" for _ in stale_ids)
+                    cur = self.execute(
+                        f"DELETE FROM agent_memories WHERE memory_id IN ({placeholders})",
+                        tuple(stale_ids),
+                    )
+                    removed["agent_memories_trimmed"] += int(cur.rowcount or 0)
+
+        return removed

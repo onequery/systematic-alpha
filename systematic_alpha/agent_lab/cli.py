@@ -36,7 +36,6 @@ def parse_args() -> argparse.Namespace:
     p_prop = sub.add_parser("propose-orders")
     p_prop.add_argument("--market", type=str, choices=["KR", "US", "kr", "us"], required=True)
     p_prop.add_argument("--date", type=str, required=True)
-    p_prop.add_argument("--auto-execute", dest="auto_execute", action="store_true", default=True)
 
     p_daily = sub.add_parser("daily-review")
     p_daily.add_argument("--date", type=str, required=True)
@@ -48,8 +47,19 @@ def parse_args() -> argparse.Namespace:
     p_report.add_argument("--from", dest="date_from", type=str, required=True)
     p_report.add_argument("--to", dest="date_to", type=str, required=True)
 
+    p_preopen = sub.add_parser("preopen-plan")
+    p_preopen.add_argument("--market", type=str, choices=["KR", "US", "kr", "us"], required=True)
+    p_preopen.add_argument("--date", type=str, required=True)
+
+    p_close = sub.add_parser("close-report")
+    p_close.add_argument("--market", type=str, choices=["KR", "US", "kr", "us"], required=True)
+    p_close.add_argument("--date", type=str, required=True)
+
     p_sanitize = sub.add_parser("sanitize-state")
     p_sanitize.add_argument("--skip-pending-cleanup", action="store_true")
+    p_sanitize.add_argument("--skip-runtime-cleanup", action="store_true")
+    p_sanitize.add_argument("--retain-days", type=int, default=30)
+    p_sanitize.add_argument("--keep-agent-memories", type=int, default=300)
 
     p_chat = sub.add_parser("telegram-chat")
     p_chat.add_argument("--poll-timeout", type=int, default=25)
@@ -123,7 +133,6 @@ def main() -> None:
             payload = orchestrator.propose_orders(
                 market=str(args.market).upper(),
                 yyyymmdd=args.date,
-                auto_execute=args.auto_execute,
             )
         elif cmd == "daily-review":
             payload = orchestrator.daily_review(yyyymmdd=args.date)
@@ -131,9 +140,22 @@ def main() -> None:
             payload = orchestrator.weekly_council(week_id=args.week)
         elif cmd == "report":
             payload = orchestrator.report(date_from=args.date_from, date_to=args.date_to)
+        elif cmd == "preopen-plan":
+            payload = orchestrator.preopen_plan_report(
+                market=str(args.market).upper(),
+                yyyymmdd=args.date,
+            )
+        elif cmd == "close-report":
+            payload = orchestrator.session_close_report(
+                market=str(args.market).upper(),
+                yyyymmdd=args.date,
+            )
         elif cmd == "sanitize-state":
             payload = orchestrator.sanitize_legacy_constraints(
-                clean_pending_proposals=not bool(args.skip_pending_cleanup)
+                clean_pending_proposals=not bool(args.skip_pending_cleanup),
+                cleanup_runtime_state=not bool(args.skip_runtime_cleanup),
+                retain_days=int(args.retain_days),
+                keep_agent_memories=int(args.keep_agent_memories),
             )
         else:
             raise RuntimeError(f"unsupported command: {cmd}")

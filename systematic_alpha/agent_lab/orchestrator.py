@@ -20,7 +20,6 @@ from systematic_alpha.agent_lab.schemas import (
     PROPOSAL_STATUS_APPROVED,
     PROPOSAL_STATUS_BLOCKED,
     PROPOSAL_STATUS_EXECUTED,
-    PROPOSAL_STATUS_PENDING_APPROVAL,
     STATUS_DATA_QUALITY_LOW,
     STATUS_INVALID_SIGNAL,
     STATUS_MARKET_CLOSED,
@@ -99,8 +98,38 @@ class AgentLabOrchestrator:
         with path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
-    def _notify(self, text: str) -> None:
-        self.notifier.send(text)
+    def _notify(self, text: str, *, event: str = "misc") -> None:
+        self.notifier.send(text, event=event)
+
+    def _llm_explain(
+        self,
+        *,
+        topic: str,
+        context: Dict[str, Any],
+        fallback: str,
+        max_chars: int = 280,
+    ) -> str:
+        fallback_text = str(fallback or "").strip()
+        response = self.llm.generate_json(
+            system_prompt=(
+                "당신은 트레이딩 운영 리포트 작성자다. "
+                "입력 컨텍스트를 바탕으로 한국어 설명 1문장을 작성하고 JSON으로만 응답하라. "
+                "키는 summary 하나만 사용한다."
+            ),
+            user_prompt=(
+                f"topic={topic}\n"
+                f"context={json.dumps(context, ensure_ascii=False)}\n"
+                "설명은 간결하고 실행 가능한 관찰 위주로 작성하라."
+            ),
+            fallback={"summary": fallback_text},
+            temperature=0.2,
+        )
+        result = response.get("result", {})
+        if isinstance(result, dict):
+            text = str(result.get("summary", "")).strip()
+            if text:
+                return text[:max_chars]
+        return fallback_text[:max_chars]
 
     @staticmethod
     def _build_symbol_name_map_from_payload(payload: Dict[str, Any]) -> Dict[str, str]:
@@ -126,6 +155,25 @@ class AgentLabOrchestrator:
             return {}
         return self._build_symbol_name_map_from_payload(payload)
 
+    def _latest_proposal_by_agent_market(self, agent_id: str, market: str) -> Optional[Dict[str, Any]]:
+        row = self.storage.query_one(
+            """
+            SELECT *
+            FROM order_proposals
+            WHERE agent_id = ? AND market = ?
+            ORDER BY created_at DESC, proposal_id DESC
+            LIMIT 1
+            """,
+            (str(agent_id), str(market).upper()),
+        )
+        if row is None:
+            return None
+        try:
+            row["orders"] = json.loads(str(row.pop("orders_json") or "[]"))
+        except Exception:
+            row["orders"] = []
+        return row
+
     @staticmethod
     def _orders_to_text(
         orders: List[Dict[str, Any]],
@@ -133,16 +181,30 @@ class AgentLabOrchestrator:
         symbol_name_map: Optional[Dict[str, str]] = None,
     ) -> str:
         if not orders:
-            return "none"
+            return "없음"
         chunks: List[str] = []
         name_map = symbol_name_map or {}
+        side_map = {
+            "BUY": "매수",
+            "SELL": "매도",
+        }
+        status_map = {
+            "FILLED": "체결",
+            "REJECTED": "거부",
+            "CANCELED": "취소",
+            "BLOCKED": "차단",
+            "EXECUTED": "실행",
+            "APPROVED": "승인",
+        }
         for row in orders[:limit]:
-            side = str(row.get("side", ""))
+            side_raw = str(row.get("side", "")).strip().upper()
+            side = side_map.get(side_raw, str(row.get("side", "")))
             symbol = str(row.get("symbol", "")).strip().upper()
             company_name = str(name_map.get(symbol, "")).strip()
             symbol_text = f"{symbol}({company_name})" if company_name else symbol
             qty = float(row.get("quantity", 0.0) or 0.0)
-            status = str(row.get("status", "")).strip()
+            status_raw = str(row.get("status", "")).strip().upper()
+            status = status_map.get(status_raw, str(row.get("status", "")).strip())
             if status:
                 chunks.append(f"{side} {symbol_text} x{qty:.0f} ({status})")
             else:
@@ -335,13 +397,22 @@ class AgentLabOrchestrator:
         payload = {"agents": [p.agent_id for p in profiles], "capital_krw": capital_krw}
         self._append_activity_artifact(self._today_str(), "lab_initialized", payload)
         self._notify(
-            "[AgentLab] init\n"
-            f"capital_krw={capital_krw:.0f}\n"
-            f"agents={', '.join(payload['agents'])}"
+            "[AgentLab] 초기화\n"
+            f"초기자본(원화)={capital_krw:.0f}\n"
+            f"에이전트={', '.join(payload['agents'])}"
+            ,
+            event="init",
         )
         return payload
 
-    def sanitize_legacy_constraints(self, *, clean_pending_proposals: bool = True) -> Dict[str, Any]:
+    def sanitize_legacy_constraints(
+        self,
+        *,
+        clean_pending_proposals: bool = True,
+        cleanup_runtime_state: bool = True,
+        retain_days: int = 30,
+        keep_agent_memories: int = 300,
+    ) -> Dict[str, Any]:
         agents = self.storage.list_agents()
         if not agents:
             raise RuntimeError("no agents registered. run `init` first.")
@@ -415,18 +486,38 @@ class AgentLabOrchestrator:
                 updated_at=now_iso(),
             )
 
+        runtime_cleanup = {
+            "order_approvals_removed": 0,
+            "order_proposals_removed": 0,
+            "session_signals_removed": 0,
+            "state_events_removed": 0,
+            "daily_reviews_removed": 0,
+            "agent_memories_trimmed": 0,
+        }
+        if cleanup_runtime_state:
+            runtime_cleanup = self.storage.cleanup_legacy_runtime_state(
+                retain_days=int(retain_days),
+                keep_agent_memories=int(keep_agent_memories),
+            )
+
         payload = {
             "agents": per_agent,
             "pending_proposals_cleaned": pending_cleaned,
             "clean_pending_proposals": bool(clean_pending_proposals),
+            "cleanup_runtime_state": bool(cleanup_runtime_state),
+            "runtime_cleanup": runtime_cleanup,
+            "retain_days": int(retain_days),
+            "keep_agent_memories": int(keep_agent_memories),
             "updated_at": now_iso(),
         }
         self.storage.log_event("sanitize_legacy_constraints", payload, now_iso())
         self._append_activity_artifact(self._today_str(), "sanitize_legacy_constraints", payload)
         self._notify(
-            "[AgentLab] sanitize-legacy-constraints\n"
-            f"agents={len(per_agent)}\n"
-            f"pending_cleaned={pending_cleaned}"
+            "[AgentLab] 레거시 제약 정리\n"
+            f"대상_에이전트={len(per_agent)}\n"
+            f"정리된_대기건수={pending_cleaned}"
+            ,
+            event="sanitize",
         )
         return payload
 
@@ -462,11 +553,13 @@ class AgentLabOrchestrator:
         self.storage.log_event("session_ingested", out, now_iso())
         self._append_activity_artifact(yyyymmdd, "session_ingested", out)
         self._notify(
-            "[AgentLab] ingest-session\n"
-            f"market={market}\n"
-            f"date={yyyymmdd}\n"
-            f"status={status_code}\n"
-            f"invalid_reason={invalid_reason or '-'}"
+            "[AgentLab] 세션 인제스트\n"
+            f"시장={market}\n"
+            f"일자={yyyymmdd}\n"
+            f"상태={status_code}\n"
+            f"무효_사유={invalid_reason or '-'}"
+            ,
+            event="ingest_session",
         )
         return out
 
@@ -485,11 +578,10 @@ class AgentLabOrchestrator:
         if signal is None:
             raise RuntimeError("failed to load session signal")
 
-        requested_auto_execute = auto_execute
-        if auto_execute is None:
-            auto_execute = _truthy(os.getenv("AGENT_LAB_AUTO_APPROVE", "1"))
         # Agent-first repository policy: order proposals are always auto-executed.
-        if not bool(auto_execute):
+        requested_auto_execute = auto_execute
+        auto_execute = True
+        if requested_auto_execute is False:
             self.storage.log_event(
                 "auto_execute_forced",
                 {
@@ -500,7 +592,6 @@ class AgentLabOrchestrator:
                 },
                 now_iso(),
             )
-            auto_execute = True
 
         agents = self.storage.list_agents()
         if not agents:
@@ -558,11 +649,7 @@ class AgentLabOrchestrator:
                 ),
                 position_qty_by_symbol=position_qty_by_symbol,
             )
-            status = (
-                PROPOSAL_STATUS_APPROVED
-                if decision.allowed and bool(auto_execute)
-                else (PROPOSAL_STATUS_PENDING_APPROVAL if decision.allowed else PROPOSAL_STATUS_BLOCKED)
-            )
+            status = PROPOSAL_STATUS_APPROVED if decision.allowed else PROPOSAL_STATUS_BLOCKED
 
             proposal_uuid = str(uuid.uuid4())
             proposal_id = self.storage.insert_order_proposal(
@@ -663,7 +750,6 @@ class AgentLabOrchestrator:
         payload = {
             "market": market,
             "date": yyyymmdd,
-            "hold_mode_pending_approval": False,
             "auto_execute": bool(auto_execute),
             "proposals": output_rows,
             "execution_results": execution_results,
@@ -673,20 +759,26 @@ class AgentLabOrchestrator:
         self._append_activity_artifact(yyyymmdd, "orders_proposed", payload)
 
         lines = [
-            "[AgentLab] propose",
-            f"market={market}",
-            f"date={yyyymmdd}",
-            f"auto_execute={bool(auto_execute)}",
+            "[AgentLab] 주문 제안",
+            f"시장={market}",
+            f"일자={yyyymmdd}",
+            f"자동실행={bool(auto_execute)}",
         ]
+        status_ko = {
+            PROPOSAL_STATUS_APPROVED: "승인됨",
+            PROPOSAL_STATUS_EXECUTED: "실행됨",
+            PROPOSAL_STATUS_BLOCKED: "차단됨",
+        }
         for row in output_rows:
+            row_status = status_ko.get(str(row.get("status", "")), str(row.get("status", "")))
             lines.append(
-                f"{row.get('agent_id')}: {row.get('status')} | "
+                f"{row.get('agent_id')}: {row_status} | "
                 f"{self._orders_to_text(list(row.get('orders') or []), limit=3, symbol_name_map=symbol_name_map)}"
             )
         if execution_results:
             ok_count = sum(1 for x in execution_results if bool(x.get("ok")))
-            lines.append(f"auto_execution_result={ok_count}/{len(execution_results)} success")
-        self._notify("\n".join(lines))
+            lines.append(f"자동실행_결과={ok_count}/{len(execution_results)} 성공")
+        self._notify("\n".join(lines), event="propose")
         return payload
 
     def _execute_proposal(
@@ -704,7 +796,7 @@ class AgentLabOrchestrator:
             proposal = self.storage.get_order_proposal_by_uuid(proposal_identifier)
         if proposal is None:
             raise ValueError(f"proposal not found: {proposal_identifier}")
-        expected = allowed_statuses or [PROPOSAL_STATUS_PENDING_APPROVAL]
+        expected = allowed_statuses or [PROPOSAL_STATUS_APPROVED]
         current_status = str(proposal["status"])
         if current_status not in expected:
             raise RuntimeError(
@@ -728,10 +820,12 @@ class AgentLabOrchestrator:
                 blocked = {"proposal_id": proposal_id, "status": PROPOSAL_STATUS_BLOCKED}
                 self._append_activity_artifact(yyyymmdd, "orders_approval_blocked", blocked)
                 self._notify(
-                    "[AgentLab] trade-blocked\n"
-                    f"proposal_id={proposal_id}\n"
-                    f"agent={agent_id}\n"
-                    "reason=fx_rate_unavailable_over_3d"
+                    "[AgentLab] 거래 차단\n"
+                    f"제안ID={proposal_id}\n"
+                    f"에이전트={agent_id}\n"
+                    "사유=fx_rate_unavailable_over_3d"
+                    ,
+                    event="trade_blocked",
                 )
                 return blocked
             fx_rate = float(rate)
@@ -770,12 +864,14 @@ class AgentLabOrchestrator:
         self.storage.log_event("orders_approved", out, now_iso())
         self._append_activity_artifact(yyyymmdd, "orders_approved", out)
         self._notify(
-            "[AgentLab] trade-executed\n"
-            f"market={market}\n"
-            f"date={yyyymmdd}\n"
-            f"agent={agent_id}\n"
-            f"proposal_id={proposal_id}\n"
-            f"fills={self._orders_to_text(fills, limit=5, symbol_name_map=symbol_name_map)}"
+            "[AgentLab] 거래 실행\n"
+            f"시장={market}\n"
+            f"일자={yyyymmdd}\n"
+            f"에이전트={agent_id}\n"
+            f"제안ID={proposal_id}\n"
+            f"체결={self._orders_to_text(fills, limit=5, symbol_name_map=symbol_name_map)}"
+            ,
+            event="trade_executed",
         )
         return out
 
@@ -784,8 +880,330 @@ class AgentLabOrchestrator:
             proposal_identifier=proposal_identifier,
             approved_by=approved_by,
             note=note,
-            allowed_statuses=[PROPOSAL_STATUS_PENDING_APPROVAL],
+            allowed_statuses=[PROPOSAL_STATUS_APPROVED],
         )
+
+    def preopen_plan_report(self, market: str, yyyymmdd: str) -> Dict[str, Any]:
+        market = str(market).strip().upper()
+        agents = self.storage.list_agents()
+        if not agents:
+            raise RuntimeError("no agents registered. run `init` first.")
+
+        plan_rows: List[Dict[str, Any]] = []
+        for agent in agents:
+            aid = str(agent["agent_id"])
+            profile = profile_from_agent_row(agent)
+            active = self.registry.get_active_strategy(aid)
+            latest = self._latest_proposal_by_agent_market(aid, market) or {}
+            latest_eq = self.storage.query_one(
+                """
+                SELECT *
+                FROM equity_curve
+                WHERE agent_id = ?
+                ORDER BY as_of_date DESC, equity_id DESC
+                LIMIT 1
+                """,
+                (aid,),
+            ) or {}
+            orders = list(latest.get("orders") or [])
+
+            fallback = {
+                "plan": f"{profile.name} 기본 플랜: 장중 수급/리스크 기준으로 {market} 대응.",
+                "focus_points": [
+                    "초반 유동성 및 체결 강도 확인",
+                    "리스크 한도 우선 점검",
+                ],
+                "risk_watch": [
+                    "급격한 변동성 확대 구간 주의",
+                ],
+            }
+            resp = self.llm.generate_json(
+                system_prompt=(
+                    "너는 트레이딩 에이전트의 장 시작 전 브리핑 작성기다. "
+                    "반드시 JSON으로만 답하고 키는 plan, focus_points, risk_watch만 사용한다."
+                ),
+                user_prompt=(
+                    f"market={market}\n"
+                    f"date={yyyymmdd}\n"
+                    f"agent_id={aid}\n"
+                    f"role={profile.role}\n"
+                    f"risk_style={profile.risk_style}\n"
+                    f"active_params={json.dumps(active.get('params', {}), ensure_ascii=False)}\n"
+                    f"latest_proposal_status={latest.get('status', '')}\n"
+                    f"latest_orders={orders}\n"
+                    f"latest_equity={json.dumps(latest_eq, ensure_ascii=False)}\n"
+                    "오늘 장에서 실행할 핵심 계획을 간결하게 작성해라."
+                ),
+                fallback=fallback,
+                temperature=0.25,
+            )
+            parsed = resp.get("result", fallback)
+            if not isinstance(parsed, dict):
+                parsed = dict(fallback)
+            plan = str(parsed.get("plan", fallback["plan"]))
+            focus_points = parsed.get("focus_points", fallback["focus_points"])
+            risk_watch = parsed.get("risk_watch", fallback["risk_watch"])
+            if not isinstance(focus_points, list):
+                focus_points = list(fallback["focus_points"])
+            if not isinstance(risk_watch, list):
+                risk_watch = list(fallback["risk_watch"])
+
+            row = {
+                "agent_id": aid,
+                "role": profile.role,
+                "strategy_version": str(active.get("version_tag", "")),
+                "latest_proposal_status": str(latest.get("status", "")),
+                "latest_orders": orders,
+                "plan": plan,
+                "focus_points": [str(x) for x in focus_points[:5]],
+                "risk_watch": [str(x) for x in risk_watch[:5]],
+                "llm_mode": str(resp.get("mode", "fallback")),
+                "llm_reason": str(resp.get("reason", "")),
+            }
+            plan_rows.append(row)
+            self.identity.append_memory(
+                agent_id=aid,
+                memory_type="preopen_plan",
+                content={
+                    "market": market,
+                    "date": yyyymmdd,
+                    "plan": row["plan"],
+                    "focus_points": row["focus_points"],
+                    "risk_watch": row["risk_watch"],
+                },
+                ts=now_iso(),
+            )
+
+        fallback_summary = f"{market} 개장 전에는 유동성/체결강도와 리스크 한도를 우선 점검하고, 에이전트별 계획에 따라 대응한다."
+        summary_text = self._llm_explain(
+            topic="preopen_plan_report",
+            context={"market": market, "date": yyyymmdd, "plans": plan_rows},
+            fallback=fallback_summary,
+        )
+
+        payload = {
+            "market": market,
+            "date": yyyymmdd,
+            "generated_at": now_iso(),
+            "plans": plan_rows,
+            "summary_text": summary_text,
+        }
+        self._write_json_artifact(yyyymmdd, f"preopen_plan_{market.lower()}_{yyyymmdd}", payload)
+        md_lines = [
+            f"# 개장 전 플랜 보고 ({market}) {yyyymmdd}",
+            "",
+        ]
+        for row in plan_rows:
+            md_lines.append(f"## {row['agent_id']} ({row['role']})")
+            md_lines.append(f"- 전략 버전: `{row['strategy_version']}`")
+            md_lines.append(f"- 최근 제안 상태: `{row['latest_proposal_status'] or '-'}'")
+            md_lines.append(f"- 오늘 계획: {row['plan']}")
+            md_lines.append("- 핵심 포인트:")
+            if row["focus_points"]:
+                for item in row["focus_points"]:
+                    md_lines.append(f"  - {item}")
+            else:
+                md_lines.append("  - 없음")
+            md_lines.append("- 리스크 주시:")
+            if row["risk_watch"]:
+                for item in row["risk_watch"]:
+                    md_lines.append(f"  - {item}")
+            else:
+                md_lines.append("  - 없음")
+            md_lines.append("")
+        self._write_text_artifact(yyyymmdd, f"preopen_plan_{market.lower()}_{yyyymmdd}", "\n".join(md_lines))
+        self.storage.log_event("preopen_plan", payload, now_iso())
+        self._append_activity_artifact(yyyymmdd, "preopen_plan", payload)
+
+        msg_lines = [
+            "[AgentLab] 개장 10분 전 플랜 보고",
+            f"시장={market}",
+            f"일자={yyyymmdd}",
+            f"요약={summary_text}",
+        ]
+        for row in plan_rows:
+            focus = ", ".join(row["focus_points"][:2]) if row["focus_points"] else "-"
+            risk = row["risk_watch"][0] if row["risk_watch"] else "-"
+            msg_lines.append(f"{row['agent_id']}: {row['plan']}")
+            msg_lines.append(f" - 핵심={focus}")
+            msg_lines.append(f" - 리스크={risk}")
+        self._notify("\n".join(msg_lines), event="preopen_plan")
+        return payload
+
+    def session_close_report(self, market: str, yyyymmdd: str) -> Dict[str, Any]:
+        market = str(market).strip().upper()
+        agents = self.storage.list_agents()
+        if not agents:
+            raise RuntimeError("no agents registered. run `init` first.")
+
+        day_rows: List[Dict[str, Any]] = []
+        active_strategy_map: Dict[str, Dict[str, Any]] = {}
+        agent_profiles: List[Any] = []
+        for agent in agents:
+            aid = str(agent["agent_id"])
+            ledger = self.accounting.upsert_daily_snapshot(agent_id=aid, as_of_date=yyyymmdd)
+            day_ret, _week_ret = self.accounting.daily_and_weekly_return(aid, yyyymmdd)
+            day_rows.append(
+                {
+                    "agent_id": aid,
+                    "equity_krw": float(ledger["equity_krw"]),
+                    "cash_krw": float(ledger["cash_krw"]),
+                    "return_pct": float(day_ret),
+                    "drawdown": float(ledger["drawdown"]),
+                    "volatility": float(ledger["volatility"]),
+                    "win_rate": float(ledger["win_rate"]),
+                    "profit_factor": float(ledger["profit_factor"]),
+                    "turnover": float(ledger["turnover"]),
+                    "max_consecutive_loss": int(ledger["max_consecutive_loss"]),
+                }
+            )
+            active_strategy_map[aid] = self.registry.get_active_strategy(aid)
+            agent_profiles.append(profile_from_agent_row(agent))
+
+        score_board = self._weekly_score_board(day_rows)
+        try:
+            dt = datetime.strptime(yyyymmdd, "%Y%m%d").date()
+        except Exception:
+            dt = datetime.now().date()
+        week_start = dt - timedelta(days=dt.weekday())
+        week_end = week_start + timedelta(days=6)
+
+        scored_rows: List[Dict[str, Any]] = []
+        for row in day_rows:
+            aid = str(row["agent_id"])
+            scored_rows.append(
+                {
+                    **row,
+                    "score": float(score_board.get(aid, 0.0)),
+                    "risk_violations": self._risk_violation_count(aid, week_start, week_end),
+                }
+            )
+        scored_rows.sort(
+            key=lambda r: (
+                float(r["score"]),
+                -float(r["turnover"]),
+                -int(r["max_consecutive_loss"]),
+                -float(r["risk_violations"]),
+            ),
+            reverse=True,
+        )
+
+        directives_map: Dict[str, List[str]] = {}
+        for agent in agents:
+            aid = str(agent["agent_id"])
+            memories = self.storage.list_agent_memories(aid, limit=40)
+            applied: List[str] = []
+            for mem in reversed(memories):
+                if str(mem.get("memory_type", "")) != "operator_directive_applied":
+                    continue
+                content = mem.get("content", {})
+                if not isinstance(content, dict):
+                    continue
+                dtype = str(content.get("directive_type", "")).strip()
+                if dtype == "param_update":
+                    key = str(content.get("param_key", "")).strip()
+                    val = content.get("applied_value", content.get("requested_value"))
+                    text = f"param_update: {key}={val}"
+                else:
+                    text = str(content.get("request_text", "")).strip()
+                if text:
+                    applied.append(text)
+            if applied:
+                directives_map[aid] = applied[-5:]
+
+        discussion = self.agent_engine.run_weekly_council_debate(
+            agent_profiles=agent_profiles,
+            active_params_map={aid: dict(v.get("params", {})) for aid, v in active_strategy_map.items()},
+            scored_rows=scored_rows,
+            score_board=score_board,
+            week_id=f"{yyyymmdd}-{market}",
+            operator_directives_map=directives_map,
+        )
+
+        proposals = self.storage.list_order_proposals(market=market, session_date=yyyymmdd)
+        trade_summary: Dict[str, Dict[str, int]] = {}
+        for row in proposals:
+            aid = str(row.get("agent_id", ""))
+            st = str(row.get("status", ""))
+            trade_summary.setdefault(aid, {"EXECUTED": 0, "BLOCKED": 0, "APPROVED": 0})
+            if st in trade_summary[aid]:
+                trade_summary[aid][st] += 1
+
+        moderator = discussion.get("moderator", {}) if isinstance(discussion, dict) else {}
+        fallback_summary = str(moderator.get("summary", "")).strip() or (
+            f"{market} 장 마감 기준으로 에이전트별 손익/낙폭과 실행 결과를 점검하고, 다음 세션 조정 포인트를 확정했다."
+        )
+        summary_text = self._llm_explain(
+            topic="session_close_report",
+            context={
+                "market": market,
+                "date": yyyymmdd,
+                "rows_scored": scored_rows,
+                "trade_summary": trade_summary,
+                "moderator_summary": str(moderator.get("summary", "")),
+            },
+            fallback=fallback_summary,
+        )
+
+        payload = {
+            "market": market,
+            "date": yyyymmdd,
+            "rows_scored": scored_rows,
+            "score_board": score_board,
+            "trade_summary": trade_summary,
+            "discussion": discussion,
+            "summary_text": summary_text,
+            "generated_at": now_iso(),
+        }
+        self._write_json_artifact(yyyymmdd, f"session_close_report_{market.lower()}_{yyyymmdd}", payload)
+        md_lines = [
+            f"# 장 종료 10분 후 결과/토의 보고 ({market}) {yyyymmdd}",
+            "",
+            "|Agent|Equity(KRW)|DailyRet|Drawdown|Vol|WinRate|PF|Turnover|Score|",
+            "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+        ]
+        for r in scored_rows:
+            md_lines.append(
+                f"|{r['agent_id']}|{float(r['equity_krw']):.0f}|{float(r['return_pct']):.4f}|"
+                f"{float(r['drawdown']):.4f}|{float(r['volatility']):.4f}|{float(r['win_rate']):.4f}|"
+                f"{float(r['profit_factor']):.4f}|{float(r['turnover']):.4f}|{float(r['score']):.4f}|"
+            )
+        md_lines.append("")
+        md_lines.append("## 토의 요약")
+        md_lines.append(summary_text)
+        md_lines.append("")
+        rounds = list(discussion.get("rounds", [])) if isinstance(discussion, dict) else []
+        for round_row in rounds[:2]:
+            md_lines.append(f"### Round {round_row.get('round')} ({round_row.get('phase')})")
+            for speech in list(round_row.get("speeches") or [])[:3]:
+                aid = str(speech.get("agent_id", ""))
+                text = str(speech.get("thesis") or speech.get("rebuttal") or "")
+                md_lines.append(f"- {aid}: {text}")
+            md_lines.append("")
+        self._write_text_artifact(yyyymmdd, f"session_close_report_{market.lower()}_{yyyymmdd}", "\n".join(md_lines))
+        self.storage.log_event("session_close_report", payload, now_iso())
+        self._append_activity_artifact(yyyymmdd, "session_close_report", payload)
+
+        msg_lines = [
+            "[AgentLab] 장 종료 10분 후 결과/토의 보고",
+            f"시장={market}",
+            f"일자={yyyymmdd}",
+            f"요약={summary_text}",
+        ]
+        for r in scored_rows:
+            aid = str(r["agent_id"])
+            t = trade_summary.get(aid, {})
+            msg_lines.append(
+                f"{aid}: 수익률={float(r['return_pct']):.4f}, 낙폭={float(r['drawdown']):.4f}, "
+                f"평가자산={float(r['equity_krw']):.0f}, 실행제안={int(t.get('EXECUTED', 0))}"
+            )
+        summary = summary_text.strip()
+        if summary:
+            if len(summary) > 220:
+                summary = summary[:220] + "..."
+            msg_lines.append(f"토의요약={summary}")
+        self._notify("\n".join(msg_lines), event="session_close_report")
+        return payload
 
     def daily_review(self, yyyymmdd: str) -> Dict[str, Any]:
         agents = self.storage.list_agents()
@@ -828,13 +1246,13 @@ class AgentLabOrchestrator:
         self._write_text_artifact(yyyymmdd, f"daily_review_{yyyymmdd}", markdown)
         self.storage.log_event("daily_review", payload, now_iso())
         self._append_activity_artifact(yyyymmdd, "daily_review", payload)
-        lines = [f"[AgentLab] daily-review", f"date={yyyymmdd}"]
+        lines = [f"[AgentLab] 일간 리뷰", f"일자={yyyymmdd}"]
         for r in rows:
             lines.append(
-                f"{r['agent_id']}: equity={float(r['equity_krw']):.0f}, "
-                f"drawdown={float(r['drawdown']):.4f}, turnover={float(r['turnover']):.4f}"
+                f"{r['agent_id']}: 평가자산={float(r['equity_krw']):.0f}, "
+                f"낙폭={float(r['drawdown']):.4f}, 회전율={float(r['turnover']):.4f}"
             )
-        self._notify("\n".join(lines))
+        self._notify("\n".join(lines), event="daily_review")
         return payload
 
     def _weekly_score_board(self, week_rows: List[Dict[str, Any]]) -> Dict[str, float]:
@@ -1057,15 +1475,15 @@ class AgentLabOrchestrator:
         self.storage.log_event("weekly_council", decision, now_iso())
         self._append_activity_artifact(weekly_stamp, "weekly_council", decision)
         lines = [
-            "[AgentLab] weekly-council",
-            f"week={week_id}",
-            f"champion={champion}",
-            f"promoted={promoted_versions if promoted_versions else '(none)'}",
+            "[AgentLab] 주간 회의",
+            f"주차={week_id}",
+            f"우승전략={champion}",
+            f"승격={promoted_versions if promoted_versions else '(없음)'}",
         ]
         rounds = list((discussion.get("rounds") or []))
         for round_row in rounds[:2]:
             phase = str(round_row.get("phase", ""))
-            lines.append(f"round={round_row.get('round')} phase={phase}")
+            lines.append(f"라운드={round_row.get('round')} 단계={phase}")
             speeches = list(round_row.get("speeches") or [])
             for speech in speeches[:3]:
                 aid = str(speech.get("agent_id", ""))
@@ -1074,7 +1492,7 @@ class AgentLabOrchestrator:
                     text = text[:120] + "..."
                 if text:
                     lines.append(f"{aid}: {text}")
-        self._notify("\n".join(lines))
+        self._notify("\n".join(lines), event="weekly_council")
         return decision
 
     def report(self, date_from: str, date_to: str) -> Dict[str, Any]:
@@ -1122,9 +1540,11 @@ class AgentLabOrchestrator:
         self.storage.log_event("report_generated", payload, now_iso())
         self._append_activity_artifact(out_day, "report_generated", payload)
         self._notify(
-            "[AgentLab] report\n"
-            f"from={date_from}\n"
-            f"to={date_to}\n"
-            f"rows={len(rows)}"
+            "[AgentLab] 리포트\n"
+            f"시작일={date_from}\n"
+            f"종료일={date_to}\n"
+            f"행수={len(rows)}"
+            ,
+            event="report",
         )
         return payload

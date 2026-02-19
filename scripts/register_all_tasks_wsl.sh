@@ -17,16 +17,17 @@ NEW_BLOCK=$(cat <<EOF
 $MARK_START
 CRON_TZ=Asia/Seoul
 30 7 * * 1-5 cd "$ROOT_DIR" && "$PYTHON_BIN" scripts/prefetch_kr_universe.py >> "$ROOT_DIR/logs/cron/kr_prefetch.log" 2>&1
+50 8 * * 1-5 cd "$ROOT_DIR" && /usr/bin/env bash "$ROOT_DIR/scripts/run_agent_lab_wsl.sh" --action preopen-plan --market KR >> "$ROOT_DIR/logs/cron/agent_kr_preopen.log" 2>&1
 0 9 * * 1-5 cd "$ROOT_DIR" && /usr/bin/env bash "$ROOT_DIR/scripts/run_daily_wsl.sh" --market KR >> "$ROOT_DIR/logs/cron/kr_daily.log" 2>&1
-20 9 * * 1-5 cd "$ROOT_DIR" && /usr/bin/env bash "$ROOT_DIR/scripts/run_agent_lab_wsl.sh" --action ingest-propose --market KR --auto-approve >> "$ROOT_DIR/logs/cron/agent_kr.log" 2>&1
+40 15 * * 1-5 cd "$ROOT_DIR" && /usr/bin/env bash "$ROOT_DIR/scripts/run_agent_lab_wsl.sh" --action close-report --market KR >> "$ROOT_DIR/logs/cron/agent_kr_close.log" 2>&1
 
 CRON_TZ=America/New_York
 30 8 * * 1-5 cd "$ROOT_DIR" && "$PYTHON_BIN" scripts/prefetch_us_universe.py --output-csv "$ROOT_DIR/out/us/\$(TZ=Asia/Seoul date +\\%Y\\%m\\%d)/cache/us_sp500_constituents.csv" >> "$ROOT_DIR/logs/cron/us_prefetch.log" 2>&1
+20 9 * * 1-5 cd "$ROOT_DIR" && /usr/bin/env bash "$ROOT_DIR/scripts/run_agent_lab_wsl.sh" --action preopen-plan --market US >> "$ROOT_DIR/logs/cron/agent_us_preopen.log" 2>&1
 30 9 * * 1-5 cd "$ROOT_DIR" && /usr/bin/env bash "$ROOT_DIR/scripts/run_daily_wsl.sh" --market US --exchange NASD >> "$ROOT_DIR/logs/cron/us_daily.log" 2>&1
-45 9 * * 1-5 cd "$ROOT_DIR" && /usr/bin/env bash "$ROOT_DIR/scripts/run_agent_lab_wsl.sh" --action ingest-propose --market US --auto-approve >> "$ROOT_DIR/logs/cron/agent_us.log" 2>&1
+10 16 * * 1-5 cd "$ROOT_DIR" && /usr/bin/env bash "$ROOT_DIR/scripts/run_agent_lab_wsl.sh" --action close-report --market US >> "$ROOT_DIR/logs/cron/agent_us_close.log" 2>&1
 
 CRON_TZ=Asia/Seoul
-10 7 * * * cd "$ROOT_DIR" && /usr/bin/env bash "$ROOT_DIR/scripts/run_agent_lab_wsl.sh" --action daily-review >> "$ROOT_DIR/logs/cron/agent_daily_review.log" 2>&1
 0 8 * * 6 cd "$ROOT_DIR" && /usr/bin/env bash "$ROOT_DIR/scripts/run_agent_lab_wsl.sh" --action weekly-council >> "$ROOT_DIR/logs/cron/agent_weekly_council.log" 2>&1
 @reboot cd "$ROOT_DIR" && /usr/bin/env bash "$ROOT_DIR/scripts/run_agent_lab_wsl.sh" --action telegram-chat >> "$ROOT_DIR/logs/cron/agent_telegram_chat.log" 2>&1
 @reboot cd "$ROOT_DIR" && /usr/bin/env bash "$ROOT_DIR/scripts/run_agent_lab_wsl.sh" --action auto-strategy-daemon >> "$ROOT_DIR/logs/cron/agent_auto_strategy.log" 2>&1

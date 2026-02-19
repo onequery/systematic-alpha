@@ -36,7 +36,7 @@ def _truncate(text: str, max_chars: int = 3500) -> str:
     body = str(text or "")
     if len(body) <= max_chars:
         return body
-    return body[:max_chars] + "\n...(truncated)..."
+    return body[:max_chars] + "\n...(중략)..."
 
 
 class TelegramChatRuntime:
@@ -218,23 +218,23 @@ class TelegramChatRuntime:
 
     def _parse_status_filters(self, args: List[str]) -> Tuple[Optional[str], Optional[str], str]:
         if len(args) > 2:
-            return None, None, "Usage: /status [agent_id] [KR|US] or /queue [agent_id] [KR|US]"
+            return None, None, "사용법: /status [agent_id] [KR|US] 또는 /queue [agent_id] [KR|US]"
         agent_id: Optional[str] = None
         market: Optional[str] = None
         for raw in args[:2]:
             m = self._normalize_market(raw)
             a = self._normalize_agent_id(raw)
             if m and market and market != m:
-                return None, None, "Conflicting market args. Use KR or US once."
+                return None, None, "시장 인자가 충돌합니다. KR 또는 US 중 하나만 지정하세요."
             if a and agent_id and agent_id != a:
-                return None, None, "Conflicting agent args. Use one agent only."
+                return None, None, "에이전트 인자가 충돌합니다. 에이전트는 하나만 지정하세요."
             if m:
                 market = m
                 continue
             if a:
                 agent_id = a
                 continue
-            return None, None, f"Unknown filter '{raw}'. Use /agents and KR|US."
+            return None, None, f"알 수 없는 필터 '{raw}'입니다. /agents 와 KR|US 를 사용하세요."
         return agent_id, market, ""
 
     @staticmethod
@@ -273,14 +273,47 @@ class TelegramChatRuntime:
     @staticmethod
     def _format_orders_short(orders: List[Dict[str, Any]], limit: int = 3) -> str:
         if not orders:
-            return "none"
+            return "없음"
         chunks: List[str] = []
+        side_map = {"BUY": "매수", "SELL": "매도"}
         for row in orders[: max(1, int(limit))]:
-            side = str(row.get("side", "")).strip() or "?"
+            side_raw = str(row.get("side", "")).strip().upper()
+            side = side_map.get(side_raw, str(row.get("side", "")).strip() or "?")
             symbol = str(row.get("symbol", "")).strip() or "?"
             qty = float(row.get("quantity", 0.0) or 0.0)
             chunks.append(f"{side} {symbol} x{qty:.0f}")
         return ", ".join(chunks)
+
+    @staticmethod
+    def _ko_status(value: Any) -> str:
+        raw = str(value or "").strip().upper()
+        mapping = {
+            "OK": "정상",
+            "ERROR": "오류",
+            "PENDING_APPROVAL": "승인대기",
+            "APPROVED": "승인됨",
+            "EXECUTED": "실행됨",
+            "BLOCKED": "차단됨",
+            "REJECTED": "반려됨",
+            "SIGNAL_OK": "신호정상",
+            "MARKET_CLOSED": "장종료",
+            "INVALID_SIGNAL": "신호무효",
+            "DATA_QUALITY_LOW": "데이터품질저하",
+            "NO_SIGNAL": "신호없음",
+        }
+        return mapping.get(raw, str(value or "-"))
+
+    @staticmethod
+    def _ko_monitor_state(value: Any) -> str:
+        raw = str(value or "").strip().lower()
+        mapping = {
+            "outside_window": "장외",
+            "disabled": "비활성",
+            "waiting": "대기",
+            "executed": "실행",
+            "idle": "유휴",
+        }
+        return mapping.get(raw, str(value or "-"))
 
     def _latest_event_by_market(self, event_type: str, market: str, limit: int = 200) -> Optional[Dict[str, Any]]:
         rows = self.storage.list_events(event_type=event_type, limit=limit)
@@ -294,25 +327,22 @@ class TelegramChatRuntime:
         return None
 
     def _latest_proposal(self, agent_id: str, market: Optional[str] = None) -> Optional[Dict[str, Any]]:
-        auto_approve = _truthy(os.getenv("AGENT_LAB_AUTO_APPROVE", "1"))
         where_market = ""
         params_base: List[Any] = [agent_id]
         if market:
             where_market = " AND market = ?"
             params_base.append(str(market).upper())
 
-        row = None
-        if auto_approve:
-            row = self.storage.query_one(
-                f"""
-                SELECT *
-                FROM order_proposals
-                WHERE agent_id = ?{where_market} AND status <> 'PENDING_APPROVAL'
-                ORDER BY created_at DESC, proposal_id DESC
-                LIMIT 1
-                """,
-                tuple(params_base),
-            )
+        row = self.storage.query_one(
+            f"""
+            SELECT *
+            FROM order_proposals
+            WHERE agent_id = ?{where_market} AND status <> 'PENDING_APPROVAL'
+            ORDER BY created_at DESC, proposal_id DESC
+            LIMIT 1
+            """,
+            tuple(params_base),
+        )
         if row is None:
             row = self.storage.query_one(
                 f"""
@@ -341,14 +371,12 @@ class TelegramChatRuntime:
             specs = [
                 ("prefetch", 7, 30, self.kst),
                 ("signal-scan", 9, 0, self.kst),
-                ("agent-exec", 9, 20, self.kst),
             ]
         else:
             now_local = now_kst.astimezone(self.et)
             specs = [
                 ("prefetch", 8, 30, self.et),
                 ("signal-scan", 9, 30, self.et),
-                ("agent-exec", 9, 45, self.et),
             ]
         for label, hour, minute, tz in specs:
             next_run = self._next_weekday_at(now_local, hour, minute)
@@ -384,38 +412,38 @@ class TelegramChatRuntime:
         auto_upd = self.storage.get_latest_event("auto_strategy_update")
         auto_upd_at = str(auto_upd.get("created_at", "-")) if auto_upd else "-"
         if auto_alive and next_poll_sec is not None:
-            lines.append(f"- daemon:auto_strategy=alive next_poll_in={next_poll_sec}s last_update={auto_upd_at}")
+            lines.append(f"- 데몬:auto_strategy=실행중 다음_폴링={next_poll_sec}s 마지막_업데이트={auto_upd_at}")
         else:
-            lines.append(f"- daemon:auto_strategy=stopped last_update={auto_upd_at}")
+            lines.append(f"- 데몬:auto_strategy=중지 마지막_업데이트={auto_upd_at}")
 
         auto_hb = self.storage.get_latest_event("auto_strategy_heartbeat")
         if auto_hb:
             hb = auto_hb.get("payload", {}) or {}
             lines.append(
-                "- auto_strategy_heartbeat: "
-                f"status={hb.get('daemon_status', '-')}, "
-                f"action={hb.get('action', '-')}, "
-                f"reason={hb.get('reason', '-')}, "
-                f"at={auto_hb.get('created_at', '-')}"
+                "- auto_strategy_하트비트: "
+                f"상태={self._ko_status(hb.get('daemon_status', '-'))}, "
+                f"액션={hb.get('action', '-')}, "
+                f"사유={hb.get('reason', '-')}, "
+                f"시각={auto_hb.get('created_at', '-')}"
             )
             mon = hb.get("intraday_monitor", {}) or {}
             lines.append(
-                "- monitor_plan: "
-                f"enabled={mon.get('enabled', False)}, "
-                f"interval={int(mon.get('interval_sec', 0) or 0)}s, "
-                f"enabled_agents={len(list(mon.get('enabled_agents', []) or []))}"
+                "- 모니터_계획: "
+                f"활성={mon.get('enabled', False)}, "
+                f"주기={int(mon.get('interval_sec', 0) or 0)}s, "
+                f"활성_에이전트={len(list(mon.get('enabled_agents', []) or []))}"
             )
             mon_markets = mon.get("markets", {}) or {}
             for mk in ["KR", "US"]:
                 st = mon_markets.get(mk, {}) or {}
-                state = str(st.get("state", "-"))
+                state = self._ko_monitor_state(st.get("state", "-"))
                 remain = st.get("seconds_until_next")
                 remain_txt = (
                     f"{int(remain)}s"
                     if isinstance(remain, (int, float))
                     else "-"
                 )
-                lines.append(f"- monitor:{mk} state={state} next_in={remain_txt}")
+                lines.append(f"- 모니터:{mk} 상태={state} 다음={remain_txt}")
 
         chat_start = self.storage.get_latest_event("telegram_chat_worker_start")
         chat_stop = self.storage.get_latest_event("telegram_chat_worker_stop")
@@ -427,22 +455,22 @@ class TelegramChatRuntime:
                 chat_alive = True
         chat_last_err = self.storage.get_latest_event("telegram_chat_worker_error")
         err_at = str(chat_last_err.get("created_at", "-")) if chat_last_err else "-"
-        lines.append(f"- daemon:telegram_chat={'alive' if chat_alive else 'stopped'} last_error={err_at}")
+        lines.append(f"- 데몬:telegram_chat={'실행중' if chat_alive else '중지'} 마지막_오류={err_at}")
         return lines
 
     def _format_market_pipeline_block(self, market: str) -> List[str]:
         m = str(market).upper()
-        out: List[str] = [f"[{m}] pipeline"]
+        out: List[str] = [f"[{m}] 파이프라인"]
         ingest_evt = self._latest_event_by_market("session_ingested", m)
         prop_evt = self._latest_event_by_market("orders_proposed", m)
         if ingest_evt:
             p = ingest_evt.get("payload", {}) or {}
             out.append(
-                f"- last_ingest: date={p.get('date', p.get('session_date', '-'))} status={p.get('status_code', '-')} "
-                f"at={ingest_evt.get('created_at', '-')}"
+                f"- 마지막_ingest: 일자={p.get('date', p.get('session_date', '-'))} 상태={self._ko_status(p.get('status_code', '-'))} "
+                f"시각={ingest_evt.get('created_at', '-')}"
             )
         else:
-            out.append("- last_ingest: -")
+            out.append("- 마지막_ingest: -")
         if prop_evt:
             p = prop_evt.get("payload", {}) or {}
             proposals = p.get("proposals") or []
@@ -450,23 +478,23 @@ class TelegramChatRuntime:
             blocked = sum(1 for x in proposals if str((x or {}).get("status", "")).upper() == "BLOCKED")
             executed = sum(1 for x in proposals if str((x or {}).get("status", "")).upper() == "EXECUTED")
             out.append(
-                f"- last_propose: date={p.get('date', '-')} total={total} executed={executed} blocked={blocked} "
-                f"at={prop_evt.get('created_at', '-')}"
+                f"- 마지막_propose: 일자={p.get('date', '-')} 전체={total} 실행={executed} 차단={blocked} "
+                f"시각={prop_evt.get('created_at', '-')}"
             )
         else:
-            out.append("- last_propose: -")
+            out.append("- 마지막_propose: -")
         for row in self._market_schedule_rows(m):
             dt_local = str(row.get("next_run_local", "-"))
             if m == "US":
                 dt_kst = str(row.get("next_run_kst", "-"))
                 out.append(
-                    f"- next_{row.get('label', 'run')}: {dt_local} / {dt_kst} "
-                    f"(in {int(row.get('eta_seconds', 0))}s)"
+                    f"- 다음_{row.get('label', 'run')}: {dt_local} / {dt_kst} "
+                    f"(남은 {int(row.get('eta_seconds', 0))}s)"
                 )
             else:
                 out.append(
-                    f"- next_{row.get('label', 'run')}: {dt_local} "
-                    f"(in {int(row.get('eta_seconds', 0))}s)"
+                    f"- 다음_{row.get('label', 'run')}: {dt_local} "
+                    f"(남은 {int(row.get('eta_seconds', 0))}s)"
                 )
         return out
 
@@ -609,11 +637,11 @@ class TelegramChatRuntime:
         text = str(raw or "").strip()
         if key not in ALLOWED_PARAM_RANGES:
             keys = ", ".join(sorted(ALLOWED_PARAM_RANGES.keys()))
-            return False, None, f"unknown param key: {key}. allowed: {keys}"
+            return False, None, f"알 수 없는 파라미터 키: {key}. 허용 목록: {keys}"
         try:
             num = float(text)
         except Exception:
-            return False, None, f"param value must be numeric: {text}"
+            return False, None, f"파라미터 값은 숫자여야 합니다: {text}"
         if self._as_int_param_key(key):
             return True, int(round(num)), ""
         return True, float(num), ""
@@ -657,18 +685,18 @@ class TelegramChatRuntime:
             },
             ts=_now_iso(),
         )
-        return True, f"directive #{did} created: {agent_id} set {param_key}={param_value_raw} (PENDING)"
+        return True, f"지시 #{did} 생성됨: {agent_id} {param_key}={param_value_raw} (대기)"
 
     def _apply_directive(self, directive: Dict[str, Any], actor: str, note: str) -> Tuple[bool, str]:
         did = int(directive.get("directive_id", 0) or 0)
         if did <= 0:
-            return False, "invalid directive id"
+            return False, "지시 ID가 올바르지 않습니다."
         agent_id = str(directive.get("agent_id", "")).strip()
         if not agent_id:
-            return False, f"directive #{did} missing agent_id"
+            return False, f"지시 #{did}에 agent_id가 없습니다."
 
         if str(directive.get("status", "")).strip().upper() != self.DIRECTIVE_STATUS_PENDING:
-            return False, f"directive #{did} is not pending"
+            return False, f"지시 #{did}는 대기 상태가 아닙니다."
 
         dtype = str(directive.get("directive_type", "")).strip()
         decision_note = str(note or "").strip()
@@ -686,7 +714,7 @@ class TelegramChatRuntime:
             param_key = str(directive.get("param_key", "")).strip()
             ok, value, err = self._coerce_param_value(param_key, str(directive.get("param_value_raw", "")))
             if not ok:
-                return False, f"directive #{did} invalid param value: {err}"
+                return False, f"지시 #{did} 파라미터 값이 올바르지 않습니다: {err}"
             active = self.registry.get_active_strategy(agent_id)
             base_params = dict(active.get("params", {}))
             prev_value = base_params.get(param_key)
@@ -746,13 +774,13 @@ class TelegramChatRuntime:
             return (
                 True,
                 (
-                    f"directive #{did} APPLIED\n"
-                    f"agent={agent_id}\n"
-                    f"param={param_key}\n"
-                    f"prev={prev_value}\n"
-                    f"requested={value}\n"
-                    f"applied={applied_value}\n"
-                    f"strategy={reg.get('version_tag')}"
+                    f"지시 #{did} 적용 완료\n"
+                    f"에이전트={agent_id}\n"
+                    f"파라미터={param_key}\n"
+                    f"이전값={prev_value}\n"
+                    f"요청값={value}\n"
+                    f"적용값={applied_value}\n"
+                    f"전략={reg.get('version_tag')}"
                 ),
             )
 
@@ -784,19 +812,19 @@ class TelegramChatRuntime:
         return (
             True,
             (
-                f"directive #{did} APPLIED\n"
-                f"agent={agent_id}\n"
-                f"type={dtype or 'freeform'}\n"
-                f"request={request_text or '(empty)'}"
+                f"지시 #{did} 적용 완료\n"
+                f"에이전트={agent_id}\n"
+                f"유형={dtype or 'freeform'}\n"
+                f"요청={request_text or '(비어있음)'}"
             ),
         )
 
     def _reject_directive(self, directive: Dict[str, Any], actor: str, note: str) -> Tuple[bool, str]:
         did = int(directive.get("directive_id", 0) or 0)
         if did <= 0:
-            return False, "invalid directive id"
+            return False, "지시 ID가 올바르지 않습니다."
         if str(directive.get("status", "")).strip().upper() != self.DIRECTIVE_STATUS_PENDING:
-            return False, f"directive #{did} is not pending"
+            return False, f"지시 #{did}는 대기 상태가 아닙니다."
         agent_id = str(directive.get("agent_id", "")).strip()
         updated = dict(directive)
         updated["status"] = self.DIRECTIVE_STATUS_REJECTED
@@ -832,7 +860,7 @@ class TelegramChatRuntime:
             },
             created_at=_now_iso(),
         )
-        return True, f"directive #{did} REJECTED"
+        return True, f"지시 #{did} 반려 완료"
 
     def _latest_equity(self, agent_id: str) -> Optional[Dict[str, Any]]:
         return self.storage.query_one(
@@ -896,7 +924,7 @@ class TelegramChatRuntime:
             "positions": positions,
             "execution_model": {
                 "signal_pipeline_mode": pipeline_mode,
-                "collect_seconds_semantics": "realtime sampling window per refresh run; agents can trigger repeated intraday refresh cycles",
+                "collect_seconds_semantics": "각 리프레시 실행에서 실시간 샘플링 구간을 의미하며, 에이전트가 장중 리프레시 사이클을 반복 트리거할 수 있음",
                 "latest_auto_strategy_heartbeat": heartbeat_payload if heartbeat else None,
             },
             "market_pipeline": {
@@ -917,23 +945,25 @@ class TelegramChatRuntime:
         proposal = ctx.get("latest_proposal") or {}
         orders = proposal.get("orders") or []
         order_chunks: List[str] = []
+        side_map = {"BUY": "매수", "SELL": "매도"}
         for row in orders[:3]:
-            side = str(row.get("side", ""))
+            side_raw = str(row.get("side", "")).strip().upper()
+            side = side_map.get(side_raw, str(row.get("side", "")))
             symbol = str(row.get("symbol", ""))
             qty = float(row.get("quantity", 0.0) or 0.0)
             order_chunks.append(f"{side} {symbol} x{qty:.0f}")
-        orders_text = ", ".join(order_chunks) if order_chunks else "none"
+        orders_text = ", ".join(order_chunks) if order_chunks else "없음"
         eq = ctx.get("latest_equity") or {}
         equity_krw = float(eq.get("equity_krw", 0.0) or 0.0)
         drawdown = float(eq.get("drawdown", 0.0) or 0.0)
         return (
-            f"{agent_id} status snapshot:\n"
-            f"- last_proposal_status: {proposal.get('status', 'N/A')}\n"
-            f"- last_proposal_orders: {orders_text}\n"
-            f"- equity_krw: {equity_krw:.0f}\n"
-            f"- drawdown: {drawdown:.4f}\n"
-            f"- question: {question}\n"
-            "LLM is unavailable or budget-limited, so this is a deterministic status response."
+            f"{agent_id} 상태 스냅샷:\n"
+            f"- 최근_제안_상태: {proposal.get('status', 'N/A')}\n"
+            f"- 최근_제안_주문: {orders_text}\n"
+            f"- 평가자산_원화: {equity_krw:.0f}\n"
+            f"- 낙폭: {drawdown:.4f}\n"
+            f"- 질문: {question}\n"
+            "LLM을 사용할 수 없거나 예산 제한 상태이므로, 결정론적 상태 응답으로 대체했습니다."
         )
 
     def _is_token_budget_issue(self, reason: str) -> bool:
@@ -952,7 +982,7 @@ class TelegramChatRuntime:
     def _ask_agent(self, agent_id: str, question: str) -> str:
         question_clean = str(question or "").strip()
         if not question_clean:
-            return "Question is empty. Usage: /ask agent_a What is your current plan?"
+            return "질문이 비어 있습니다. 사용법: /ask agent_a 현재 계획이 뭐야?"
 
         ctx = self._build_agent_context(agent_id)
         fallback = {
@@ -961,16 +991,16 @@ class TelegramChatRuntime:
             "risk_flags": [],
         }
         system_prompt = (
-            "You are a trader agent in a systematic trading lab. "
-            "Respond as a professional human trader. "
-            "Use first-person voice, concrete and concise, no hype. "
-            "Return JSON only with keys: answer, action_items, risk_flags."
+            "너는 체계적 트레이딩 랩의 트레이더 에이전트다. "
+            "숙련된 인간 트레이더처럼 1인칭으로, 구체적이고 간결하게 답하라. "
+            "과장된 표현은 금지한다. "
+            "반드시 JSON만 반환하고 키는 answer, action_items, risk_flags 만 사용한다."
         )
         user_prompt = (
             f"agent_id={agent_id}\n"
             f"question={question_clean}\n"
             f"context={json.dumps(ctx, ensure_ascii=False)}\n"
-            "Keep answer grounded in current data and strategy state."
+            "현재 데이터와 전략 상태에 근거해서 답하라."
         )
         resp = self.llm.generate_json(
             system_prompt=system_prompt,
@@ -1012,10 +1042,10 @@ class TelegramChatRuntime:
 
         if mode != "live" and self._is_token_budget_issue(reason):
             self._send_message(
-                "[AgentLab] alert\n"
-                f"agent={agent_id}\n"
-                "OpenAI token/quota limit issue detected in chat response.\n"
-                f"reason={reason}"
+                "[AgentLab] 알림\n"
+                f"에이전트={agent_id}\n"
+                "채팅 응답에서 OpenAI 토큰/쿼터 제한 문제가 감지되었습니다.\n"
+                f"사유={reason}"
             )
 
         lines = [
@@ -1023,15 +1053,15 @@ class TelegramChatRuntime:
             answer,
         ]
         if action_items:
-            lines.append("action_items:")
+            lines.append("실행_항목:")
             for item in action_items[:5]:
                 lines.append(f"- {str(item)}")
         if risk_flags:
-            lines.append("risk_flags:")
+            lines.append("리스크_플래그:")
             for item in risk_flags[:5]:
                 lines.append(f"- {str(item)}")
         if mode != "live":
-            lines.append(f"(mode={mode}, reason={reason or 'fallback'})")
+            lines.append(f"(모드={mode}, 사유={reason or 'fallback'})")
         return "\n".join(lines)
 
     def _format_agent_status(self, agent_id: str, market: Optional[str] = None) -> str:
@@ -1042,32 +1072,28 @@ class TelegramChatRuntime:
         version_tag = str(active.get("version_tag", "N/A"))
         markets = [str(market).upper()] if market else ["KR", "US"]
         lines = [
-            f"[{agent_id}] status",
-            f"- strategy: {version_tag}",
-            f"- positions: {len(pos)}",
-            f"- equity_krw: {float(eq.get('equity_krw', 0.0) or 0.0):.0f}",
-            f"- drawdown: {float(eq.get('drawdown', 0.0) or 0.0):.4f}",
+            f"[{agent_id}] 상태",
+            f"- 전략: {version_tag}",
+            f"- 보유포지션수: {len(pos)}",
+            f"- 평가자산_원화: {float(eq.get('equity_krw', 0.0) or 0.0):.0f}",
+            f"- 낙폭: {float(eq.get('drawdown', 0.0) or 0.0):.4f}",
         ]
         for mk in markets:
             latest = self._latest_proposal(agent_id, mk) or {}
             orders = latest.get("orders") or []
             score = float((latest or {}).get("strategy_version_id", 0) or 0)
             lines.append(
-                f"- {mk}_latest_proposal: {latest.get('status', 'N/A')} ({latest.get('session_date', 'N/A')})"
+                f"- {mk}_최근_제안: {self._ko_status(latest.get('status', 'N/A'))} ({latest.get('session_date', 'N/A')})"
             )
-            lines.append(f"- {mk}_latest_orders: {self._format_orders_short(orders, limit=3)}")
-            lines.append(f"- {mk}_proposal_version_id: {score:.0f}")
-            sched = self._market_schedule_rows(mk)
-            if sched:
-                next_exec = next((x for x in sched if str(x.get("label")) == "agent-exec"), sched[0])
-                lines.append(f"- {mk}_next_agent_exec_in: {int(next_exec.get('eta_seconds', 0))}s")
+            lines.append(f"- {mk}_최근_주문: {self._format_orders_short(orders, limit=3)}")
+            lines.append(f"- {mk}_제안_전략버전ID: {score:.0f}")
         return "\n".join(lines)
 
     def _format_all_status(self, market: Optional[str] = None) -> str:
         agents = self.storage.list_agents()
         if not agents:
-            return "No agents found. Run Agent Lab init first."
-        lines = ["[AgentLab] all agents status"]
+            return "등록된 에이전트가 없습니다. 먼저 Agent Lab init을 실행하세요."
+        lines = ["[AgentLab] 전체 에이전트 상태"]
         markets = [str(market).upper()] if market else ["KR", "US"]
         for mk in markets:
             lines.append(f"[{mk}]")
@@ -1076,34 +1102,28 @@ class TelegramChatRuntime:
                 latest = self._latest_proposal(aid, mk) or {}
                 eq = self._latest_equity(aid) or {}
                 lines.append(
-                    f"- {aid}: proposal={latest.get('status', 'N/A')} "
-                    f"date={latest.get('session_date', 'N/A')} equity={float(eq.get('equity_krw', 0.0) or 0.0):.0f}"
+                    f"- {aid}: 제안={self._ko_status(latest.get('status', 'N/A'))} "
+                    f"일자={latest.get('session_date', 'N/A')} 평가자산={float(eq.get('equity_krw', 0.0) or 0.0):.0f}"
                 )
             lines.extend(self._format_market_pipeline_block(mk))
         lines.extend(self._runtime_health_lines())
         council = self._latest_weekly_council()
         if council:
             lines.append(
-                f"- latest_council: {council.get('week_id', 'N/A')} champion={council.get('champion_agent_id', 'N/A')}"
+                f"- 최근_주간회의: {council.get('week_id', 'N/A')} 우승전략={council.get('champion_agent_id', 'N/A')}"
             )
         return "\n".join(lines)
 
     def _format_queue_status(self, agent_id: Optional[str] = None, market: Optional[str] = None) -> str:
         markets = [str(market).upper()] if market else ["KR", "US"]
-        lines = ["[AgentLab] queue"]
+        lines = ["[AgentLab] 큐 상태"]
         if agent_id:
-            lines.append(f"- agent={agent_id}")
+            lines.append(f"- 에이전트={agent_id}")
             for mk in markets:
                 latest = self._latest_proposal(agent_id, mk) or {}
                 lines.append(
-                    f"- {mk}: latest={latest.get('status', 'N/A')} date={latest.get('session_date', 'N/A')} "
-                    f"orders={self._format_orders_short(list(latest.get('orders') or []), limit=2)}"
-                )
-                sched = self._market_schedule_rows(mk)
-                next_exec = next((x for x in sched if str(x.get("label")) == "agent-exec"), sched[0] if sched else {})
-                lines.append(
-                    f"- {mk}: next_agent_exec={next_exec.get('next_run_local', '-')} "
-                    f"(in {int(next_exec.get('eta_seconds', 0) or 0)}s)"
+                    f"- {mk}: 최근={self._ko_status(latest.get('status', 'N/A'))} 일자={latest.get('session_date', 'N/A')} "
+                    f"주문={self._format_orders_short(list(latest.get('orders') or []), limit=2)}"
                 )
         else:
             for mk in markets:
@@ -1114,8 +1134,8 @@ class TelegramChatRuntime:
     def _format_recent_memory(self, agent_id: str) -> str:
         rows = self.identity.load_recent_memories(agent_id, limit=10)
         if not rows:
-            return f"[{agent_id}] no memory entries."
-        lines = [f"[{agent_id}] recent memory"]
+            return f"[{agent_id}] 메모리 기록이 없습니다."
+        lines = [f"[{agent_id}] 최근 메모리"]
         for row in rows[-10:]:
             mem_type = str(row.get("memory_type", row.get("content", {}).get("memory_type", "unknown")))
             created_at = str(row.get("created_at", ""))
@@ -1130,19 +1150,20 @@ class TelegramChatRuntime:
 
     def _format_directives(self, *, agent_id: Optional[str], status: Optional[str]) -> str:
         rows = self._list_directives(agent_id=agent_id, status=status, limit=12)
-        title = "[AgentLab] directives"
+        title = "[AgentLab] 지시사항"
         if agent_id:
             title += f" agent={agent_id}"
         if status:
-            title += f" status={status.upper()}"
+            title += f" 상태={status.upper()}"
         if not rows:
-            return title + "\n- (none)"
+            return title + "\n- (없음)"
         lines = [title]
         for row in rows:
             did = int(row.get("directive_id", 0) or 0)
             aid = str(row.get("agent_id", ""))
             dtype = str(row.get("directive_type", ""))
             st = str(row.get("status", ""))
+            dtype_ko = {"param_update": "파라미터수정", "freeform": "자유지시"}.get(dtype, dtype)
             requested = str(row.get("requested_at", row.get("created_at", "")))
             if dtype == "param_update":
                 detail = f"{row.get('param_key', '')}={row.get('param_value_raw', '')}"
@@ -1151,14 +1172,14 @@ class TelegramChatRuntime:
             if len(detail) > 72:
                 detail = detail[:72] + "..."
             lines.append(
-                f"- #{did} {st} {aid} [{dtype}] {detail} (at={requested})"
+                f"- #{did} {self._ko_status(st)} {aid} [{dtype_ko}] {detail} (시각={requested})"
             )
         return "\n".join(lines)
 
     def _help_text(self) -> str:
         return (
             "[AgentLab Bot]\n"
-            "Commands:\n"
+            "명령어:\n"
             "/help\n"
             "/agents\n"
             "/status\n"
@@ -1174,23 +1195,23 @@ class TelegramChatRuntime:
             "/directives [agent_id] [pending|applied|rejected]\n"
             "/approve <directive_id> [note]\n"
             "/reject <directive_id> [reason]\n\n"
-            "Examples:\n"
+            "예시:\n"
             "/status agent_a\n"
             "/status KR\n"
             "/status agent_b US\n"
             "/queue agent_a KR\n"
             "/plan agent_b\n"
-            "/ask agent_c Why did you avoid the top-ranked symbol today?\n"
-            "/directive agent_a Consider including sector leadership in your weekly review.\n"
-            "/setparam agent_b min_strength 115 tighten entry quality\n"
-            "/approve 42 looks good"
+            "/ask agent_c 오늘 상위 종목을 피한 이유가 뭐야?\n"
+            "/directive agent_a 주간 리뷰에 섹터 주도주 관점도 반영해줘.\n"
+            "/setparam agent_b min_strength 115 진입 품질 강화\n"
+            "/approve 42 반영해줘"
         )
 
     def _agent_list_text(self) -> str:
         rows = self.storage.list_agents()
         if not rows:
-            return "No agents found. Run init first."
-        lines = ["[AgentLab] agents"]
+            return "등록된 에이전트가 없습니다. 먼저 init을 실행하세요."
+        lines = ["[AgentLab] 에이전트 목록"]
         for row in rows:
             lines.append(f"- {row.get('agent_id')}: {row.get('name')} ({row.get('role')})")
         return "\n".join(lines)
@@ -1241,58 +1262,58 @@ class TelegramChatRuntime:
                 out = self._format_queue_status(market=market)
         elif cmd == "/plan":
             if len(args) < 1:
-                out = "Usage: /plan <agent_id>"
+                out = "사용법: /plan <agent_id>"
             else:
                 aid = self._normalize_agent_id(args[0])
                 if not aid:
-                    out = "Unknown agent. Use /agents."
+                    out = "알 수 없는 에이전트입니다. /agents 를 확인하세요."
                 else:
-                    out = self._ask_agent(aid, "What is your current plan and rationale right now?")
+                    out = self._ask_agent(aid, "지금 즉시 실행할 계획과 근거를 요약해줘.")
         elif cmd == "/ask":
             if len(args) < 2:
-                out = "Usage: /ask <agent_id> <question>"
+                out = "사용법: /ask <agent_id> <question>"
             else:
                 aid = self._normalize_agent_id(args[0])
                 if not aid:
-                    out = "Unknown agent. Use /agents."
+                    out = "알 수 없는 에이전트입니다. /agents 를 확인하세요."
                 else:
                     question = " ".join(args[1:]).strip()
                     out = self._ask_agent(aid, question)
         elif cmd == "/memory":
             if len(args) < 1:
-                out = "Usage: /memory <agent_id>"
+                out = "사용법: /memory <agent_id>"
             else:
                 aid = self._normalize_agent_id(args[0])
                 if not aid:
-                    out = "Unknown agent. Use /agents."
+                    out = "알 수 없는 에이전트입니다. /agents 를 확인하세요."
                 else:
                     out = self._format_recent_memory(aid)
         elif cmd == "/directive":
             if len(args) < 2:
-                out = "Usage: /directive <agent_id> <request>"
+                out = "사용법: /directive <agent_id> <request>"
             else:
                 aid = self._normalize_agent_id(args[0])
                 if not aid:
-                    out = "Unknown agent. Use /agents."
+                    out = "알 수 없는 에이전트입니다. /agents 를 확인하세요."
                 else:
                     request_text = " ".join(args[1:]).strip()
                     if not request_text:
-                        out = "Request text is empty. Usage: /directive <agent_id> <request>"
+                        out = "요청 문장이 비어 있습니다. 사용법: /directive <agent_id> <request>"
                     else:
                         did = self._create_freeform_directive(aid, request_text, actor)
                         out = (
-                            f"directive #{did} created (PENDING)\n"
-                            f"agent={aid}\n"
-                            f"request={request_text}\n"
-                            "next: /approve <id> [note] or /reject <id> [reason]"
+                            f"지시 #{did} 생성됨 (대기)\n"
+                            f"에이전트={aid}\n"
+                            f"요청={request_text}\n"
+                            "다음 단계: /approve <id> [note] 또는 /reject <id> [reason]"
                         )
         elif cmd == "/setparam":
             if len(args) < 3:
-                out = "Usage: /setparam <agent_id> <param_key> <value> [note]"
+                out = "사용법: /setparam <agent_id> <param_key> <value> [note]"
             else:
                 aid = self._normalize_agent_id(args[0])
                 if not aid:
-                    out = "Unknown agent. Use /agents."
+                    out = "알 수 없는 에이전트입니다. /agents 를 확인하세요."
                 else:
                     key = str(args[1]).strip()
                     value = str(args[2]).strip()
@@ -1306,7 +1327,7 @@ class TelegramChatRuntime:
                     )
                     out = msg
                     if ok:
-                        out += "\nnext: /approve <id> [note] or /reject <id> [reason]"
+                        out += "\n다음 단계: /approve <id> [note] 또는 /reject <id> [reason]"
         elif cmd == "/directives":
             aid = None
             status = None
@@ -1321,42 +1342,42 @@ class TelegramChatRuntime:
             out = self._format_directives(agent_id=aid, status=status)
         elif cmd in {"/approve", "/apply"}:
             if len(args) < 1:
-                out = "Usage: /approve <directive_id> [note]"
+                out = "사용법: /approve <directive_id> [note]"
             else:
                 try:
                     did = int(args[0])
                 except Exception:
                     did = 0
                 if did <= 0:
-                    out = "directive_id must be a positive integer."
+                    out = "directive_id는 1 이상의 정수여야 합니다."
                 else:
                     directive = self._directive_by_id(did)
                     if directive is None:
-                        out = f"directive #{did} not found."
+                        out = f"지시 #{did}를 찾을 수 없습니다."
                     else:
                         note = " ".join(args[1:]).strip()
                         ok, msg = self._apply_directive(directive, actor, note)
                         out = msg
         elif cmd == "/reject":
             if len(args) < 1:
-                out = "Usage: /reject <directive_id> [reason]"
+                out = "사용법: /reject <directive_id> [reason]"
             else:
                 try:
                     did = int(args[0])
                 except Exception:
                     did = 0
                 if did <= 0:
-                    out = "directive_id must be a positive integer."
+                    out = "directive_id는 1 이상의 정수여야 합니다."
                 else:
                     directive = self._directive_by_id(did)
                     if directive is None:
-                        out = f"directive #{did} not found."
+                        out = f"지시 #{did}를 찾을 수 없습니다."
                     else:
                         note = " ".join(args[1:]).strip()
                         ok, msg = self._reject_directive(directive, actor, note)
                         out = msg
         elif cmd:
-            out = "Unknown command. Use /help."
+            out = "알 수 없는 명령어입니다. /help 를 확인하세요."
         else:
             if ":" in text:
                 head, tail = text.split(":", 1)
@@ -1364,16 +1385,16 @@ class TelegramChatRuntime:
                 if aid and tail.strip():
                     out = self._ask_agent(aid, tail.strip())
                 else:
-                    out = "Use /help for supported commands."
+                    out = "지원 명령어는 /help 를 확인하세요."
             else:
-                out = "Use /help for supported commands."
+                out = "지원 명령어는 /help 를 확인하세요."
 
         thread_id = message.get("message_thread_id")
         self._send_message(out, thread_id=str(thread_id) if thread_id is not None else None)
 
     def _poll_once(self) -> int:
         if not self.telegram_enabled:
-            raise RuntimeError("Telegram is not configured. Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID.")
+            raise RuntimeError("텔레그램 설정이 없습니다. TELEGRAM_BOT_TOKEN과 TELEGRAM_CHAT_ID를 확인하세요.")
         params = {
             "offset": self.offset,
             "timeout": self.poll_timeout,

@@ -1,292 +1,163 @@
-# systematic-alpha (Agent-First)
+# systematic-alpha (WSL 전용, Agent 자동운용)
 
-This project is operated in **Agent mode**.
-This repository is now **WSL-first (Linux shell)**.
+이 레포는 KR/US 신호를 바탕으로 3개 에이전트가 자동으로 매매/리뷰/토의를 수행하는 프로젝트입니다.
 
-- KR/US market signals are generated internally.
-- `Agent Lab` (3 agents) consumes those signals and proposes BUY/SELL actions.
-- Telegram notifications are focused on agent proposals and agent workflow events.
+## 1. 핵심 동작
 
-Manual "top-3 picks for discretionary trading" is no longer the primary workflow in this repository.
+- 신호 생성
+  - KR/US 장 시작 구간에서 신호 JSON 생성
+  - 예: `out/kr/YYYYMMDD/results/*.json`, `out/us/YYYYMMDD/results/*.json`
+- Agent Lab
+  - `agent_a`: 모멘텀/수급 강화형
+  - `agent_b`: 리스크 우선형
+  - `agent_c`: 반대가설/다양성형
+- 데몬
+  - `telegram-chat`: 텔레그램 명령 수신/응답
+  - `auto-strategy-daemon`: 장중 반복 모니터링/제안/자동실행
 
-## Core Architecture
-
-- `Signal Engine` (internal dependency)
-  - Produces KR/US session JSON signals.
-  - Output examples:
-    - `out/kr/YYYYMMDD/results/*.json`
-    - `out/us/YYYYMMDD/results/*.json`
-- `Agent Lab` (primary operation layer)
-  - `agent_a`: momentum/flow bias
-  - `agent_b`: risk-first conservative bias
-  - `agent_c`: counter-hypothesis/diversification bias
-  - Runs multi-round weekly council debate and strategy updates.
-  - Generates order proposals, review reports, and weekly council decisions.
-
-## Install
+## 2. 설치
 
 ```bash
 conda create -n systematic-alpha python=3.12 -y
 conda activate systematic-alpha
 pip install -r requirements.txt
-# openai is included in requirements.txt; install explicitly only if needed:
-# pip install openai
 ```
 
-## Environment
+## 3. 환경변수
 
-Copy `.env.example` to `.env`, then fill secrets.
+`.env.example`를 `.env`로 복사 후 값 입력:
 
-Required:
+- 필수
+  - `KIS_APP_KEY`
+  - `KIS_APP_SECRET`
+  - `KIS_ACC_NO`
+- 텔레그램
+  - `TELEGRAM_BOT_TOKEN`
+  - `TELEGRAM_CHAT_ID`
+- OpenAI(권장)
+  - `OPENAI_API_KEY`
+  - `OPENAI_MODEL`
+  - `OPENAI_MAX_DAILY_COST`
 
-- `KIS_APP_KEY`
-- `KIS_APP_SECRET`
-- `KIS_ACC_NO`
+알림 필터(중요):
 
-Recommended for notifications:
+- `AGENT_LAB_NOTIFY_EVENTS`
+  - 기본값: `trade_executed,preopen_plan,session_close_report,weekly_council`
+  - 이 목록에 없는 이벤트는 텔레그램 푸시를 보내지 않습니다.
 
-- `TELEGRAM_BOT_TOKEN`
-- `TELEGRAM_CHAT_ID`
-
-Optional for LLM-assisted agent updates:
-
-- `AGENT_LAB_ENABLED=1`
-- `OPENAI_API_KEY=...`
-- `OPENAI_MODEL=gpt-4o-mini`
-- `OPENAI_MAX_DAILY_COST=5.0`
-- `AGENT_LAB_EXECUTION_MODE=mojito_mock` (mock-account API execution)
-- `AGENT_LAB_AUTO_APPROVE=1` (auto execute without manual approval)
-- `AGENT_LAB_USE_LIVE_FX=1` (try live USD/KRW rate first)
-- `AGENT_LAB_FX_TIMEOUT_SECONDS=8` (timeout per FX provider call)
-- `AGENT_LAB_TELEGRAM_USE_ENV_PROXY=0` (default; set `1` only if your network requires env proxy)
-- `SYSTEMATIC_ALPHA_PROXY_MODE=auto` (`auto|off|clear_all`, network guard for broken proxy env)
-- `AGENT_LAB_USDKRW_DEFAULT=1300` (fallback if live FX/cache unavailable)
-- `AGENT_LAB_HEARTBEAT_MINUTES=30` (periodic daemon heartbeat Telegram interval)
-- `AGENT_LAB_MAX_FREEDOM=1` (relax runtime caps for aggressive intraday autonomy)
-- `AGENT_LAB_MAX_FREEDOM_INTERVAL_SEC=30` (monitor/propose loop interval while market is open)
-- `AGENT_LAB_INTRADAY_MONITOR_PROPOSE=1` (monitor-cycle propose/orders during market open)
-- `AGENT_LAB_INTRADAY_SIGNAL_REFRESH=1` (monitor-cycle reruns market scanner before propose)
-- `AGENT_LAB_INTRADAY_COLLECT_SECONDS=45` (realtime collection length per refresh run)
-- `AGENT_LAB_INTRADAY_MAX_SYMBOLS_SCAN=200` (scan cap per refresh run; lower=faster)
-
-## WSL One Command: Activate Everything
+## 4. 작업 등록/해제
 
 ```bash
 chmod +x scripts/*.sh
 ./scripts/register_all_tasks_wsl.sh
 ```
 
-WSL scripts automatically resolve Python to `~/anaconda3/envs/systematic-alpha/bin/python`.
-If `.env` contains a Windows-style `PYTHON_BIN`, it is ignored in WSL mode.
-
-This registers cron-based automation in WSL:
-
-- KR prefetch + open-time signal run + Agent ingest/propose/auto-execution
-- US prefetch + open-time signal run + Agent ingest/propose/auto-execution
-- Daily review, weekly council
-- Telegram chat worker (`@reboot`)
-- Auto strategy daemon (`@reboot`)
-- Agent Lab initialization (`10,000,000 KRW`, `3 agents`) by default
-- Plus immediate bootstrap: `telegram-chat` and `auto-strategy-daemon` are restarted right away (even if already running).
-
-Default behavior:
-
-- Agent proposals are auto-executed in paper account mode when `AGENT_LAB_AUTO_APPROVE=1`.
-- Auto strategy daemon polls every 30s by default and runs intraday monitor cycles during open windows.
-- Intraday monitor can refresh market signals and then re-propose/re-execute orders in the same cycle.
-- Agent workflow notifications are sent from python orchestrator (if Telegram is configured).
-- Manual order approval step is disabled in this WSL setup. Order proposal status is expected to be `EXECUTED` or `BLOCKED` (not `PENDING_APPROVAL`).
-
-Quick check after registration:
-
-```bash
-crontab -l
-ps -ef | grep run_agent_lab_wsl.sh | grep -v grep
-```
-
-## WSL One Command: Remove Everything
+전체 제거:
 
 ```bash
 ./scripts/remove_all_tasks_wsl.sh
 ```
 
-## WSL One Command: Reset Tasks (Down + Up)
-
-Use this after code/config updates when you want to fully restart scheduler + daemons in one line.
-
-```bash
-./scripts/reset_all_tasks_wsl.sh
-```
-
-## WSL One Command: Reset Tasks (Preserve State)
-
-Use this during live operation to restart scheduler + daemons **without** re-running Agent Lab init.
-This preserves current capital/accounting state, strategy versions, and agent memories.
+상태 보존 리셋(추천):
 
 ```bash
 ./scripts/reset_tasks_preserve_state_wsl.sh
 ```
 
-Equivalent one-liner:
+## 5. 자동 스케줄
+
+### KR
+
+- 07:30 KST: 유니버스 프리패치
+- 08:50 KST: 개장 10분 전 플랜 보고
+- 09:00 KST: 신호 생성(run_daily)
+- 15:40 KST: 장 종료 10분 후 결과/토의 보고
+
+### US (미국 동부시간 기준)
+
+- 08:30 ET: 유니버스 프리패치
+- 09:20 ET: 개장 10분 전 플랜 보고
+- 09:30 ET: 신호 생성(run_daily)
+- 16:10 ET: 장 종료 10분 후 결과/토의 보고
+
+### 공통
+
+- 매주 토요일 08:00 KST: 주간 토의 보고
+- `@reboot`: `telegram-chat`, `auto-strategy-daemon` 자동 시작
+
+## 6. 텔레그램으로 받는 보고(요구사항 반영)
+
+아래 5가지만 자동 보고합니다.
+
+1. 에이전트 매매(체결) 발생 시
+2. KR 개장 10분 전 플랜 보고
+3. KR 마감 10분 후 일일 결과 + 에이전트 토의 요약
+4. US 개장/마감도 2~3과 동일
+5. 주간 에이전트 토의 보고
+
+그 외 이벤트(하트비트, 데몬 시작, 장중 모니터링 등)는 기본적으로 텔레그램 푸시를 보내지 않습니다.
+설명이 필요한 보고(개장 전 플랜, 장 종료 후 결과/토의, 주간 토의 요약)는 OpenAI LLM이 활성화된 경우 LLM 설명문을 함께 생성합니다.
+
+## 7. 텔레그램 명령어
+
+- `/help`
+- `/agents`
+- `/status`
+- `/status KR`
+- `/status US`
+- `/status agent_a KR`
+- `/queue`
+- `/queue agent_b US`
+- `/plan agent_a`
+- `/ask agent_b 지금 계획 요약해줘`
+- `/memory agent_c`
+- `/directive agent_a 장중 변동성 급증 시 노출 축소`
+- `/setparam agent_b min_strength 115 보수적으로 상향`
+- `/directives`
+- `/approve <id>`
+- `/reject <id>`
+
+## 8. 수동 실행 명령
 
 ```bash
-INIT_AGENT_LAB=0 ./scripts/reset_all_tasks_wsl.sh
-```
-
-## Cleanup Legacy Constraint Residue
-
-If old identity/memory or pending-approval traces remain from earlier versions, run:
-
-```bash
-/home/heesu/anaconda3/envs/systematic-alpha/bin/python -m systematic_alpha.agent_lab.cli --project-root . sanitize-state
-```
-
-This refreshes `identity.md`, filters legacy memory lines, and cleans stale `PENDING_APPROVAL` proposal residue.
-
-## Check Registered Cron Jobs
-
-```bash
-crontab -l
-```
-
-## Agent Notifications
-
-When Telegram is configured, Agent Lab sends:
-
-- Session ingest status
-- Agent proposal summary (`BUY/SELL symbol x qty`)
-- Auto trade execution results (`FILLED/REJECTED`, proposal id, symbol/qty)
-- Failure events (ingest/propose/review/execution)
-- Daily review completion
-- Weekly council debate summary (champion, promoted versions, moderator summary)
-- Weekly debate excerpts (opening/rebuttal, short form)
-- OpenAI token/quota alerts during council (daily budget, quota, token/context limits)
-- Interactive chat replies from agents (`/ask`, `/plan`, `/status`, `/queue`)
-- Automatic data-reception self-heal events (critical failure detection + safe patch attempts)
-- Automatic strategy-update events from auto strategy daemon
-- OpenAI token/quota/budget alerts from auto strategy daemon
-- Auto strategy heartbeat events (current action, reason, next poll, monitor state)
-- Intraday monitor cycle events (enabled/disabled, market state, optional propose result)
-
-## Important Paths
-
-- Agent DB: `state/agent_lab/agent_lab.sqlite`
-- Agent identity: `state/agent_lab/agents/<agent_id>/identity.md`
-- Agent memory: `state/agent_lab/agents/<agent_id>/memory.jsonl`
-- Agent artifacts: `out/agent_lab/YYYYMMDD/`
-- Weekly council artifacts: `out/agent_lab/YYYYMMDD_weekly/`
-- Agent action timeline: `out/agent_lab/YYYYMMDD/activity_log.jsonl`
-- Agent logs: `logs/agent_lab/YYYYMMDD/`
-
-## Manual Agent Commands (WSL)
-
-```bash
-# initialize
+# 초기화
 ./scripts/run_agent_lab_wsl.sh --action init --capital-krw 10000000 --agents 3
 
-# KR/US ingest + propose + auto-execute
-./scripts/run_agent_lab_wsl.sh --action ingest-propose --market KR
-./scripts/run_agent_lab_wsl.sh --action ingest-propose --market US
+# 개장 전 플랜 보고
+./scripts/run_agent_lab_wsl.sh --action preopen-plan --market KR --date YYYYMMDD
+./scripts/run_agent_lab_wsl.sh --action preopen-plan --market US --date YYYYMMDD
 
-# review / council
-./scripts/run_agent_lab_wsl.sh --action daily-review --date YYYYMMDD
+# 장 마감 후 결과/토의 보고
+./scripts/run_agent_lab_wsl.sh --action close-report --market KR --date YYYYMMDD
+./scripts/run_agent_lab_wsl.sh --action close-report --market US --date YYYYMMDD
+
+# 주간 토의
 ./scripts/run_agent_lab_wsl.sh --action weekly-council --week YYYY-Www
 
-# self-heal (manual trigger)
-python -m systematic_alpha.agent_lab.cli --project-root . self-heal --market KR --date YYYYMMDD --log-path <log_file> --output-json <result_json>
-
-# Telegram interactive worker
+# 데몬
 ./scripts/run_agent_lab_wsl.sh --action telegram-chat
-
-# Auto strategy daemon
 ./scripts/run_agent_lab_wsl.sh --action auto-strategy-daemon
-
-# One-shot checks
-./scripts/run_agent_lab_wsl.sh --action telegram-chat --chat-once
-./scripts/run_agent_lab_wsl.sh --action auto-strategy-daemon --auto-strategy-once
 ```
 
-## Telegram 사용 가이드
+## 9. 경로
 
-텔레그램에서 아래 명령어로 에이전트와 직접 소통할 수 있습니다.
+- DB: `state/agent_lab/agent_lab.sqlite`
+- 에이전트 정체성: `state/agent_lab/agents/<agent_id>/identity.md`
+- 에이전트 메모리: `state/agent_lab/agents/<agent_id>/memory.jsonl`
+- 산출물: `out/agent_lab/YYYYMMDD/`
+- 주간 산출물: `out/agent_lab/YYYYMMDD_weekly/`
+- 로그: `logs/agent_lab/YYYYMMDD/`, `logs/cron/`
 
-사전 확인:
+## 10. 트러블슈팅
 
-1. `.env`에 `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`가 설정되어 있어야 합니다.
-2. `telegram-chat` 데몬이 실행 중이어야 합니다.
-3. 아래 명령으로 실행 상태를 확인할 수 있습니다.
+- 텔레그램 무응답 시
+  1. `ps -ef | grep run_agent_lab_wsl.sh | grep -v grep`
+  2. `.env`의 `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` 확인
+  3. `logs/cron/agent_telegram_chat.log` 확인
+  4. `./scripts/reset_tasks_preserve_state_wsl.sh` 실행
+
+- 레거시 상태 정리
 
 ```bash
-ps -ef | grep run_agent_lab_wsl.sh | grep -v grep
+/home/heesu/anaconda3/envs/systematic-alpha/bin/python -m systematic_alpha.agent_lab.cli --project-root . sanitize-state --retain-days 30 --keep-agent-memories 300
 ```
-
-주요 명령어:
-
-| 명령어 | 용도 | 예시 입력 | 예상 응답(요약) |
-|---|---|---|---|
-| `/help` | 사용 가능한 명령 확인 | `/help` | 명령어 목록과 사용법 |
-| `/agents` | 활성 에이전트 목록 확인 | `/agents` | `agent_a`, `agent_b`, `agent_c` 역할 요약 |
-| `/status` | 전체 상태 요약 | `/status` | 최근 KR/US 실행 상태, 제안/주문/에러 요약 |
-| `/status <agent_id>` | 특정 에이전트 상태 | `/status agent_a` | 해당 에이전트의 최신 포지션/최근 의사결정 |
-| `/status KR\|US` | 시장별 상태 요약 | `/status KR` | KR 파이프라인 상태와 다음 실행 시각/남은 초 |
-| `/status <agent_id> KR\|US` | 에이전트+시장 상태 | `/status agent_a US` | 해당 에이전트의 US 최신 제안/주문/다음 실행까지 남은 초 |
-| `/queue` | 큐/스케줄 점검 | `/queue` | KR/US 파이프라인 마지막 실행 + 다음 실행 시각/남은 초 + 데몬 상태 |
-| `/queue <agent_id> KR\|US` | 에이전트별 큐 점검 | `/queue agent_b KR` | 해당 에이전트의 KR 최신 proposal 상태 + 다음 실행 남은 초 |
-| `/plan <agent_id>` | 현재 운용 계획 확인 | `/plan agent_b` | 금일 계획, 진입/회피 기준, 리스크 관점 |
-| `/ask <agent_id> <질문>` | 자유 질의응답 | `/ask agent_c 오늘 상위 종목 대신 5위를 고른 이유?` | 해당 판단 근거와 대안 설명 |
-| `/memory <agent_id>` | 최근 기억(학습 로그) 확인 | `/memory agent_a` | 최근 의사결정/교훈/다음 액션 |
-| `/directive <agent_id> <지시문>` | 자연어 지시 생성(PENDING) | `/directive agent_a 거래량 급증 종목을 더 우선 고려해` | 지시 ID 생성, 상태 `PENDING` |
-| `/setparam <agent_id> <key> <value> <메모>` | 파라미터 수정 지시(PENDING) | `/setparam agent_b min_strength 115 체결강도 기준 상향` | 파라미터 지시 ID 생성 |
-| `/directives` | 지시 대기열 조회 | `/directives` | 승인/거절 대기 ID 목록 |
-| `/approve <id> <메모>` | 지시 승인 적용 | `/approve 42 apply now` | 적용 완료, 전략/메모리 반영 결과 |
-| `/reject <id> <사유>` | 지시 거절 | `/reject 42 risk too high` | 거절 처리, 사유 기록 |
-
-실전 대화 예시:
-
-1. 시장 분리 상태 점검
-입력: `/status KR`
-응답 예시: `KR pipeline + next_prefetch/next_signal-scan/next_agent-exec (in N seconds)`
-2. 큐/남은 시간 점검
-입력: `/queue agent_a US`
-응답 예시: `US latest=BLOCKED, next_agent_exec=... (in N seconds), daemon status`
-3. 전략 이유 질의
-입력: `/ask agent_a 오늘 1순위 종목을 선택한 핵심 이유 3가지만 알려줘`
-응답 예시: `체결강도 유지, VWAP 상단 유지, 호가비율 우위`
-4. 전략 수정 요청
-입력: `/setparam agent_b min_bid_ask_ratio 1.3 보수적으로 상향`
-응답 예시: `directive_id=57, status=PENDING`
-입력: `/approve 57 apply now`
-응답 예시: `directive 57 applied, strategy version promoted`
-
-지시(Directive) 처리 순서:
-
-1. `/directive` 또는 `/setparam`으로 지시 생성 (`PENDING`)
-2. `/directives`로 대기열 확인
-3. `/approve` 또는 `/reject`로 확정
-4. 적용된 지시는 `state/agent_lab/agents/<agent_id>/memory.jsonl`에 기록
-5. `setparam` 적용 시 전략 버전이 갱신되고, 주간 회의 맥락에도 반영
-
-실행 모델 참고:
-
-1. 기본 신호 파이프라인은 장별 스케줄 실행입니다 (KR 09:00, US 09:30 ET).
-2. `collect_seconds`는 "해당 실행 1회 내부의 실시간 수집 길이"이며, 항상-상시 루프 의미가 아닙니다.
-3. 에이전트 전략 파라미터 `intraday_monitor_enabled`, `intraday_monitor_interval_sec`를 통해 장중 모니터링 모드를 스스로 켜고 주기를 조정할 수 있습니다.
-4. 현재 모니터링/대기/오류 상태는 `/queue`, `/status KR`, `/status US`에서 heartbeat와 함께 확인할 수 있습니다.
-
-운영 팁:
-
-1. 실행 직후에는 `/status KR`, `/status US`, `/queue`로 먼저 상태/남은 시간을 확인한 뒤 질의하세요.
-2. 전략 변경은 반드시 `PENDING -> approve` 순서로 적용하세요.
-3. 응답이 없으면 `telegram-chat` 데몬 프로세스와 `logs/cron/agent_telegram_chat.log`를 확인하세요.
-
-Identity and memory are persisted in `state/agent_lab/agents/<agent_id>/`.
-If you stop and restart tasks for code updates, agents warm-start from identity + recent memory + latest checkpoint.
-
-## Note on Legacy Signal Code
-
-The legacy KR/US selector code is still required because Agent Lab currently ingests its signal outputs.
-So selector code remains in the repository as an internal dependency.
-
-## Disclaimer
-
-This repository is for research and automation purposes only, not investment advice.

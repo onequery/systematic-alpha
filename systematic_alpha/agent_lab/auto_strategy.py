@@ -39,7 +39,16 @@ def _truncate(text: str, max_chars: int = 3300) -> str:
     body = str(text or "")
     if len(body) <= max_chars:
         return body
-    return body[:max_chars] + "\n...(truncated)..."
+    return body[:max_chars] + "\n...(중략)..."
+
+
+def _parse_csv_set(value: str) -> set[str]:
+    out: set[str] = set()
+    for raw in str(value or "").split(","):
+        token = raw.strip().lower()
+        if token:
+            out.add(token)
+    return out
 
 
 @dataclass
@@ -85,6 +94,8 @@ class AutoStrategyDaemon:
 
         self.http = requests.Session()
         self.http.trust_env = False
+        default_events = "trade_executed,preopen_plan,session_close_report,weekly_council"
+        self.allowed_notify_events = _parse_csv_set(os.getenv("AGENT_LAB_NOTIFY_EVENTS", default_events))
 
     def close(self) -> None:
         self.orchestrator.close()
@@ -104,8 +115,15 @@ class AutoStrategyDaemon:
         )
         return any(key in text for key in keys)
 
-    def _send_telegram(self, text: str) -> None:
+    def _allow_event(self, event: str) -> bool:
+        if "*" in self.allowed_notify_events:
+            return True
+        return str(event or "").strip().lower() in self.allowed_notify_events
+
+    def _send_telegram(self, text: str, *, event: str = "misc") -> None:
         if not self.telegram_enabled:
+            return
+        if not self._allow_event(event):
             return
         payload: Dict[str, Any] = {
             "chat_id": self.telegram_chat_id,
@@ -138,10 +156,12 @@ class AutoStrategyDaemon:
         payload = {"reason": str(reason or ""), "at": _now_iso()}
         self.storage.log_event("auto_strategy_llm_limit_alert", payload, payload["at"])
         self._send_telegram(
-            "[AgentLab] alert\n"
-            "auto-strategy daemon hit OpenAI token/quota/budget limit.\n"
-            f"reason={payload['reason']}\n"
-            "action=Increase OPENAI_MAX_DAILY_COST, check billing/quota, or reduce auto-strategy frequency."
+            "[AgentLab] 알림\n"
+            "오토전략 데몬에서 OpenAI 토큰/쿼터/예산 제한에 도달했습니다.\n"
+            f"사유={payload['reason']}\n"
+            "조치=OPENAI_MAX_DAILY_COST 상향, 결제/쿼터 점검, 오토전략 빈도 축소"
+            ,
+            event="llm_limit_alert",
         )
 
     def _latest_equity_rows(self) -> Dict[str, List[Dict[str, Any]]]:
@@ -208,6 +228,44 @@ class AutoStrategyDaemon:
     @staticmethod
     def _max_freedom_mode() -> bool:
         return _truthy(os.getenv("AGENT_LAB_MAX_FREEDOM", "1"))
+
+    @staticmethod
+    def _ko_signal_status(value: str) -> str:
+        mapping = {
+            "SIGNAL_OK": "신호정상",
+            "MARKET_CLOSED": "장종료",
+            "INVALID_SIGNAL": "신호무효",
+            "DATA_QUALITY_LOW": "데이터품질저하",
+            "NO_SIGNAL": "신호없음",
+        }
+        key = str(value or "").strip().upper()
+        ko = mapping.get(key)
+        if ko:
+            return f"{ko}({key})"
+        return str(value or "-")
+
+    @staticmethod
+    def _ko_action(value: str) -> str:
+        mapping = {
+            "monitor_only": "모니터링만",
+            "skip": "건너뜀",
+            "updated": "업데이트",
+            "idle": "유휴",
+            "error": "오류",
+        }
+        return mapping.get(str(value or "").strip(), str(value or "-"))
+
+    @staticmethod
+    def _ko_monitor_state(value: str) -> str:
+        mapping = {
+            "outside_window": "장외",
+            "disabled": "비활성",
+            "waiting": "대기",
+            "executed": "실행",
+            "idle": "유휴",
+        }
+        raw = str(value or "").strip()
+        return mapping.get(raw, raw or "-")
 
     def _refresh_intraday_signal(self, market: str, now_kst: datetime) -> Dict[str, Any]:
         market = str(market).upper()
@@ -451,15 +509,18 @@ class AutoStrategyDaemon:
                 payload["propose_error"] = repr(exc)
 
         self.storage.log_event("auto_intraday_monitor_cycle", payload, _now_iso())
+        signal_text = self._ko_signal_status(signal_status)
         self._send_telegram(
-            "[AgentLab] intraday-monitor\n"
-            f"market={market}\n"
-            f"mode={payload.get('mode')}\n"
-            f"signal={signal_status} ({signal_date or '-'})\n"
-            f"refresh_ok={payload.get('refresh_ok')}\n"
-            f"proposal_status={status_counts if status_counts else '(none)'}\n"
-            f"propose_triggered={payload.get('propose_triggered')}\n"
-            f"propose_ok={payload.get('propose_ok')}"
+            "[AgentLab] 장중 모니터링\n"
+            f"시장={market}\n"
+            f"모드={payload.get('mode')}\n"
+            f"신호={signal_text} ({signal_date or '-'})\n"
+            f"리프레시_성공={payload.get('refresh_ok')}\n"
+            f"제안_상태={status_counts if status_counts else '(없음)'}\n"
+            f"제안_트리거={payload.get('propose_triggered')}\n"
+            f"제안_성공={payload.get('propose_ok')}"
+            ,
+            event="intraday_monitor",
         )
         return payload
 
@@ -526,13 +587,18 @@ class AutoStrategyDaemon:
         mk = monitor.get("markets", {}) if isinstance(monitor, dict) else {}
         kr = mk.get("KR", {}) if isinstance(mk, dict) else {}
         us = mk.get("US", {}) if isinstance(mk, dict) else {}
+        action_ko = self._ko_action(str(payload.get("action", "-")))
+        kr_state = self._ko_monitor_state(str(kr.get("state", "-")))
+        us_state = self._ko_monitor_state(str(us.get("state", "-")))
         self._send_telegram(
-            "[AgentLab] heartbeat\n"
-            f"action={payload.get('action', '-')}\n"
-            f"reason={payload.get('reason', '-')}\n"
-            f"next_poll_in={payload.get('next_poll_in_sec', self.poll_seconds)}s\n"
-            f"monitor_enabled={monitor.get('enabled', False)} interval={monitor.get('interval_sec', 0)}s\n"
-            f"KR={kr.get('state', '-')}, US={us.get('state', '-')}"
+            "[AgentLab] 하트비트\n"
+            f"액션={action_ko}({payload.get('action', '-')})\n"
+            f"사유={payload.get('reason', '-')}\n"
+            f"다음_폴링={payload.get('next_poll_in_sec', self.poll_seconds)}s\n"
+            f"모니터_활성={monitor.get('enabled', False)} 주기={monitor.get('interval_sec', 0)}s\n"
+            f"KR={kr_state}, US={us_state}"
+            ,
+            event="heartbeat",
         )
         self.storage.log_event("auto_strategy_heartbeat_notice", payload, _now_iso())
 
@@ -776,13 +842,15 @@ class AutoStrategyDaemon:
             created_at=_now_iso(),
         )
         self._send_telegram(
-            "[AgentLab] auto-strategy-update\n"
-            f"week={updated.get('week_id')}\n"
-            f"champion={updated.get('champion_agent_id')}\n"
-            f"trigger_codes={','.join(updated.get('trigger_codes', []))}\n"
-            f"vote_mode={vote.get('mode')}\n"
-            f"vote_reason={vote.get('reason')}\n"
-            f"artifact={updated.get('artifact_path')}"
+            "[AgentLab] 오토전략 업데이트\n"
+            f"주차={updated.get('week_id')}\n"
+            f"우승전략={updated.get('champion_agent_id')}\n"
+            f"트리거_코드={','.join(updated.get('trigger_codes', []))}\n"
+            f"투표_모드={vote.get('mode')}\n"
+            f"투표_사유={vote.get('reason')}\n"
+            f"결과_파일={updated.get('artifact_path')}"
+            ,
+            event="auto_strategy_update",
         )
         return {"action": "updated", "intraday_monitor": intraday_monitor, **updated}
 
@@ -793,11 +861,13 @@ class AutoStrategyDaemon:
             created_at=_now_iso(),
         )
         self._send_telegram(
-            "[AgentLab] auto-strategy-daemon start\n"
-            f"poll_seconds={self.poll_seconds}\n"
-            f"cooldown_minutes={self.cooldown_minutes}\n"
-            f"max_updates_per_day={self.max_updates_per_day}\n"
-            f"heartbeat_minutes={self.heartbeat_minutes}"
+            "[AgentLab] 오토전략 데몬 시작\n"
+            f"폴링_주기(초)={self.poll_seconds}\n"
+            f"쿨다운(분)={self.cooldown_minutes}\n"
+            f"일일_최대_업데이트={self.max_updates_per_day}\n"
+            f"하트비트_주기(분)={self.heartbeat_minutes}"
+            ,
+            event="daemon_start",
         )
         if once:
             latest_once = self.run_once()
@@ -817,8 +887,10 @@ class AutoStrategyDaemon:
                 self.storage.log_event("auto_strategy_daemon_error", err, _now_iso())
                 self._emit_heartbeat(err, daemon_status="error")
                 self._send_telegram(
-                    "[AgentLab] auto-strategy-daemon error\n"
-                    f"error={repr(exc)}"
+                    "[AgentLab] 오토전략 데몬 오류\n"
+                    f"오류={repr(exc)}"
+                    ,
+                    event="daemon_error",
                 )
                 time.sleep(10)
                 continue
