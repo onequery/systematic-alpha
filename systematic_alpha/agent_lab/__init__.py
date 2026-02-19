@@ -14,4 +14,5 @@ __all__ = [
     "telegram_chat",
     "self_heal",
     "auto_strategy",
+    "notify",
 ]

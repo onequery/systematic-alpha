@@ -11,6 +11,7 @@ from systematic_alpha.agent_lab.accounting import AccountingEngine
 from systematic_alpha.agent_lab.agents import AgentDecisionEngine, build_default_agent_profiles, profile_from_agent_row
 from systematic_alpha.agent_lab.identity import AgentIdentityStore
 from systematic_alpha.agent_lab.llm_client import LLMClient
+from systematic_alpha.agent_lab.notify import TelegramNotifier
 from systematic_alpha.agent_lab.paper_broker import PaperBroker
 from systematic_alpha.agent_lab.risk_engine import RiskEngine
 from systematic_alpha.agent_lab.schemas import (
@@ -30,6 +31,11 @@ PROMOTION_SCORE_THRESHOLD = 0.60
 
 def now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
+
+
+def _truthy(value: str) -> bool:
+    norm = str(value or "").strip().lower()
+    return norm in {"1", "true", "yes", "y", "on"}
 
 
 def parse_week_id(week_id: str) -> Tuple[date, date]:
@@ -55,6 +61,7 @@ class AgentLabOrchestrator:
         self.accounting = AccountingEngine(self.storage)
         self.risk = RiskEngine()
         self.paper_broker = PaperBroker(self.storage)
+        self.notifier = TelegramNotifier()
 
     def close(self) -> None:
         self.storage.close()
@@ -73,6 +80,37 @@ class AgentLabOrchestrator:
         out = self._artifact_dir(yyyymmdd) / f"{name}.md"
         out.write_text(text, encoding="utf-8")
         return out
+
+    def _append_activity_artifact(self, yyyymmdd: str, event_type: str, payload: Dict[str, Any]) -> None:
+        path = self._artifact_dir(yyyymmdd) / "activity_log.jsonl"
+        row = {
+            "ts": now_iso(),
+            "event_type": event_type,
+            "payload": payload,
+        }
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+    def _notify(self, text: str) -> None:
+        self.notifier.send(text)
+
+    @staticmethod
+    def _orders_to_text(orders: List[Dict[str, Any]], limit: int = 5) -> str:
+        if not orders:
+            return "none"
+        chunks: List[str] = []
+        for row in orders[:limit]:
+            side = str(row.get("side", ""))
+            symbol = str(row.get("symbol", ""))
+            qty = float(row.get("quantity", 0.0) or 0.0)
+            status = str(row.get("status", "")).strip()
+            if status:
+                chunks.append(f"{side} {symbol} x{qty:.0f} ({status})")
+            else:
+                chunks.append(f"{side} {symbol} x{qty:.0f}")
+        if len(orders) > limit:
+            chunks.append(f"... +{len(orders) - limit}")
+        return ", ".join(chunks)
 
     def _today_str(self) -> str:
         return datetime.now().strftime("%Y%m%d")
@@ -181,7 +219,14 @@ class AgentLabOrchestrator:
             payload={"capital_krw": capital_krw, "agents": len(profiles), "date": self._today_str()},
             created_at=now_iso(),
         )
-        return {"agents": [p.agent_id for p in profiles], "capital_krw": capital_krw}
+        payload = {"agents": [p.agent_id for p in profiles], "capital_krw": capital_krw}
+        self._append_activity_artifact(self._today_str(), "lab_initialized", payload)
+        self._notify(
+            "[AgentLab] init\n"
+            f"capital_krw={capital_krw:.0f}\n"
+            f"agents={', '.join(payload['agents'])}"
+        )
+        return payload
 
     def ingest_session(self, market: str, yyyymmdd: str) -> Dict[str, Any]:
         market = market.strip().upper()
@@ -213,9 +258,23 @@ class AgentLabOrchestrator:
         }
         self._write_json_artifact(yyyymmdd, f"ingest_{market.lower()}_{yyyymmdd}", out)
         self.storage.log_event("session_ingested", out, now_iso())
+        self._append_activity_artifact(yyyymmdd, "session_ingested", out)
+        self._notify(
+            "[AgentLab] ingest-session\n"
+            f"market={market}\n"
+            f"date={yyyymmdd}\n"
+            f"status={status_code}\n"
+            f"invalid_reason={invalid_reason or '-'}"
+        )
         return out
 
-    def propose_orders(self, market: str, yyyymmdd: str) -> Dict[str, Any]:
+    def propose_orders(
+        self,
+        market: str,
+        yyyymmdd: str,
+        *,
+        auto_execute: Optional[bool] = None,
+    ) -> Dict[str, Any]:
         market = market.strip().upper()
         signal = self.storage.get_latest_session_signal(market, yyyymmdd)
         if signal is None:
@@ -223,6 +282,9 @@ class AgentLabOrchestrator:
             signal = self.storage.get_latest_session_signal(market, yyyymmdd)
         if signal is None:
             raise RuntimeError("failed to load session signal")
+
+        if auto_execute is None:
+            auto_execute = _truthy(os.getenv("AGENT_LAB_AUTO_APPROVE", "1"))
 
         agents = self.storage.list_agents()
         if not agents:
@@ -309,14 +371,67 @@ class AgentLabOrchestrator:
                 }
             )
 
+        execution_results: List[Dict[str, Any]] = []
+        if bool(auto_execute):
+            for row in output_rows:
+                if str(row.get("status", "")) != PROPOSAL_STATUS_PENDING_APPROVAL:
+                    continue
+                proposal_id = int(row["proposal_id"])
+                try:
+                    executed = self.approve_orders(
+                        proposal_identifier=str(proposal_id),
+                        approved_by="auto_executor",
+                        note=f"auto-approved market={market} date={yyyymmdd}",
+                    )
+                    row["status"] = str(executed.get("status", row["status"]))
+                    row["auto_execution"] = {"ok": True, "status": row["status"]}
+                    execution_results.append(
+                        {
+                            "proposal_id": proposal_id,
+                            "agent_id": row.get("agent_id"),
+                            "ok": True,
+                            "status": row["status"],
+                            "fills": executed.get("fills", []),
+                        }
+                    )
+                except Exception as exc:
+                    row["auto_execution"] = {"ok": False, "error": repr(exc)}
+                    execution_results.append(
+                        {
+                            "proposal_id": proposal_id,
+                            "agent_id": row.get("agent_id"),
+                            "ok": False,
+                            "error": repr(exc),
+                        }
+                    )
+
         payload = {
             "market": market,
             "date": yyyymmdd,
             "hold_mode_pending_approval": hold_mode,
+            "auto_execute": bool(auto_execute),
             "proposals": output_rows,
+            "execution_results": execution_results,
         }
         self._write_json_artifact(yyyymmdd, f"proposals_{market.lower()}_{yyyymmdd}", payload)
         self.storage.log_event("orders_proposed", payload, now_iso())
+        self._append_activity_artifact(yyyymmdd, "orders_proposed", payload)
+
+        lines = [
+            "[AgentLab] propose",
+            f"market={market}",
+            f"date={yyyymmdd}",
+            f"auto_execute={bool(auto_execute)}",
+        ]
+        for row in output_rows:
+            lines.append(
+                f"{row.get('agent_id')}: {row.get('status')} | "
+                f"{self._orders_to_text(list(row.get('orders') or []), limit=3)}"
+            )
+        if execution_results:
+            ok_count = sum(1 for x in execution_results if bool(x.get("ok")))
+            lines.append(f"auto_execution_result={ok_count}/{len(execution_results)} success")
+        self._notify("\n".join(lines))
         return payload
 
     def approve_orders(self, proposal_identifier: str, approved_by: str = "manual", note: str = "") -> Dict[str, Any]:
@@ -344,7 +459,15 @@ class AgentLabOrchestrator:
                     blocked_reason="fx_rate_unavailable_over_3d",
                     updated_at=now_iso(),
                 )
-                return {"proposal_id": proposal_id, "status": PROPOSAL_STATUS_BLOCKED}
+                blocked = {"proposal_id": proposal_id, "status": PROPOSAL_STATUS_BLOCKED}
+                self._append_activity_artifact(yyyymmdd, "orders_approval_blocked", blocked)
+                self._notify(
+                    "[AgentLab] trade-blocked\n"
+                    f"proposal_id={proposal_id}\n"
+                    f"agent={agent_id}\n"
+                    "reason=fx_rate_unavailable_over_3d"
+                )
+                return blocked
             fx_rate = float(rate)
 
         self.storage.insert_order_approval(
@@ -378,6 +501,15 @@ class AgentLabOrchestrator:
         }
         self._write_json_artifact(yyyymmdd, f"approval_{proposal_id}", out)
         self.storage.log_event("orders_approved", out, now_iso())
+        self._append_activity_artifact(yyyymmdd, "orders_approved", out)
+        self._notify(
+            "[AgentLab] trade-executed\n"
+            f"market={market}\n"
+            f"date={yyyymmdd}\n"
+            f"agent={agent_id}\n"
+            f"proposal_id={proposal_id}\n"
+            f"fills={self._orders_to_text(fills, limit=5)}"
+        )
         return out
 
     def daily_review(self, yyyymmdd: str) -> Dict[str, Any]:
@@ -420,6 +552,14 @@ class AgentLabOrchestrator:
         self._write_json_artifact(yyyymmdd, f"daily_review_{yyyymmdd}", payload)
         self._write_text_artifact(yyyymmdd, f"daily_review_{yyyymmdd}", markdown)
         self.storage.log_event("daily_review", payload, now_iso())
+        self._append_activity_artifact(yyyymmdd, "daily_review", payload)
+        lines = [f"[AgentLab] daily-review", f"date={yyyymmdd}"]
+        for r in rows:
+            lines.append(
+                f"{r['agent_id']}: equity={float(r['equity_krw']):.0f}, "
+                f"drawdown={float(r['drawdown']):.4f}, turnover={float(r['turnover']):.4f}"
+            )
+        self._notify("\n".join(lines))
         return payload
 
     def _weekly_score_board(self, week_rows: List[Dict[str, Any]]) -> Dict[str, float]:
@@ -639,6 +779,26 @@ class AgentLabOrchestrator:
         self._write_json_artifact(stamp, f"weekly_council_{week_id.replace('-', '_')}", decision)
         self._write_text_artifact(stamp, f"weekly_council_{week_id.replace('-', '_')}", markdown)
         self.storage.log_event("weekly_council", decision, now_iso())
+        self._append_activity_artifact(stamp, "weekly_council", decision)
+        lines = [
+            "[AgentLab] weekly-council",
+            f"week={week_id}",
+            f"champion={champion}",
+            f"promoted={promoted_versions if promoted_versions else '(none)'}",
+        ]
+        rounds = list((discussion.get("rounds") or []))
+        for round_row in rounds[:2]:
+            phase = str(round_row.get("phase", ""))
+            lines.append(f"round={round_row.get('round')} phase={phase}")
+            speeches = list(round_row.get("speeches") or [])
+            for speech in speeches[:3]:
+                aid = str(speech.get("agent_id", ""))
+                text = str(speech.get("thesis") or speech.get("rebuttal") or "")
+                if len(text) > 120:
+                    text = text[:120] + "..."
+                if text:
+                    lines.append(f"{aid}: {text}")
+        self._notify("\n".join(lines))
         return decision
 
     def report(self, date_from: str, date_to: str) -> Dict[str, Any]:
@@ -684,4 +844,11 @@ class AgentLabOrchestrator:
                 )
         self._write_text_artifact(out_day, f"report_{date_from}_{date_to}", "\n".join(lines))
         self.storage.log_event("report_generated", payload, now_iso())
+        self._append_activity_artifact(out_day, "report_generated", payload)
+        self._notify(
+            "[AgentLab] report\n"
+            f"from={date_from}\n"
+            f"to={date_to}\n"
+            f"rows={len(rows)}"
+        )
         return payload

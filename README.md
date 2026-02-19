@@ -1,6 +1,7 @@
 # systematic-alpha (Agent-First)
 
 This project is operated in **Agent mode**.
+This repository is now **WSL-first (Linux shell)**.
 
 - KR/US market signals are generated internally.
 - `Agent Lab` (3 agents) consumes those signals and proposes BUY/SELL actions.
@@ -28,6 +29,8 @@ Manual "top-3 picks for discretionary trading" is no longer the primary workflow
 conda create -n systematic-alpha python=3.12 -y
 conda activate systematic-alpha
 pip install -r requirements.txt
+# openai is included in requirements.txt; install explicitly only if needed:
+# pip install openai
 ```
 
 ## Environment
@@ -51,47 +54,55 @@ Optional for LLM-assisted agent updates:
 - `OPENAI_API_KEY=...`
 - `OPENAI_MODEL=gpt-4o-mini`
 - `OPENAI_MAX_DAILY_COST=5.0`
+- `AGENT_LAB_EXECUTION_MODE=mojito_mock` (mock-account API execution)
+- `AGENT_LAB_AUTO_APPROVE=1` (auto execute without manual approval)
 - `AGENT_LAB_TELEGRAM_USE_ENV_PROXY=0` (default; set `1` only if your network requires env proxy)
 - `SYSTEMATIC_ALPHA_PROXY_MODE=auto` (`auto|off|clear_all`, network guard for broken proxy env)
 
-## One Command: Activate Everything
+## WSL One Command: Activate Everything
 
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\register_all_tasks.ps1
+```bash
+chmod +x scripts/*.sh
+./scripts/register_all_tasks_wsl.sh
 ```
 
-This command registers all required tasks and initializes Agent Lab:
+WSL scripts automatically resolve Python to `~/anaconda3/envs/systematic-alpha/bin/python`.
+If `.env` contains a Windows-style `PYTHON_BIN`, it is ignored in WSL mode.
 
-- KR signal generation tasks
-- US signal generation tasks
-- Agent Lab post-session/review/weekly tasks
-- Agent Lab Telegram chat worker task (logon trigger)
-- Agent Lab auto strategy daemon task (logon trigger, autonomous strategy update timing)
-- Agent initialization (`agent_a`, `agent_b`, `agent_c`)
+This registers cron-based automation in WSL:
+
+- KR prefetch + open-time signal run + Agent ingest/propose/auto-execution
+- US prefetch + open-time signal run + Agent ingest/propose/auto-execution
+- Daily review, weekly council
+- Telegram chat worker (`@reboot`)
+- Auto strategy daemon (`@reboot`)
+- Agent Lab initialization (`10,000,000 KRW`, `3 agents`) by default
 
 Default behavior:
 
-- Base KR/US selector Telegram notifications are disabled.
-- Agent Lab notifications remain enabled (if Telegram is configured).
+- Agent proposals are auto-executed in paper account mode when `AGENT_LAB_AUTO_APPROVE=1`.
+- Agent workflow notifications are sent from python orchestrator (if Telegram is configured).
 
-## One Command: Remove Everything
+## WSL One Command: Remove Everything
 
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\remove_all_tasks.ps1
+```bash
+./scripts/remove_all_tasks_wsl.sh
 ```
 
-## Check Registered Tasks
+## Check Registered Cron Jobs
 
-```powershell
-Get-ScheduledTask -TaskName "SystematicAlpha*" | Format-Table TaskName, State -AutoSize
+```bash
+crontab -l
 ```
 
 ## Agent Notifications
 
 When Telegram is configured, Agent Lab sends:
 
+- Session ingest status
 - Agent proposal summary (`BUY/SELL symbol x qty`)
-- Failure events (ingest/propose/review)
+- Auto trade execution results (`FILLED/REJECTED`, proposal id, symbol/qty)
+- Failure events (ingest/propose/review/execution)
 - Daily review completion
 - Weekly council debate summary (champion, promoted versions, moderator summary)
 - Weekly debate excerpts (opening/rebuttal, short form)
@@ -107,33 +118,35 @@ When Telegram is configured, Agent Lab sends:
 - Agent identity: `state/agent_lab/agents/<agent_id>/identity.md`
 - Agent memory: `state/agent_lab/agents/<agent_id>/memory.jsonl`
 - Agent artifacts: `out/agent_lab/YYYYMMDD/`
+- Agent action timeline: `out/agent_lab/YYYYMMDD/activity_log.jsonl`
 - Agent logs: `logs/agent_lab/YYYYMMDD/`
 
-## Manual Agent Commands (Optional)
+## Manual Agent Commands (WSL)
 
-```powershell
+```bash
 # initialize
-powershell -ExecutionPolicy Bypass -File .\scripts\run_agent_lab.ps1 -Action init -CapitalKrw 10000000 -Agents 3
+./scripts/run_agent_lab_wsl.sh --action init --capital-krw 10000000 --agents 3
 
-# ingest + propose
-powershell -ExecutionPolicy Bypass -File .\scripts\run_agent_lab.ps1 -Action ingest-propose -Market KR -Date YYYYMMDD
-powershell -ExecutionPolicy Bypass -File .\scripts\run_agent_lab.ps1 -Action ingest-propose -Market US -Date YYYYMMDD
+# KR/US ingest + propose + auto-execute
+./scripts/run_agent_lab_wsl.sh --action ingest-propose --market KR --auto-approve
+./scripts/run_agent_lab_wsl.sh --action ingest-propose --market US --auto-approve
 
 # review / council
-powershell -ExecutionPolicy Bypass -File .\scripts\run_agent_lab.ps1 -Action daily-review -Date YYYYMMDD
-powershell -ExecutionPolicy Bypass -File .\scripts\run_agent_lab.ps1 -Action weekly-council -Week YYYY-Www
+./scripts/run_agent_lab_wsl.sh --action daily-review --date YYYYMMDD
+./scripts/run_agent_lab_wsl.sh --action weekly-council --week YYYY-Www
 
 # self-heal (manual trigger)
 python -m systematic_alpha.agent_lab.cli --project-root . self-heal --market KR --date YYYYMMDD --log-path <log_file> --output-json <result_json>
 
 # Telegram interactive worker
-powershell -ExecutionPolicy Bypass -File .\scripts\run_agent_lab.ps1 -Action telegram-chat
+./scripts/run_agent_lab_wsl.sh --action telegram-chat
 
-# Auto strategy daemon (agents decide strategy-update timing)
-powershell -ExecutionPolicy Bypass -File .\scripts\run_agent_lab.ps1 -Action auto-strategy-daemon
+# Auto strategy daemon
+./scripts/run_agent_lab_wsl.sh --action auto-strategy-daemon
 
-# One-shot check
-powershell -ExecutionPolicy Bypass -File .\scripts\run_agent_lab.ps1 -Action auto-strategy-daemon -AutoStrategyOnce
+# One-shot checks
+./scripts/run_agent_lab_wsl.sh --action telegram-chat --chat-once
+./scripts/run_agent_lab_wsl.sh --action auto-strategy-daemon --auto-strategy-once
 ```
 
 ## Telegram Agent Chat Commands

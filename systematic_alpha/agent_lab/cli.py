@@ -37,6 +37,8 @@ def parse_args() -> argparse.Namespace:
     p_prop = sub.add_parser("propose-orders")
     p_prop.add_argument("--market", type=str, choices=["KR", "US", "kr", "us"], required=True)
     p_prop.add_argument("--date", type=str, required=True)
+    p_prop.add_argument("--auto-execute", dest="auto_execute", action="store_true", default=None)
+    p_prop.add_argument("--no-auto-execute", dest="auto_execute", action="store_false", default=None)
 
     p_approve = sub.add_parser("approve-orders")
     p_approve.add_argument("--proposal-id", type=str, required=True)
@@ -122,7 +124,11 @@ def main() -> None:
         elif cmd == "ingest-session":
             payload = orchestrator.ingest_session(market=str(args.market).upper(), yyyymmdd=args.date)
         elif cmd == "propose-orders":
-            payload = orchestrator.propose_orders(market=str(args.market).upper(), yyyymmdd=args.date)
+            payload = orchestrator.propose_orders(
+                market=str(args.market).upper(),
+                yyyymmdd=args.date,
+                auto_execute=args.auto_execute,
+            )
         elif cmd == "approve-orders":
             payload = orchestrator.approve_orders(
                 proposal_identifier=args.proposal_id,

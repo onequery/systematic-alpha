@@ -3,7 +3,7 @@ from __future__ import annotations
 import importlib
 import os
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from systematic_alpha.agent_lab.storage import AgentLabStorage
 from systematic_alpha.credentials import load_credentials
@@ -13,7 +13,7 @@ from systematic_alpha.mojito_loader import import_mojito_module
 class PaperBroker:
     def __init__(self, storage: AgentLabStorage):
         self.storage = storage
-        self.execution_mode = str(os.getenv("AGENT_LAB_EXECUTION_MODE", "simulated")).strip().lower()
+        self.execution_mode = str(os.getenv("AGENT_LAB_EXECUTION_MODE", "mojito_mock")).strip().lower()
         self.us_exchange = str(os.getenv("AGENT_LAB_US_EXCHANGE", "NASD")).strip().upper() or "NASD"
         self._brokers: Dict[str, Any] = {}
         self._creds_loaded = False
@@ -32,7 +32,7 @@ class PaperBroker:
     def _exchange_label(self, market: str) -> str:
         # self-heal:us-exchange-resolver-v1
         if market.upper() == "KR":
-            return "서울"
+            return "KR"
 
         normalized = {
             "NASD": "NASD",
@@ -70,13 +70,22 @@ class PaperBroker:
             return None
         try:
             mojito = import_mojito_module()
-            broker = mojito.KoreaInvestment(
-                api_key=self._creds["key"],
-                api_secret=self._creds["secret"],
-                acc_no=self._creds["acc_no"],
-                exchange=self._exchange_label(key),
-                mock=True,
-            )
+            if key == "KR":
+                # Domestic mock account uses default exchange routing.
+                broker = mojito.KoreaInvestment(
+                    api_key=self._creds["key"],
+                    api_secret=self._creds["secret"],
+                    acc_no=self._creds["acc_no"],
+                    mock=True,
+                )
+            else:
+                broker = mojito.KoreaInvestment(
+                    api_key=self._creds["key"],
+                    api_secret=self._creds["secret"],
+                    acc_no=self._creds["acc_no"],
+                    exchange=self._exchange_label(key),
+                    mock=True,
+                )
             self._brokers[key] = broker
             return broker
         except Exception:
