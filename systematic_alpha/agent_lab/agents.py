@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import math
+import os
 from typing import Any, Dict, List, Optional, Tuple
 
 from systematic_alpha.agent_lab.llm_client import LLMClient
 from systematic_alpha.agent_lab.schemas import (
     AgentProfile,
     ORDER_SIDE_BUY,
+    ORDER_SIDE_SELL,
     ORDER_TYPE_MARKET,
     ProposedOrder,
 )
@@ -52,19 +54,9 @@ def build_default_agent_profiles(total_capital_krw: float, count: int = 3) -> Li
                 risk_style=risk,
                 constraints={
                     "markets": ["KR", "US"],
-                    "max_daily_picks": 3,
-                    "allowed_params": [
-                        "min_change_pct",
-                        "min_gap_pct",
-                        "min_strength",
-                        "min_vol_ratio",
-                        "min_bid_ask_ratio",
-                        "min_pass_conditions",
-                        "min_maintain_ratio",
-                        "collect_seconds",
-                        "intraday_monitor_enabled",
-                        "intraday_monitor_interval_sec",
-                    ],
+                    "budget_isolated": True,
+                    "cross_agent_budget_access": False,
+                    "autonomy_mode": "max_freedom_realtime",
                 },
             )
         )
@@ -108,6 +100,9 @@ def _extract_ranked_candidates(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
             price_f = 0.0
         if price_f <= 0:
             continue
+        conditions = row.get("conditions") or {}
+        if not isinstance(conditions, dict):
+            conditions = {}
         out.append(
             {
                 "rank": int(row.get("rank", idx)),
@@ -115,10 +110,24 @@ def _extract_ranked_candidates(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "name": str(row.get("name", "")).strip(),
                 "recommendation_score": float(row.get("recommendation_score", 0.0) or 0.0),
                 "price": price_f,
+                "change_pct": float(metrics.get("current_change_pct", 0.0) or 0.0),
+                "gap_pct": float(metrics.get("gap_pct", 0.0) or 0.0),
+                "strength_avg": float(metrics.get("strength_avg", 0.0) or 0.0),
+                "strength_hit_ratio": float(metrics.get("strength_hit_ratio", 0.0) or 0.0),
+                "vol_ratio": float(metrics.get("volume_ratio", 0.0) or 0.0),
+                "bid_ask_avg": float(metrics.get("bid_ask_avg", 0.0) or 0.0),
+                "bid_ask_hit_ratio": float(metrics.get("bid_ask_hit_ratio", 0.0) or 0.0),
+                "vwap": float(metrics.get("vwap", 0.0) or 0.0),
+                "latest_price": float(metrics.get("latest_price", 0.0) or 0.0),
+                "conditions": conditions,
             }
         )
     out.sort(key=lambda x: (x["rank"], -x["recommendation_score"]))
     return out
+
+
+def _truthy(value: str) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
 def _short_text(text: str, limit: int = 220) -> str:
@@ -140,21 +149,65 @@ class AgentDecisionEngine:
             stable = [x for x in candidates if x["recommendation_score"] >= 65.0]
             picked = (stable if stable else candidates)[:max_picks]
         else:
-            idxs = [0, 2, 4, 1, 3]
             picked = []
-            for i in idxs:
+            # Diversifier: spread picks across the ranking curve.
+            if len(candidates) <= max_picks:
+                return list(candidates)
+            step = max(1, len(candidates) // max_picks)
+            for i in range(0, len(candidates), step):
                 if i < len(candidates):
                     picked.append(candidates[i])
                 if len(picked) >= max_picks:
                     break
         return picked
 
-    def _risk_budget_ratio(self, agent_id: str) -> float:
+    def _risk_budget_ratio(self, agent_id: str, params: Dict[str, Any]) -> float:
+        raw = params.get("risk_budget_ratio")
+        if raw is not None:
+            try:
+                return max(0.01, float(raw))
+            except Exception:
+                pass
         if agent_id == "agent_a":
             return 0.95
         if agent_id == "agent_b":
             return 0.75
         return 0.85
+
+    @staticmethod
+    def _max_freedom_mode() -> bool:
+        return _truthy(os.getenv("AGENT_LAB_MAX_FREEDOM", "1"))
+
+    @staticmethod
+    def _candidate_pass_count(candidate: Dict[str, Any], params: Dict[str, Any]) -> int:
+        th_change = float(params.get("min_change_pct", 0.0) or 0.0)
+        th_gap = float(params.get("min_gap_pct", 0.0) or 0.0)
+        th_strength = float(params.get("min_strength", 0.0) or 0.0)
+        th_vol = float(params.get("min_vol_ratio", 0.0) or 0.0)
+        th_bid_ask = float(params.get("min_bid_ask_ratio", 0.0) or 0.0)
+        th_maintain = float(params.get("min_maintain_ratio", 0.0) or 0.0)
+        cond = candidate.get("conditions") if isinstance(candidate.get("conditions"), dict) else {}
+
+        checks = [
+            float(candidate.get("change_pct", 0.0) or 0.0) >= th_change,
+            float(candidate.get("gap_pct", 0.0) or 0.0) >= th_gap,
+            float(candidate.get("strength_avg", 0.0) or 0.0) >= th_strength,
+            float(candidate.get("vol_ratio", 0.0) or 0.0) >= th_vol,
+            float(candidate.get("bid_ask_avg", 0.0) or 0.0) >= th_bid_ask,
+            float(candidate.get("strength_hit_ratio", 0.0) or 0.0) >= th_maintain,
+            float(candidate.get("bid_ask_hit_ratio", 0.0) or 0.0) >= th_maintain,
+            bool(cond.get("price_above_vwap", True)),
+            bool(cond.get("low_not_broken", True)),
+        ]
+        return sum(1 for x in checks if bool(x))
+
+    def _filter_candidates(self, candidates: List[Dict[str, Any]], params: Dict[str, Any]) -> List[Dict[str, Any]]:
+        if self._max_freedom_mode():
+            return list(candidates)
+        min_pass = int(params.get("min_pass_conditions", 1) or 1)
+        min_pass = max(1, min(9, min_pass))
+        filtered = [x for x in candidates if self._candidate_pass_count(x, params) >= min_pass]
+        return filtered if filtered else list(candidates)
 
     def propose_orders(
         self,
@@ -164,9 +217,10 @@ class AgentDecisionEngine:
         session_payload: Dict[str, Any],
         params: Dict[str, Any],
         available_cash_krw: float,
+        current_positions: Optional[List[Dict[str, Any]]] = None,
         usdkrw_rate: float = 1300.0,
     ) -> Tuple[List[ProposedOrder], str]:
-        candidates = _extract_ranked_candidates(session_payload)
+        candidates = self._filter_candidates(_extract_ranked_candidates(session_payload), params=params)
         if not candidates:
             return [], "No ranked candidates from session signal payload."
 
@@ -177,16 +231,64 @@ class AgentDecisionEngine:
         if fx_rate <= 0:
             fx_rate = 1300.0 if market_norm == "US" else 1.0
 
-        max_picks = int(params.get("max_daily_picks", 3) or 3)
-        max_picks = max(1, min(3, max_picks))
+        if self._max_freedom_mode():
+            max_picks = int(float(os.getenv("AGENT_LAB_MAX_FREEDOM_PICKS", "20") or 20))
+            max_picks = max(1, min(len(candidates), max_picks))
+        else:
+            max_picks = int(params.get("max_daily_picks", 3) or 3)
+            max_picks = max(1, min(200, max_picks))
         picked = self._select_candidates(agent.agent_id, candidates, max_picks=max_picks)
         if not picked:
             return [], "No candidate passed agent-specific picker."
 
-        budget_cap = max(0.0, float(available_cash_krw)) * self._risk_budget_ratio(agent.agent_id)
+        held_market_positions = [
+            row
+            for row in list(current_positions or [])
+            if str(row.get("market", "")).strip().upper() == market_norm
+        ]
+        held_symbols = {str(row.get("symbol", "")).strip().upper(): row for row in held_market_positions}
+        target_symbols = {str(row.get("code", "")).strip().upper() for row in picked}
+
+        est_sell_krw = sum(float(row.get("market_value_krw", 0.0) or 0.0) for sym, row in held_symbols.items() if sym not in target_symbols)
+        base_cash = max(0.0, float(available_cash_krw))
+        budget_ratio = self._risk_budget_ratio(agent.agent_id, params)
+        tradable_cash_krw = base_cash + max(0.0, est_sell_krw)
+        if self._max_freedom_mode():
+            budget_cap = tradable_cash_krw
+        else:
+            budget_cap = tradable_cash_krw * min(1.0, max(0.01, budget_ratio))
         per_order_budget = budget_cap / max(1, len(picked))
         orders: List[ProposedOrder] = []
+
+        # First, rotate out symbols that are no longer in target set.
+        for sym, row in held_symbols.items():
+            if sym in target_symbols:
+                continue
+            qty = float(row.get("quantity", 0.0) or 0.0)
+            ref_price_krw = float(row.get("avg_price", 0.0) or 0.0)
+            if qty <= 0 or ref_price_krw <= 0:
+                continue
+            ref_price_local = ref_price_krw if market_norm != "US" else (ref_price_krw / fx_rate)
+            orders.append(
+                ProposedOrder(
+                    market=market,
+                    symbol=sym,
+                    side=ORDER_SIDE_SELL,
+                    order_type=ORDER_TYPE_MARKET,
+                    quantity=float(qty),
+                    limit_price=None,
+                    reference_price=float(ref_price_local),
+                    signal_rank=0,
+                    recommendation_score=0.0,
+                    rationale=(
+                        f"{agent.name} rotation sell: symbol={sym} is outside current target set."
+                    ),
+                )
+            )
+
         for c in picked:
+            if c["code"] in held_symbols:
+                continue
             price = float(c["price"])  # KR: KRW price, US: USD price
             price_krw = price * fx_rate
             qty = int(math.floor(per_order_budget / price_krw))
@@ -213,13 +315,16 @@ class AgentDecisionEngine:
         rationale = (
             f"{agent.name} proposed {len(orders)} order(s). "
             f"available_cash_krw={available_cash_krw:.0f}, budget_cap={budget_cap:.0f}, "
-            f"per_order_budget={per_order_budget:.0f}, fx_rate={fx_rate:.2f}"
+            f"per_order_budget={per_order_budget:.0f}, fx_rate={fx_rate:.2f}, "
+            f"held_positions={len(held_market_positions)}, max_freedom={self._max_freedom_mode()}"
         )
         return orders, rationale
 
     def _normalize_param_changes(self, raw: Any) -> Dict[str, Any]:
         if not isinstance(raw, dict):
             return {}
+        if self._max_freedom_mode():
+            return dict(raw)
         out: Dict[str, Any] = {}
         for key, value in raw.items():
             if key not in ALLOWED_PARAM_RANGES:
@@ -358,7 +463,7 @@ class AgentDecisionEngine:
         rounds.append({"round": 2, "phase": "rebuttal", "speeches": rebuttal_speeches})
 
         moderator_fallback = {
-            "summary": "Fallback moderator summary: retain stable constraints and review risk events.",
+            "summary": "Fallback moderator summary: preserve adaptive realtime operation and review risk events.",
             "consensus_actions": [],
             "risk_watch": ["LLM fallback mode during council."],
         }
@@ -403,10 +508,10 @@ class AgentDecisionEngine:
             open_row = next((x for x in opening_speeches if x["agent_id"] == aid), {})
             rebut_row = next((x for x in rebuttal_speeches if x["agent_id"] == aid), {})
             for key, value in (open_row.get("param_changes") or {}).items():
-                if key in ALLOWED_PARAM_RANGES:
+                if self._max_freedom_mode() or key in ALLOWED_PARAM_RANGES:
                     merged[key] = value
             for key, value in (rebut_row.get("param_changes") or {}).items():
-                if key in ALLOWED_PARAM_RANGES:
+                if self._max_freedom_mode() or key in ALLOWED_PARAM_RANGES:
                     merged[key] = value
             suggested_params[aid] = self.registry.clamp_params(merged)
 
@@ -449,6 +554,6 @@ class AgentDecisionEngine:
             params = active_params
         merged = dict(active_params)
         for key, val in params.items():
-            if key in ALLOWED_PARAM_RANGES:
+            if self._max_freedom_mode() or key in ALLOWED_PARAM_RANGES:
                 merged[key] = val
         return self.registry.clamp_params(merged)

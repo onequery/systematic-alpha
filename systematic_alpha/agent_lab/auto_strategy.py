@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -52,12 +54,12 @@ class AutoStrategyDaemon:
         self,
         *,
         project_root: str | Path,
-        poll_seconds: int = 300,
+        poll_seconds: int = 30,
         cooldown_minutes: int = 180,
         max_updates_per_day: int = 2,
     ):
         self.project_root = Path(project_root).resolve()
-        self.poll_seconds = max(30, int(poll_seconds))
+        self.poll_seconds = max(10, int(poll_seconds))
         self.cooldown_minutes = max(10, int(cooldown_minutes))
         self.max_updates_per_day = max(1, int(max_updates_per_day))
         self.heartbeat_minutes = max(5, int(float(os.getenv("AGENT_LAB_HEARTBEAT_MINUTES", "30") or 30)))
@@ -203,11 +205,122 @@ class AutoStrategyDaemon:
             row["payload"] = {}
         return row
 
+    @staticmethod
+    def _max_freedom_mode() -> bool:
+        return _truthy(os.getenv("AGENT_LAB_MAX_FREEDOM", "1"))
+
+    def _refresh_intraday_signal(self, market: str, now_kst: datetime) -> Dict[str, Any]:
+        market = str(market).upper()
+        market_lc = market.lower()
+        run_date = now_kst.strftime("%Y%m%d")
+        stamp = now_kst.strftime("%Y%m%d_%H%M%S")
+
+        out_base = self.project_root / "out" / market_lc / run_date
+        result_dir = out_base / "results"
+        result_dir.mkdir(parents=True, exist_ok=True)
+        log_dir = self.project_root / "logs" / "agent_lab" / run_date
+        log_dir.mkdir(parents=True, exist_ok=True)
+
+        output_json = result_dir / f"{market_lc}_daily_{stamp}.json"
+        log_path = log_dir / f"intraday_signal_refresh_{market_lc}_{stamp}.log"
+        analytics_dir = out_base / "analytics"
+        overnight_path = out_base / "selection_overnight_report.csv"
+
+        collect_seconds = int(float(os.getenv("AGENT_LAB_INTRADAY_COLLECT_SECONDS", "45") or 45))
+        final_picks = int(float(os.getenv("AGENT_LAB_INTRADAY_FINAL_PICKS", "20") or 20))
+        pre_candidates = int(float(os.getenv("AGENT_LAB_INTRADAY_PRE_CANDIDATES", "120") or 120))
+        max_symbols_scan = int(float(os.getenv("AGENT_LAB_INTRADAY_MAX_SYMBOLS_SCAN", "200") or 200))
+        kr_universe_size = int(float(os.getenv("AGENT_LAB_INTRADAY_KR_UNIVERSE_SIZE", "300") or 300))
+        us_universe_size = int(float(os.getenv("AGENT_LAB_INTRADAY_US_UNIVERSE_SIZE", "500") or 500))
+        us_exchange = str(os.getenv("AGENT_LAB_US_EXCHANGE", "NASD")).strip().upper() or "NASD"
+
+        cmd = [
+            sys.executable,
+            "-u",
+            "main.py",
+            "--market",
+            market_lc,
+            "--collect-seconds",
+            str(max(5, collect_seconds)),
+            "--final-picks",
+            str(max(1, final_picks)),
+            "--pre-candidates",
+            str(max(1, pre_candidates)),
+            "--max-symbols-scan",
+            str(max(50, max_symbols_scan)),
+            "--kr-universe-size",
+            str(max(50, kr_universe_size)),
+            "--us-universe-size",
+            str(max(50, us_universe_size)),
+            "--min-change-pct",
+            str(float(os.getenv("AGENT_LAB_INTRADAY_MIN_CHANGE_PCT", "0") or 0.0)),
+            "--min-gap-pct",
+            str(float(os.getenv("AGENT_LAB_INTRADAY_MIN_GAP_PCT", "0") or 0.0)),
+            "--min-strength",
+            str(float(os.getenv("AGENT_LAB_INTRADAY_MIN_STRENGTH", "0") or 0.0)),
+            "--min-vol-ratio",
+            str(float(os.getenv("AGENT_LAB_INTRADAY_MIN_VOL_RATIO", "0") or 0.0)),
+            "--min-bid-ask-ratio",
+            str(float(os.getenv("AGENT_LAB_INTRADAY_MIN_BID_ASK_RATIO", "0") or 0.0)),
+            "--min-pass-conditions",
+            str(int(float(os.getenv("AGENT_LAB_INTRADAY_MIN_PASS_CONDITIONS", "1") or 1))),
+            "--min-maintain-ratio",
+            str(float(os.getenv("AGENT_LAB_INTRADAY_MIN_MAINTAIN_RATIO", "0") or 0.0)),
+            "--output-json",
+            str(output_json),
+            "--analytics-dir",
+            str(analytics_dir),
+            "--overnight-report-path",
+            str(overnight_path),
+            "--long-only",
+        ]
+        allow_low_cov = _truthy(os.getenv("AGENT_LAB_INTRADAY_ALLOW_LOW_COVERAGE", "1"))
+        cmd.append("--allow-low-coverage" if allow_low_cov else "--invalidate-on-low-coverage")
+        if market == "US":
+            cmd.extend(["--exchange", us_exchange])
+
+        started = time.perf_counter()
+        completed = subprocess.run(
+            cmd,
+            cwd=str(self.project_root),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=max(120, collect_seconds + 180),
+        )
+        elapsed = time.perf_counter() - started
+        log_body = (
+            f"[intraday-refresh] started={now_kst.isoformat()}\n"
+            f"command={' '.join(cmd)}\n"
+            f"returncode={completed.returncode}\n"
+            f"elapsed_sec={elapsed:.1f}\n\n"
+            f"[stdout]\n{completed.stdout}\n\n[stderr]\n{completed.stderr}\n"
+        )
+        log_path.write_text(log_body, encoding="utf-8")
+
+        payload = {
+            "market": market,
+            "run_date": run_date,
+            "ok": bool(completed.returncode == 0 and output_json.exists()),
+            "returncode": int(completed.returncode),
+            "elapsed_sec": round(elapsed, 2),
+            "output_json": str(output_json),
+            "log_path": str(log_path),
+        }
+        if completed.returncode != 0:
+            payload["error"] = f"returncode={completed.returncode}"
+        self.storage.log_event("auto_intraday_signal_refresh", payload, _now_iso())
+        return payload
+
     def _intraday_monitor_policy(self) -> Dict[str, Any]:
         agents = self.storage.list_agents()
         enabled_agents: List[str] = []
         intervals: List[int] = []
         by_agent: Dict[str, Dict[str, Any]] = {}
+        forced_max_freedom = self._max_freedom_mode()
+        forced_interval = int(float(os.getenv("AGENT_LAB_MAX_FREEDOM_INTERVAL_SEC", "30") or 30))
+        forced_interval = max(10, min(3600, forced_interval))
         for row in agents:
             aid = str(row.get("agent_id", ""))
             try:
@@ -216,17 +329,16 @@ class AutoStrategyDaemon:
                 continue
             params = active.get("params", {}) or {}
             enabled = bool(float(params.get("intraday_monitor_enabled", 0) or 0) >= 0.5)
-            interval = int(
-                float(
-                    params.get("intraday_monitor_interval_sec", params.get("collect_seconds", self.poll_seconds))
-                    or self.poll_seconds
-                )
-            )
-            interval = max(120, min(1800, interval))
+            interval = int(float(params.get("intraday_monitor_interval_sec", params.get("collect_seconds", self.poll_seconds)) or self.poll_seconds))
+            interval = max(10, min(3600, interval))
+            if forced_max_freedom:
+                enabled = True
+                interval = forced_interval
             by_agent[aid] = {
                 "enabled": enabled,
                 "interval_sec": interval,
                 "version_tag": str(active.get("version_tag", "")),
+                "forced_max_freedom": forced_max_freedom,
             }
             if enabled:
                 enabled_agents.append(aid)
@@ -274,23 +386,49 @@ class AutoStrategyDaemon:
 
     def _run_intraday_monitor_cycle(self, market: str, now_kst: datetime) -> Dict[str, Any]:
         market = str(market).upper()
-        signal = self._latest_session_signal_for_market(market)
-        signal_date = str(signal.get("session_date", "")) if signal else ""
-        signal_status = str(signal.get("status_code", "NO_SIGNAL")) if signal else "NO_SIGNAL"
-        status_counts = self._proposal_status_counts(market, signal_date) if signal_date else {}
+        refresh_enabled = self._max_freedom_mode() or _truthy(os.getenv("AGENT_LAB_INTRADAY_SIGNAL_REFRESH", "1"))
         payload: Dict[str, Any] = {
             "market": market,
             "executed_at_kst": now_kst.isoformat(),
             "mode": "observe",
-            "session_date": signal_date,
-            "signal_status": signal_status,
-            "proposal_status_counts": status_counts,
+            "session_date": "",
+            "signal_status": "NO_SIGNAL",
+            "proposal_status_counts": {},
+            "refresh_enabled": refresh_enabled,
+            "refresh_triggered": False,
+            "refresh_ok": False,
             "propose_triggered": False,
             "propose_ok": False,
         }
+        if refresh_enabled:
+            payload["refresh_triggered"] = True
+            refresh = self._refresh_intraday_signal(market, now_kst)
+            payload["refresh_ok"] = bool(refresh.get("ok", False))
+            payload["refresh_log"] = refresh.get("log_path", "")
+            payload["refresh_elapsed_sec"] = refresh.get("elapsed_sec", 0.0)
+            if not bool(refresh.get("ok", False)):
+                payload["refresh_error"] = refresh.get("error", "intraday_refresh_failed")
+            else:
+                signal_date = now_kst.strftime("%Y%m%d")
+                try:
+                    self.orchestrator.ingest_session(market, signal_date)
+                except Exception as exc:
+                    payload["refresh_ok"] = False
+                    payload["refresh_error"] = f"ingest_failed:{repr(exc)}"
+                    payload["refresh_ingest_ok"] = False
+                else:
+                    payload["refresh_ingest_ok"] = True
+
+        signal = self._latest_session_signal_for_market(market)
+        signal_date = str(signal.get("session_date", "")) if signal else ""
+        signal_status = str(signal.get("status_code", "NO_SIGNAL")) if signal else "NO_SIGNAL"
+        status_counts = self._proposal_status_counts(market, signal_date) if signal_date else {}
+        payload["session_date"] = signal_date
+        payload["signal_status"] = signal_status
+        payload["proposal_status_counts"] = status_counts
 
         # Optional advanced mode: re-run propose cycle during open sessions.
-        propose_enabled = _truthy(os.getenv("AGENT_LAB_INTRADAY_MONITOR_PROPOSE", "0"))
+        propose_enabled = self._max_freedom_mode() or _truthy(os.getenv("AGENT_LAB_INTRADAY_MONITOR_PROPOSE", "1"))
         if propose_enabled and signal and signal_status == "SIGNAL_OK":
             try:
                 proposed = self.orchestrator.propose_orders(
@@ -318,6 +456,7 @@ class AutoStrategyDaemon:
             f"market={market}\n"
             f"mode={payload.get('mode')}\n"
             f"signal={signal_status} ({signal_date or '-'})\n"
+            f"refresh_ok={payload.get('refresh_ok')}\n"
             f"proposal_status={status_counts if status_counts else '(none)'}\n"
             f"propose_triggered={payload.get('propose_triggered')}\n"
             f"propose_ok={payload.get('propose_ok')}"
@@ -338,7 +477,7 @@ class AutoStrategyDaemon:
                 result["markets"][mk] = {"state": "disabled", "open": self._is_market_open_now(mk, now_kst)}
             return result
 
-        interval_sec = max(120, int(result["interval_sec"] or 120))
+        interval_sec = max(10, int(result["interval_sec"] or 10))
         now_naive = now_kst.replace(tzinfo=None)
         for mk in ["KR", "US"]:
             open_now = self._is_market_open_now(mk, now_kst)
@@ -691,7 +830,7 @@ class AutoStrategyDaemon:
 def run_auto_strategy_daemon(
     *,
     project_root: str | Path,
-    poll_seconds: int = 300,
+    poll_seconds: int = 30,
     cooldown_minutes: int = 180,
     max_updates_per_day: int = 2,
     once: bool = False,

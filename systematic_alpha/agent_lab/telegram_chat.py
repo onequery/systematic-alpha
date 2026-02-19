@@ -875,6 +875,10 @@ class TelegramChatRuntime:
         positions = self.storage.list_positions(agent_id)
         if len(positions) > 20:
             positions = positions[:20]
+        heartbeat_payload = heartbeat.get("payload", {}) if heartbeat else {}
+        monitor_payload = heartbeat_payload.get("intraday_monitor", {}) if isinstance(heartbeat_payload, dict) else {}
+        monitor_enabled = bool(monitor_payload.get("enabled", False))
+        pipeline_mode = "adaptive_intraday" if monitor_enabled else "session_based"
 
         return {
             "agent_id": agent_id,
@@ -891,9 +895,9 @@ class TelegramChatRuntime:
             "recent_directives": recent_directives,
             "positions": positions,
             "execution_model": {
-                "signal_pipeline_mode": "scheduled_daily",
-                "collect_seconds_semantics": "realtime collection duration per run (not always-on loop)",
-                "latest_auto_strategy_heartbeat": heartbeat.get("payload", {}) if heartbeat else None,
+                "signal_pipeline_mode": pipeline_mode,
+                "collect_seconds_semantics": "realtime sampling window per refresh run; agents can trigger repeated intraday refresh cycles",
+                "latest_auto_strategy_heartbeat": heartbeat_payload if heartbeat else None,
             },
             "market_pipeline": {
                 "KR": {

@@ -48,6 +48,9 @@ def parse_args() -> argparse.Namespace:
     p_report.add_argument("--from", dest="date_from", type=str, required=True)
     p_report.add_argument("--to", dest="date_to", type=str, required=True)
 
+    p_sanitize = sub.add_parser("sanitize-state")
+    p_sanitize.add_argument("--skip-pending-cleanup", action="store_true")
+
     p_chat = sub.add_parser("telegram-chat")
     p_chat.add_argument("--poll-timeout", type=int, default=25)
     p_chat.add_argument("--idle-sleep", type=float, default=1.0)
@@ -55,7 +58,7 @@ def parse_args() -> argparse.Namespace:
     p_chat.add_argument("--once", action="store_true")
 
     p_auto = sub.add_parser("auto-strategy-daemon")
-    p_auto.add_argument("--poll-seconds", type=int, default=300)
+    p_auto.add_argument("--poll-seconds", type=int, default=30)
     p_auto.add_argument("--cooldown-minutes", type=int, default=180)
     p_auto.add_argument("--max-updates-per-day", type=int, default=2)
     p_auto.add_argument("--once", action="store_true")
@@ -128,6 +131,10 @@ def main() -> None:
             payload = orchestrator.weekly_council(week_id=args.week)
         elif cmd == "report":
             payload = orchestrator.report(date_from=args.date_from, date_to=args.date_to)
+        elif cmd == "sanitize-state":
+            payload = orchestrator.sanitize_legacy_constraints(
+                clean_pending_proposals=not bool(args.skip_pending_cleanup)
+            )
         else:
             raise RuntimeError(f"unsupported command: {cmd}")
         _echo(payload)

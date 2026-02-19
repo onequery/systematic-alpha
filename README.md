@@ -62,7 +62,12 @@ Optional for LLM-assisted agent updates:
 - `SYSTEMATIC_ALPHA_PROXY_MODE=auto` (`auto|off|clear_all`, network guard for broken proxy env)
 - `AGENT_LAB_USDKRW_DEFAULT=1300` (fallback if live FX/cache unavailable)
 - `AGENT_LAB_HEARTBEAT_MINUTES=30` (periodic daemon heartbeat Telegram interval)
-- `AGENT_LAB_INTRADAY_MONITOR_PROPOSE=0` (`1` enables monitor-cycle propose/orders during market open)
+- `AGENT_LAB_MAX_FREEDOM=1` (relax runtime caps for aggressive intraday autonomy)
+- `AGENT_LAB_MAX_FREEDOM_INTERVAL_SEC=30` (monitor/propose loop interval while market is open)
+- `AGENT_LAB_INTRADAY_MONITOR_PROPOSE=1` (monitor-cycle propose/orders during market open)
+- `AGENT_LAB_INTRADAY_SIGNAL_REFRESH=1` (monitor-cycle reruns market scanner before propose)
+- `AGENT_LAB_INTRADAY_COLLECT_SECONDS=45` (realtime collection length per refresh run)
+- `AGENT_LAB_INTRADAY_MAX_SYMBOLS_SCAN=200` (scan cap per refresh run; lower=faster)
 
 ## WSL One Command: Activate Everything
 
@@ -87,6 +92,8 @@ This registers cron-based automation in WSL:
 Default behavior:
 
 - Agent proposals are auto-executed in paper account mode when `AGENT_LAB_AUTO_APPROVE=1`.
+- Auto strategy daemon polls every 30s by default and runs intraday monitor cycles during open windows.
+- Intraday monitor can refresh market signals and then re-propose/re-execute orders in the same cycle.
 - Agent workflow notifications are sent from python orchestrator (if Telegram is configured).
 - Manual order approval step is disabled in this WSL setup. Order proposal status is expected to be `EXECUTED` or `BLOCKED` (not `PENDING_APPROVAL`).
 
@@ -125,6 +132,16 @@ Equivalent one-liner:
 ```bash
 INIT_AGENT_LAB=0 ./scripts/reset_all_tasks_wsl.sh
 ```
+
+## Cleanup Legacy Constraint Residue
+
+If old identity/memory or pending-approval traces remain from earlier versions, run:
+
+```bash
+/home/heesu/anaconda3/envs/systematic-alpha/bin/python -m systematic_alpha.agent_lab.cli --project-root . sanitize-state
+```
+
+This refreshes `identity.md`, filters legacy memory lines, and cleans stale `PENDING_APPROVAL` proposal residue.
 
 ## Check Registered Cron Jobs
 

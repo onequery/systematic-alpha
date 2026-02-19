@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import os
 from datetime import datetime
 from typing import Any, Dict, List
 
@@ -12,35 +13,42 @@ def now_iso() -> str:
 
 
 DEFAULT_STRATEGY_PARAMS: Dict[str, Any] = {
-    "min_change_pct": 3.0,
-    "min_gap_pct": 2.0,
-    "min_strength": 100.0,
-    "min_vol_ratio": 0.10,
-    "min_bid_ask_ratio": 1.2,
-    "min_pass_conditions": 5,
-    "min_maintain_ratio": 0.6,
-    "collect_seconds": 600,
-    "intraday_monitor_enabled": 0,
-    "intraday_monitor_interval_sec": 600,
-    "max_daily_picks": 3,
-    "position_cap_ratio": 0.333,
-    "exposure_cap_ratio": 0.95,
+    "min_change_pct": 0.0,
+    "min_gap_pct": 0.0,
+    "min_strength": 0.0,
+    "min_vol_ratio": 0.0,
+    "min_bid_ask_ratio": 0.0,
+    "min_pass_conditions": 1,
+    "min_maintain_ratio": 0.0,
+    "collect_seconds": 60,
+    "intraday_monitor_enabled": 1,
+    "intraday_monitor_interval_sec": 30,
+    "max_daily_picks": 20,
+    "position_cap_ratio": 1.0,
+    "exposure_cap_ratio": 1.0,
+    "day_loss_limit": -1.0,
+    "week_loss_limit": -1.0,
+    "risk_budget_ratio": 1.0,
 }
 
 
 ALLOWED_PARAM_RANGES: Dict[str, List[float]] = {
-    "min_change_pct": [1.0, 6.0],
-    "min_gap_pct": [0.5, 4.0],
-    "min_strength": [90.0, 160.0],
-    "min_vol_ratio": [0.05, 0.4],
-    "min_bid_ask_ratio": [1.0, 2.0],
-    "min_pass_conditions": [4.0, 8.0],
-    "min_maintain_ratio": [0.4, 0.9],
-    "collect_seconds": [120.0, 900.0],
+    "min_change_pct": [-30.0, 30.0],
+    "min_gap_pct": [-30.0, 30.0],
+    "min_strength": [0.0, 500.0],
+    "min_vol_ratio": [0.0, 5.0],
+    "min_bid_ask_ratio": [0.0, 10.0],
+    "min_pass_conditions": [1.0, 8.0],
+    "min_maintain_ratio": [0.0, 1.0],
+    "collect_seconds": [10.0, 1800.0],
     "intraday_monitor_enabled": [0.0, 1.0],
-    "intraday_monitor_interval_sec": [120.0, 1800.0],
-    "position_cap_ratio": [0.20, 0.40],
-    "exposure_cap_ratio": [0.70, 0.95],
+    "intraday_monitor_interval_sec": [10.0, 3600.0],
+    "max_daily_picks": [1.0, 200.0],
+    "position_cap_ratio": [0.01, 2.0],
+    "exposure_cap_ratio": [0.01, 3.0],
+    "day_loss_limit": [-1.0, -0.0001],
+    "week_loss_limit": [-1.0, -0.0001],
+    "risk_budget_ratio": [0.01, 2.0],
 }
 
 
@@ -49,14 +57,26 @@ class StrategyRegistry:
         self.storage = storage
 
     @staticmethod
-    def clamp_params(params: Dict[str, Any]) -> Dict[str, Any]:
+    def _truthy(value: str) -> bool:
+        return str(value or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+    @classmethod
+    def clamp_params(cls, params: Dict[str, Any]) -> Dict[str, Any]:
+        if cls._truthy(os.getenv("AGENT_LAB_MAX_FREEDOM", "1")):
+            return copy.deepcopy(params)
         out = copy.deepcopy(params)
         for key, bounds in ALLOWED_PARAM_RANGES.items():
             if key not in out:
                 continue
             lo, hi = float(bounds[0]), float(bounds[1])
             val = float(out[key])
-            if key in {"min_pass_conditions", "collect_seconds", "intraday_monitor_interval_sec", "intraday_monitor_enabled"}:
+            if key in {
+                "min_pass_conditions",
+                "collect_seconds",
+                "intraday_monitor_interval_sec",
+                "intraday_monitor_enabled",
+                "max_daily_picks",
+            }:
                 out[key] = int(max(lo, min(hi, val)))
             else:
                 out[key] = max(lo, min(hi, val))

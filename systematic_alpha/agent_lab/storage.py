@@ -489,6 +489,24 @@ class AgentLabStorage:
                 (status, blocked_reason, updated_at, int(proposal_id)),
             )
 
+    def bulk_update_pending_proposals(
+        self,
+        *,
+        new_status: str,
+        blocked_reason: str,
+        updated_at: str,
+    ) -> int:
+        with self.tx():
+            cur = self.execute(
+                """
+                UPDATE order_proposals
+                SET status = ?, blocked_reason = ?, updated_at = ?
+                WHERE status = 'PENDING_APPROVAL'
+                """,
+                (new_status, blocked_reason, updated_at),
+            )
+            return int(cur.rowcount or 0)
+
     def list_order_proposals(
         self,
         market: Optional[str] = None,
@@ -826,6 +844,27 @@ class AgentLabStorage:
         for row in rows:
             row["content"] = json.loads(row.pop("content_json"))
         return rows
+
+    def delete_legacy_agent_memories(self, agent_id: str) -> int:
+        with self.tx():
+            cur = self.execute(
+                """
+                DELETE FROM agent_memories
+                WHERE agent_id = ?
+                  AND (
+                    content_json LIKE '%PENDING_APPROVAL%'
+                    OR content_json LIKE '%max_daily_picks=3%'
+                    OR content_json LIKE '%exposure_cap_ratio=0.95%'
+                    OR content_json LIKE '%collect_seconds=600%'
+                    OR content_json LIKE '%scheduled_daily%'
+                    OR content_json LIKE '%not always-on loop%'
+                    OR content_json LIKE '%approval flow%'
+                    OR content_json LIKE '%Hard Constraints%'
+                  )
+                """,
+                (agent_id,),
+            )
+            return int(cur.rowcount or 0)
 
     def get_latest_event(self, event_type: str) -> Optional[Dict[str, Any]]:
         row = self.query_one(

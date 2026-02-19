@@ -27,7 +27,7 @@ from systematic_alpha.agent_lab.schemas import (
     STATUS_SIGNAL_OK,
 )
 from systematic_alpha.agent_lab.storage import AgentLabStorage
-from systematic_alpha.agent_lab.strategy_registry import StrategyRegistry
+from systematic_alpha.agent_lab.strategy_registry import DEFAULT_STRATEGY_PARAMS, StrategyRegistry
 
 PROMOTION_SCORE_THRESHOLD = 0.60
 
@@ -103,25 +103,65 @@ class AgentLabOrchestrator:
         self.notifier.send(text)
 
     @staticmethod
-    def _orders_to_text(orders: List[Dict[str, Any]], limit: int = 5) -> str:
+    def _build_symbol_name_map_from_payload(payload: Dict[str, Any]) -> Dict[str, str]:
+        out: Dict[str, str] = {}
+        rows = []
+        if isinstance(payload, dict):
+            rows = list(payload.get("all_ranked") or payload.get("final") or [])
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            code = str(row.get("code", "")).strip().upper()
+            name = str(row.get("name", "")).strip()
+            if code and name:
+                out[code] = name
+        return out
+
+    def _load_symbol_name_map(self, market: str, yyyymmdd: str) -> Dict[str, str]:
+        signal = self.storage.get_latest_session_signal(str(market).upper(), str(yyyymmdd))
+        if not signal:
+            return {}
+        payload = signal.get("payload", {})
+        if not isinstance(payload, dict):
+            return {}
+        return self._build_symbol_name_map_from_payload(payload)
+
+    @staticmethod
+    def _orders_to_text(
+        orders: List[Dict[str, Any]],
+        limit: int = 5,
+        symbol_name_map: Optional[Dict[str, str]] = None,
+    ) -> str:
         if not orders:
             return "none"
         chunks: List[str] = []
+        name_map = symbol_name_map or {}
         for row in orders[:limit]:
             side = str(row.get("side", ""))
-            symbol = str(row.get("symbol", ""))
+            symbol = str(row.get("symbol", "")).strip().upper()
+            company_name = str(name_map.get(symbol, "")).strip()
+            symbol_text = f"{symbol}({company_name})" if company_name else symbol
             qty = float(row.get("quantity", 0.0) or 0.0)
             status = str(row.get("status", "")).strip()
             if status:
-                chunks.append(f"{side} {symbol} x{qty:.0f} ({status})")
+                chunks.append(f"{side} {symbol_text} x{qty:.0f} ({status})")
             else:
-                chunks.append(f"{side} {symbol} x{qty:.0f}")
+                chunks.append(f"{side} {symbol_text} x{qty:.0f}")
         if len(orders) > limit:
             chunks.append(f"... +{len(orders) - limit}")
         return ", ".join(chunks)
 
     def _today_str(self) -> str:
         return datetime.now().strftime("%Y%m%d")
+
+    @staticmethod
+    def _sanitized_agent_constraints() -> Dict[str, Any]:
+        return {
+            "markets": ["KR", "US"],
+            "budget_isolated": True,
+            "cross_agent_budget_access": False,
+            "autonomy_mode": "max_freedom_realtime",
+        }
 
     def _find_session_json(self, market: str, yyyymmdd: str) -> Optional[Path]:
         market_tag = market.strip().lower()
@@ -301,6 +341,95 @@ class AgentLabOrchestrator:
         )
         return payload
 
+    def sanitize_legacy_constraints(self, *, clean_pending_proposals: bool = True) -> Dict[str, Any]:
+        agents = self.storage.list_agents()
+        if not agents:
+            raise RuntimeError("no agents registered. run `init` first.")
+
+        per_agent: List[Dict[str, Any]] = []
+        for row in agents:
+            aid = str(row.get("agent_id", ""))
+            old_profile = profile_from_agent_row(row)
+            refreshed_profile = type(old_profile)(
+                agent_id=old_profile.agent_id,
+                name=old_profile.name,
+                role=old_profile.role,
+                philosophy=old_profile.philosophy,
+                allocated_capital_krw=old_profile.allocated_capital_krw,
+                risk_style=old_profile.risk_style,
+                constraints=self._sanitized_agent_constraints(),
+            )
+            self.storage.upsert_agent(
+                agent_id=refreshed_profile.agent_id,
+                name=refreshed_profile.name,
+                role=refreshed_profile.role,
+                philosophy=refreshed_profile.philosophy,
+                allocated_capital_krw=refreshed_profile.allocated_capital_krw,
+                risk_style=refreshed_profile.risk_style,
+                constraints=refreshed_profile.constraints,
+                created_at=now_iso(),
+            )
+            self.identity.ensure_identity(refreshed_profile, force_refresh=True)
+            mem_stat = self.identity.sanitize_memory_file(aid)
+            db_removed = self.storage.delete_legacy_agent_memories(aid)
+
+            try:
+                active = self.registry.get_active_strategy(aid)
+                active_params = dict(active.get("params", {}) or {})
+            except Exception:
+                active_params = {}
+            merged = dict(DEFAULT_STRATEGY_PARAMS)
+            merged.update(active_params)
+            merged.update(
+                {
+                    "intraday_monitor_enabled": 1,
+                    "intraday_monitor_interval_sec": int(
+                        float(os.getenv("AGENT_LAB_MAX_FREEDOM_INTERVAL_SEC", "30") or 30)
+                    ),
+                    "max_daily_picks": int(float(os.getenv("AGENT_LAB_MAX_FREEDOM_PICKS", "20") or 20)),
+                    "risk_budget_ratio": 1.0,
+                    "day_loss_limit": -1.0,
+                    "week_loss_limit": -1.0,
+                }
+            )
+            reg = self.registry.register_strategy_version(
+                agent_id=aid,
+                params=merged,
+                notes="sanitize_legacy_constraints: refresh identity/memory and max-freedom params",
+                promote=True,
+            )
+            per_agent.append(
+                {
+                    "agent_id": aid,
+                    "memory_removed": int(mem_stat.get("removed", 0)),
+                    "memory_removed_db": int(db_removed),
+                    "strategy_version": str(reg.get("version_tag", "")),
+                }
+            )
+
+        pending_cleaned = 0
+        if clean_pending_proposals:
+            pending_cleaned = self.storage.bulk_update_pending_proposals(
+                new_status=PROPOSAL_STATUS_BLOCKED,
+                blocked_reason="legacy_cleanup_no_manual_approval",
+                updated_at=now_iso(),
+            )
+
+        payload = {
+            "agents": per_agent,
+            "pending_proposals_cleaned": pending_cleaned,
+            "clean_pending_proposals": bool(clean_pending_proposals),
+            "updated_at": now_iso(),
+        }
+        self.storage.log_event("sanitize_legacy_constraints", payload, now_iso())
+        self._append_activity_artifact(self._today_str(), "sanitize_legacy_constraints", payload)
+        self._notify(
+            "[AgentLab] sanitize-legacy-constraints\n"
+            f"agents={len(per_agent)}\n"
+            f"pending_cleaned={pending_cleaned}"
+        )
+        return payload
+
     def ingest_session(self, market: str, yyyymmdd: str) -> Dict[str, Any]:
         market = market.strip().upper()
         path = self._find_session_json(market, yyyymmdd)
@@ -378,30 +507,56 @@ class AgentLabOrchestrator:
             raise RuntimeError("no agents registered. run `init` first.")
         output_rows: List[Dict[str, Any]] = []
         usdkrw = self._usdkrw_rate(yyyymmdd) if market == "US" else 1.0
+        symbol_name_map = self._build_symbol_name_map_from_payload(signal.get("payload", {}))
         for agent in agents:
             agent_id = str(agent["agent_id"])
             profile = profile_from_agent_row(agent)
             active = self.registry.get_active_strategy(agent_id)
+            active_params = dict(active.get("params", {}) or {})
             ledger = self.accounting.rebuild_agent_ledger(agent_id)
             day_ret, week_ret = self.accounting.daily_and_weekly_return(agent_id, yyyymmdd)
+            position_qty_by_symbol: Dict[str, float] = {}
+            for pos in list(ledger.get("positions") or []):
+                pos_market = str(pos.get("market", "")).strip().upper()
+                if pos_market != market:
+                    continue
+                symbol = str(pos.get("symbol", "")).strip().upper()
+                qty = float(pos.get("quantity", 0.0) or 0.0)
+                if symbol and qty > 0:
+                    position_qty_by_symbol[symbol] = qty
 
             proposed_orders, rationale = self.agent_engine.propose_orders(
                 agent=profile,
                 market=market,
                 session_payload=signal["payload"],
-                params=active["params"],
+                params=active_params,
                 available_cash_krw=float(ledger["cash_krw"]),
+                current_positions=list(ledger.get("positions", [])),
                 usdkrw_rate=usdkrw,
             )
             raw_orders = [o.__dict__ for o in proposed_orders]
             decision = self.risk.evaluate(
                 status_code=str(signal["status_code"]),
                 allocated_capital_krw=float(agent["allocated_capital_krw"]),
+                available_cash_krw=float(ledger["cash_krw"]),
                 day_return_pct=float(day_ret),
                 week_return_pct=float(week_ret),
                 current_exposure_krw=float(self.accounting.current_exposure_krw(agent_id)),
                 orders=raw_orders,
                 usdkrw_rate=usdkrw,
+                position_cap_ratio=float(
+                    active_params.get("position_cap_ratio", self.risk.position_cap_ratio) or self.risk.position_cap_ratio
+                ),
+                exposure_cap_ratio=float(
+                    active_params.get("exposure_cap_ratio", self.risk.exposure_cap_ratio) or self.risk.exposure_cap_ratio
+                ),
+                day_loss_limit=float(
+                    active_params.get("day_loss_limit", self.risk.day_loss_limit) or self.risk.day_loss_limit
+                ),
+                week_loss_limit=float(
+                    active_params.get("week_loss_limit", self.risk.week_loss_limit) or self.risk.week_loss_limit
+                ),
+                position_qty_by_symbol=position_qty_by_symbol,
             )
             status = (
                 PROPOSAL_STATUS_APPROVED
@@ -526,7 +681,7 @@ class AgentLabOrchestrator:
         for row in output_rows:
             lines.append(
                 f"{row.get('agent_id')}: {row.get('status')} | "
-                f"{self._orders_to_text(list(row.get('orders') or []), limit=3)}"
+                f"{self._orders_to_text(list(row.get('orders') or []), limit=3, symbol_name_map=symbol_name_map)}"
             )
         if execution_results:
             ok_count = sum(1 for x in execution_results if bool(x.get("ok")))
@@ -595,6 +750,7 @@ class AgentLabOrchestrator:
             orders=list(proposal["orders"]),
             fx_rate=fx_rate,
         )
+        symbol_name_map = self._load_symbol_name_map(market, yyyymmdd)
         self.storage.update_order_proposal_status(
             proposal_id=proposal_id,
             status=PROPOSAL_STATUS_EXECUTED,
@@ -619,7 +775,7 @@ class AgentLabOrchestrator:
             f"date={yyyymmdd}\n"
             f"agent={agent_id}\n"
             f"proposal_id={proposal_id}\n"
-            f"fills={self._orders_to_text(fills, limit=5)}"
+            f"fills={self._orders_to_text(fills, limit=5, symbol_name_map=symbol_name_map)}"
         )
         return out
 
