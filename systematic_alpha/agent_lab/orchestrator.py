@@ -893,12 +893,13 @@ class AgentLabOrchestrator:
             f"{str((discussion.get('moderator') or {}).get('summary') or '')}\n"
         )
         stamp = week_end.strftime("%Y%m%d")
+        weekly_stamp = f"{stamp}_weekly"
         self.storage.upsert_weekly_council(week_id, champion, decision, markdown, now_iso())
         self.identity.save_checkpoint(week_id, decision)
-        self._write_json_artifact(stamp, f"weekly_council_{week_id.replace('-', '_')}", decision)
-        self._write_text_artifact(stamp, f"weekly_council_{week_id.replace('-', '_')}", markdown)
+        self._write_json_artifact(weekly_stamp, f"weekly_council_{week_id.replace('-', '_')}", decision)
+        self._write_text_artifact(weekly_stamp, f"weekly_council_{week_id.replace('-', '_')}", markdown)
         self.storage.log_event("weekly_council", decision, now_iso())
-        self._append_activity_artifact(stamp, "weekly_council", decision)
+        self._append_activity_artifact(weekly_stamp, "weekly_council", decision)
         lines = [
             "[AgentLab] weekly-council",
             f"week={week_id}",

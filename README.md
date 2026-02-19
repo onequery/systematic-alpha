@@ -157,6 +157,7 @@ When Telegram is configured, Agent Lab sends:
 - Agent identity: `state/agent_lab/agents/<agent_id>/identity.md`
 - Agent memory: `state/agent_lab/agents/<agent_id>/memory.jsonl`
 - Agent artifacts: `out/agent_lab/YYYYMMDD/`
+- Weekly council artifacts: `out/agent_lab/YYYYMMDD_weekly/`
 - Agent action timeline: `out/agent_lab/YYYYMMDD/activity_log.jsonl`
 - Agent logs: `logs/agent_lab/YYYYMMDD/`
 
