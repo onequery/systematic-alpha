@@ -388,6 +388,35 @@ class TelegramChatRuntime:
         else:
             lines.append(f"- daemon:auto_strategy=stopped last_update={auto_upd_at}")
 
+        auto_hb = self.storage.get_latest_event("auto_strategy_heartbeat")
+        if auto_hb:
+            hb = auto_hb.get("payload", {}) or {}
+            lines.append(
+                "- auto_strategy_heartbeat: "
+                f"status={hb.get('daemon_status', '-')}, "
+                f"action={hb.get('action', '-')}, "
+                f"reason={hb.get('reason', '-')}, "
+                f"at={auto_hb.get('created_at', '-')}"
+            )
+            mon = hb.get("intraday_monitor", {}) or {}
+            lines.append(
+                "- monitor_plan: "
+                f"enabled={mon.get('enabled', False)}, "
+                f"interval={int(mon.get('interval_sec', 0) or 0)}s, "
+                f"enabled_agents={len(list(mon.get('enabled_agents', []) or []))}"
+            )
+            mon_markets = mon.get("markets", {}) or {}
+            for mk in ["KR", "US"]:
+                st = mon_markets.get(mk, {}) or {}
+                state = str(st.get("state", "-"))
+                remain = st.get("seconds_until_next")
+                remain_txt = (
+                    f"{int(remain)}s"
+                    if isinstance(remain, (int, float))
+                    else "-"
+                )
+                lines.append(f"- monitor:{mk} state={state} next_in={remain_txt}")
+
         chat_start = self.storage.get_latest_event("telegram_chat_worker_start")
         chat_stop = self.storage.get_latest_event("telegram_chat_worker_stop")
         chat_alive = False
@@ -443,7 +472,12 @@ class TelegramChatRuntime:
 
     @staticmethod
     def _as_int_param_key(key: str) -> bool:
-        return key in {"min_pass_conditions", "collect_seconds"}
+        return key in {
+            "min_pass_conditions",
+            "collect_seconds",
+            "intraday_monitor_enabled",
+            "intraday_monitor_interval_sec",
+        }
 
     def _actor_from_message(self, message: Dict[str, Any]) -> str:
         user = message.get("from") or {}
@@ -836,6 +870,7 @@ class TelegramChatRuntime:
         latest_proposal_kr = self._latest_proposal(agent_id, "KR")
         latest_proposal_us = self._latest_proposal(agent_id, "US")
         latest_equity = self._latest_equity(agent_id)
+        heartbeat = self.storage.get_latest_event("auto_strategy_heartbeat")
         recent_directives = self._list_directives(agent_id=agent_id, limit=8)
         positions = self.storage.list_positions(agent_id)
         if len(positions) > 20:
@@ -855,6 +890,11 @@ class TelegramChatRuntime:
             "latest_equity": latest_equity,
             "recent_directives": recent_directives,
             "positions": positions,
+            "execution_model": {
+                "signal_pipeline_mode": "scheduled_daily",
+                "collect_seconds_semantics": "realtime collection duration per run (not always-on loop)",
+                "latest_auto_strategy_heartbeat": heartbeat.get("payload", {}) if heartbeat else None,
+            },
             "market_pipeline": {
                 "KR": {
                     "last_ingest": self._latest_event_by_market("session_ingested", "KR"),

@@ -62,6 +62,8 @@ def build_default_agent_profiles(total_capital_krw: float, count: int = 3) -> Li
                         "min_pass_conditions",
                         "min_maintain_ratio",
                         "collect_seconds",
+                        "intraday_monitor_enabled",
+                        "intraday_monitor_interval_sec",
                     ],
                 },
             )

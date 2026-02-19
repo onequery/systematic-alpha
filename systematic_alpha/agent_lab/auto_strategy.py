@@ -60,6 +60,7 @@ class AutoStrategyDaemon:
         self.poll_seconds = max(30, int(poll_seconds))
         self.cooldown_minutes = max(10, int(cooldown_minutes))
         self.max_updates_per_day = max(1, int(max_updates_per_day))
+        self.heartbeat_minutes = max(5, int(float(os.getenv("AGENT_LAB_HEARTBEAT_MINUTES", "30") or 30)))
 
         self.storage = AgentLabStorage(self.project_root / "state" / "agent_lab" / "agent_lab.sqlite")
         self.orchestrator = AgentLabOrchestrator(self.project_root)
@@ -171,6 +172,245 @@ class AutoStrategyDaemon:
 
     def _recent_auto_updates(self, limit: int = 100) -> List[Dict[str, Any]]:
         return self.storage.list_events(event_type="auto_strategy_update", limit=limit)
+
+    def _latest_event_by_market(self, event_type: str, market: str, limit: int = 240) -> Optional[Dict[str, Any]]:
+        rows = self.storage.list_events(event_type=event_type, limit=limit)
+        m = str(market or "").upper()
+        for row in rows:
+            payload = row.get("payload", {})
+            if not isinstance(payload, dict):
+                continue
+            if str(payload.get("market", "")).upper() == m:
+                return row
+        return None
+
+    def _latest_session_signal_for_market(self, market: str) -> Optional[Dict[str, Any]]:
+        row = self.storage.query_one(
+            """
+            SELECT *
+            FROM session_signals
+            WHERE market = ?
+            ORDER BY created_at DESC, session_signal_id DESC
+            LIMIT 1
+            """,
+            (str(market).upper(),),
+        )
+        if row is None:
+            return None
+        try:
+            row["payload"] = json.loads(str(row.get("payload_json") or "{}"))
+        except Exception:
+            row["payload"] = {}
+        return row
+
+    def _intraday_monitor_policy(self) -> Dict[str, Any]:
+        agents = self.storage.list_agents()
+        enabled_agents: List[str] = []
+        intervals: List[int] = []
+        by_agent: Dict[str, Dict[str, Any]] = {}
+        for row in agents:
+            aid = str(row.get("agent_id", ""))
+            try:
+                active = self.orchestrator.registry.get_active_strategy(aid)
+            except Exception:
+                continue
+            params = active.get("params", {}) or {}
+            enabled = bool(float(params.get("intraday_monitor_enabled", 0) or 0) >= 0.5)
+            interval = int(
+                float(
+                    params.get("intraday_monitor_interval_sec", params.get("collect_seconds", self.poll_seconds))
+                    or self.poll_seconds
+                )
+            )
+            interval = max(120, min(1800, interval))
+            by_agent[aid] = {
+                "enabled": enabled,
+                "interval_sec": interval,
+                "version_tag": str(active.get("version_tag", "")),
+            }
+            if enabled:
+                enabled_agents.append(aid)
+                intervals.append(interval)
+        enabled = len(enabled_agents) > 0
+        interval_sec = min(intervals) if intervals else 0
+        return {
+            "enabled": enabled,
+            "interval_sec": int(interval_sec),
+            "enabled_agents": enabled_agents,
+            "by_agent": by_agent,
+            "markets": ["KR", "US"],
+        }
+
+    def _is_market_open_now(self, market: str, now_kst: datetime) -> bool:
+        m = str(market).upper()
+        if m == "KR":
+            if now_kst.weekday() >= 5:
+                return False
+            start = now_kst.replace(hour=9, minute=0, second=0, microsecond=0)
+            end = now_kst.replace(hour=15, minute=35, second=0, microsecond=0)
+            return start <= now_kst <= end
+
+        now_et = now_kst.astimezone(self.et)
+        if now_et.weekday() >= 5:
+            return False
+        start = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+        end = now_et.replace(hour=16, minute=5, second=0, microsecond=0)
+        return start <= now_et <= end
+
+    def _proposal_status_counts(self, market: str, session_date: str) -> Dict[str, int]:
+        rows = self.storage.query_all(
+            """
+            SELECT status, COUNT(*) AS c
+            FROM order_proposals
+            WHERE market = ? AND session_date = ?
+            GROUP BY status
+            """,
+            (str(market).upper(), str(session_date)),
+        )
+        out: Dict[str, int] = {}
+        for row in rows:
+            out[str(row.get("status", "UNKNOWN"))] = int(row.get("c", 0) or 0)
+        return out
+
+    def _run_intraday_monitor_cycle(self, market: str, now_kst: datetime) -> Dict[str, Any]:
+        market = str(market).upper()
+        signal = self._latest_session_signal_for_market(market)
+        signal_date = str(signal.get("session_date", "")) if signal else ""
+        signal_status = str(signal.get("status_code", "NO_SIGNAL")) if signal else "NO_SIGNAL"
+        status_counts = self._proposal_status_counts(market, signal_date) if signal_date else {}
+        payload: Dict[str, Any] = {
+            "market": market,
+            "executed_at_kst": now_kst.isoformat(),
+            "mode": "observe",
+            "session_date": signal_date,
+            "signal_status": signal_status,
+            "proposal_status_counts": status_counts,
+            "propose_triggered": False,
+            "propose_ok": False,
+        }
+
+        # Optional advanced mode: re-run propose cycle during open sessions.
+        propose_enabled = _truthy(os.getenv("AGENT_LAB_INTRADAY_MONITOR_PROPOSE", "0"))
+        if propose_enabled and signal and signal_status == "SIGNAL_OK":
+            try:
+                proposed = self.orchestrator.propose_orders(
+                    market=market,
+                    yyyymmdd=signal_date,
+                    auto_execute=True,
+                )
+                proposals = list(proposed.get("proposals") or [])
+                payload["mode"] = "observe+propose"
+                payload["propose_triggered"] = True
+                payload["propose_ok"] = True
+                payload["propose_rows"] = len(proposals)
+                payload["propose_executed"] = sum(
+                    1 for row in proposals if str((row or {}).get("status", "")).upper() == "EXECUTED"
+                )
+            except Exception as exc:
+                payload["mode"] = "observe+propose"
+                payload["propose_triggered"] = True
+                payload["propose_ok"] = False
+                payload["propose_error"] = repr(exc)
+
+        self.storage.log_event("auto_intraday_monitor_cycle", payload, _now_iso())
+        self._send_telegram(
+            "[AgentLab] intraday-monitor\n"
+            f"market={market}\n"
+            f"mode={payload.get('mode')}\n"
+            f"signal={signal_status} ({signal_date or '-'})\n"
+            f"proposal_status={status_counts if status_counts else '(none)'}\n"
+            f"propose_triggered={payload.get('propose_triggered')}\n"
+            f"propose_ok={payload.get('propose_ok')}"
+        )
+        return payload
+
+    def _run_intraday_monitor(self, now_kst: datetime) -> Dict[str, Any]:
+        policy = self._intraday_monitor_policy()
+        result: Dict[str, Any] = {
+            "enabled": bool(policy.get("enabled", False)),
+            "interval_sec": int(policy.get("interval_sec", 0) or 0),
+            "enabled_agents": list(policy.get("enabled_agents", [])),
+            "markets": {},
+            "executed_markets": [],
+        }
+        if not result["enabled"]:
+            for mk in ["KR", "US"]:
+                result["markets"][mk] = {"state": "disabled", "open": self._is_market_open_now(mk, now_kst)}
+            return result
+
+        interval_sec = max(120, int(result["interval_sec"] or 120))
+        now_naive = now_kst.replace(tzinfo=None)
+        for mk in ["KR", "US"]:
+            open_now = self._is_market_open_now(mk, now_kst)
+            state: Dict[str, Any] = {"open": open_now, "state": "idle"}
+            last_cycle = self._latest_event_by_market("auto_intraday_monitor_cycle", mk)
+            if last_cycle:
+                state["last_cycle_at"] = str(last_cycle.get("created_at", ""))
+            if not open_now:
+                state["state"] = "outside_window"
+                result["markets"][mk] = state
+                continue
+
+            due = True
+            if last_cycle:
+                created = _parse_iso(str(last_cycle.get("created_at", "")))
+                if created is not None:
+                    elapsed = (now_naive - created).total_seconds()
+                    if elapsed < interval_sec:
+                        due = False
+                        state["state"] = "waiting"
+                        state["seconds_until_next"] = int(max(0.0, interval_sec - elapsed))
+            if not due:
+                result["markets"][mk] = state
+                continue
+
+            cycle = self._run_intraday_monitor_cycle(mk, now_kst)
+            state["state"] = "executed"
+            state["session_date"] = str(cycle.get("session_date", ""))
+            state["signal_status"] = str(cycle.get("signal_status", ""))
+            state["propose_triggered"] = bool(cycle.get("propose_triggered", False))
+            state["propose_ok"] = bool(cycle.get("propose_ok", False))
+            state["seconds_until_next"] = interval_sec
+            result["executed_markets"].append(mk)
+            result["markets"][mk] = state
+        return result
+
+    def _maybe_send_heartbeat_telegram(self, payload: Dict[str, Any]) -> None:
+        latest = self.storage.get_latest_event("auto_strategy_heartbeat_notice")
+        if latest:
+            created = _parse_iso(str(latest.get("created_at", "")))
+            if created is not None:
+                delta = datetime.now() - created
+                if delta < timedelta(minutes=self.heartbeat_minutes):
+                    return
+        monitor = payload.get("intraday_monitor", {}) if isinstance(payload, dict) else {}
+        mk = monitor.get("markets", {}) if isinstance(monitor, dict) else {}
+        kr = mk.get("KR", {}) if isinstance(mk, dict) else {}
+        us = mk.get("US", {}) if isinstance(mk, dict) else {}
+        self._send_telegram(
+            "[AgentLab] heartbeat\n"
+            f"action={payload.get('action', '-')}\n"
+            f"reason={payload.get('reason', '-')}\n"
+            f"next_poll_in={payload.get('next_poll_in_sec', self.poll_seconds)}s\n"
+            f"monitor_enabled={monitor.get('enabled', False)} interval={monitor.get('interval_sec', 0)}s\n"
+            f"KR={kr.get('state', '-')}, US={us.get('state', '-')}"
+        )
+        self.storage.log_event("auto_strategy_heartbeat_notice", payload, _now_iso())
+
+    def _emit_heartbeat(self, latest: Dict[str, Any], daemon_status: str = "ok") -> None:
+        now_kst = datetime.now(self.kst)
+        next_poll_at = now_kst + timedelta(seconds=self.poll_seconds)
+        payload = {
+            "daemon_status": daemon_status,
+            "action": str(latest.get("action", "idle")),
+            "reason": str(latest.get("reason", "")),
+            "next_poll_in_sec": int(self.poll_seconds),
+            "next_poll_at_kst": next_poll_at.isoformat(),
+            "intraday_monitor": latest.get("intraday_monitor", {}),
+            "updated_at_kst": now_kst.isoformat(),
+        }
+        self.storage.log_event("auto_strategy_heartbeat", payload, _now_iso())
+        self._maybe_send_heartbeat_telegram(payload)
 
     def _within_restricted_window(self, now_kst: datetime) -> bool:
         # Keep strategy mutation away from open/volatile windows.
@@ -344,14 +584,16 @@ class AutoStrategyDaemon:
 
     def run_once(self) -> Dict[str, Any]:
         now_kst = datetime.now(self.kst)
+        intraday_monitor = self._run_intraday_monitor(now_kst)
         triggers = self._detect_triggers(now_kst)
 
         if not triggers:
             result = {
-                "action": "skip",
+                "action": "monitor_only" if intraday_monitor.get("executed_markets") else "skip",
                 "reason": "no_triggers",
                 "now_kst": now_kst.isoformat(),
                 "trigger_count": 0,
+                "intraday_monitor": intraday_monitor,
             }
             return result
 
@@ -361,6 +603,7 @@ class AutoStrategyDaemon:
                 "reason": "restricted_window",
                 "now_kst": now_kst.isoformat(),
                 "triggers": [t.__dict__ for t in triggers],
+                "intraday_monitor": intraday_monitor,
             }
             return result
 
@@ -370,6 +613,7 @@ class AutoStrategyDaemon:
                 "reason": "cooldown_or_daily_limit",
                 "now_kst": now_kst.isoformat(),
                 "triggers": [t.__dict__ for t in triggers],
+                "intraday_monitor": intraday_monitor,
             }
             return result
 
@@ -382,6 +626,7 @@ class AutoStrategyDaemon:
                 "vote": vote,
                 "now_kst": now_kst.isoformat(),
                 "triggers": [t.__dict__ for t in triggers],
+                "intraday_monitor": intraday_monitor,
             }
             return result
 
@@ -400,7 +645,7 @@ class AutoStrategyDaemon:
             f"vote_reason={vote.get('reason')}\n"
             f"artifact={updated.get('artifact_path')}"
         )
-        return {"action": "updated", **updated}
+        return {"action": "updated", "intraday_monitor": intraday_monitor, **updated}
 
     def run(self, *, once: bool = False) -> Dict[str, Any]:
         self.storage.log_event(
@@ -408,19 +653,30 @@ class AutoStrategyDaemon:
             payload={"poll_seconds": self.poll_seconds},
             created_at=_now_iso(),
         )
+        self._send_telegram(
+            "[AgentLab] auto-strategy-daemon start\n"
+            f"poll_seconds={self.poll_seconds}\n"
+            f"cooldown_minutes={self.cooldown_minutes}\n"
+            f"max_updates_per_day={self.max_updates_per_day}\n"
+            f"heartbeat_minutes={self.heartbeat_minutes}"
+        )
         if once:
-            return self.run_once()
+            latest_once = self.run_once()
+            self._emit_heartbeat(latest_once, daemon_status="ok")
+            return latest_once
 
         latest: Dict[str, Any] = {"action": "idle"}
         while True:
             try:
                 latest = self.run_once()
+                self._emit_heartbeat(latest, daemon_status="ok")
             except KeyboardInterrupt:
                 break
             except Exception as exc:
                 err = {"action": "error", "error": repr(exc), "at": _now_iso()}
                 latest = err
                 self.storage.log_event("auto_strategy_daemon_error", err, _now_iso())
+                self._emit_heartbeat(err, daemon_status="error")
                 self._send_telegram(
                     "[AgentLab] auto-strategy-daemon error\n"
                     f"error={repr(exc)}"

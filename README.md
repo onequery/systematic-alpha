@@ -61,6 +61,8 @@ Optional for LLM-assisted agent updates:
 - `AGENT_LAB_TELEGRAM_USE_ENV_PROXY=0` (default; set `1` only if your network requires env proxy)
 - `SYSTEMATIC_ALPHA_PROXY_MODE=auto` (`auto|off|clear_all`, network guard for broken proxy env)
 - `AGENT_LAB_USDKRW_DEFAULT=1300` (fallback if live FX/cache unavailable)
+- `AGENT_LAB_HEARTBEAT_MINUTES=30` (periodic daemon heartbeat Telegram interval)
+- `AGENT_LAB_INTRADAY_MONITOR_PROPOSE=0` (`1` enables monitor-cycle propose/orders during market open)
 
 ## WSL One Command: Activate Everything
 
@@ -146,6 +148,8 @@ When Telegram is configured, Agent Lab sends:
 - Automatic data-reception self-heal events (critical failure detection + safe patch attempts)
 - Automatic strategy-update events from auto strategy daemon
 - OpenAI token/quota/budget alerts from auto strategy daemon
+- Auto strategy heartbeat events (current action, reason, next poll, monitor state)
+- Intraday monitor cycle events (enabled/disabled, market state, optional propose result)
 
 ## Important Paths
 
@@ -243,6 +247,13 @@ ps -ef | grep run_agent_lab_wsl.sh | grep -v grep
 3. `/approve` 또는 `/reject`로 확정
 4. 적용된 지시는 `state/agent_lab/agents/<agent_id>/memory.jsonl`에 기록
 5. `setparam` 적용 시 전략 버전이 갱신되고, 주간 회의 맥락에도 반영
+
+실행 모델 참고:
+
+1. 기본 신호 파이프라인은 장별 스케줄 실행입니다 (KR 09:00, US 09:30 ET).
+2. `collect_seconds`는 "해당 실행 1회 내부의 실시간 수집 길이"이며, 항상-상시 루프 의미가 아닙니다.
+3. 에이전트 전략 파라미터 `intraday_monitor_enabled`, `intraday_monitor_interval_sec`를 통해 장중 모니터링 모드를 스스로 켜고 주기를 조정할 수 있습니다.
+4. 현재 모니터링/대기/오류 상태는 `/queue`, `/status KR`, `/status US`에서 heartbeat와 함께 확인할 수 있습니다.
 
 운영 팁:
 

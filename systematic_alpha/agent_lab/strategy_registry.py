@@ -20,6 +20,8 @@ DEFAULT_STRATEGY_PARAMS: Dict[str, Any] = {
     "min_pass_conditions": 5,
     "min_maintain_ratio": 0.6,
     "collect_seconds": 600,
+    "intraday_monitor_enabled": 0,
+    "intraday_monitor_interval_sec": 600,
     "max_daily_picks": 3,
     "position_cap_ratio": 0.333,
     "exposure_cap_ratio": 0.95,
@@ -35,6 +37,8 @@ ALLOWED_PARAM_RANGES: Dict[str, List[float]] = {
     "min_pass_conditions": [4.0, 8.0],
     "min_maintain_ratio": [0.4, 0.9],
     "collect_seconds": [120.0, 900.0],
+    "intraday_monitor_enabled": [0.0, 1.0],
+    "intraday_monitor_interval_sec": [120.0, 1800.0],
     "position_cap_ratio": [0.20, 0.40],
     "exposure_cap_ratio": [0.70, 0.95],
 }
@@ -52,7 +56,7 @@ class StrategyRegistry:
                 continue
             lo, hi = float(bounds[0]), float(bounds[1])
             val = float(out[key])
-            if key in {"min_pass_conditions", "collect_seconds"}:
+            if key in {"min_pass_conditions", "collect_seconds", "intraday_monitor_interval_sec", "intraday_monitor_enabled"}:
                 out[key] = int(max(lo, min(hi, val)))
             else:
                 out[key] = max(lo, min(hi, val))
