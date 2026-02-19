@@ -40,6 +40,7 @@ class RiskEngine:
         week_return_pct: float,
         current_exposure_krw: float,
         orders: List[Dict[str, Any]],
+        usdkrw_rate: float = 1300.0,
     ) -> RiskDecision:
         dropped: List[Dict[str, Any]] = []
         if self.blocked_by_signal(status_code):
@@ -72,13 +73,18 @@ class RiskEngine:
         exposure_after = float(current_exposure_krw)
         accepted: List[Dict[str, Any]] = []
         seen_symbols = set()
+        fx_rate = float(usdkrw_rate or 1300.0)
+        if fx_rate <= 0:
+            fx_rate = 1300.0
 
         for raw in orders:
             symbol = str(raw.get("symbol", "")).strip().upper()
             side = str(raw.get("side", "BUY")).upper()
             qty = float(raw.get("quantity", 0.0) or 0.0)
             ref = float(raw.get("reference_price", 0.0) or 0.0)
-            notional = qty * ref
+            order_market = str(raw.get("market", "")).strip().upper()
+            local_notional = qty * ref
+            notional = local_notional * (fx_rate if order_market == "US" else 1.0)
             if side != "BUY" or qty <= 0 or ref <= 0:
                 dropped.append({"order": raw, "reason": "invalid_order_fields"})
                 continue

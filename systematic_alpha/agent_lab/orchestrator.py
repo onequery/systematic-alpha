@@ -7,6 +7,8 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import requests
+
 from systematic_alpha.agent_lab.accounting import AccountingEngine
 from systematic_alpha.agent_lab.agents import AgentDecisionEngine, build_default_agent_profiles, profile_from_agent_row
 from systematic_alpha.agent_lab.identity import AgentIdentityStore
@@ -46,6 +48,11 @@ def parse_week_id(week_id: str) -> Tuple[date, date]:
     start = date.fromisocalendar(year, week, 1)
     end = date.fromisocalendar(year, week, 7)
     return start, end
+
+
+def _valid_usdkrw(rate: float) -> bool:
+    # Conservative sanity band for USD/KRW.
+    return 500.0 <= float(rate) <= 3000.0
 
 
 class AgentLabOrchestrator:
@@ -176,22 +183,87 @@ class AgentLabOrchestrator:
     def _usdkrw_rate(self, yyyymmdd: str) -> Optional[float]:
         default_rate = float(os.getenv("AGENT_LAB_USDKRW_DEFAULT", "1300") or 1300.0)
         latest = self.storage.get_latest_event("fx_rate_usdkrw")
-        if latest:
-            payload = latest.get("payload", {})
+        run_date = datetime.strptime(yyyymmdd, "%Y%m%d").date()
+        use_live_fx = _truthy(os.getenv("AGENT_LAB_USE_LIVE_FX", "1"))
+
+        def _extract_cached_rate(row: Optional[Dict[str, Any]], *, max_age_days: int) -> Optional[float]:
+            if not row:
+                return None
+            payload = row.get("payload", {})
             try:
                 rate = float(payload.get("rate"))
-                d0 = datetime.fromisoformat(str(latest["created_at"])).date()
-                d1 = datetime.strptime(yyyymmdd, "%Y%m%d").date()
-                if (d1 - d0).days <= 3:
+                if not _valid_usdkrw(rate):
+                    return None
+                d0 = datetime.fromisoformat(str(row["created_at"])).date()
+                if (run_date - d0).days <= max_age_days:
                     return rate
             except Exception:
-                pass
+                return None
+            return None
+
+        cached_today = _extract_cached_rate(latest, max_age_days=0)
+        latest_source = ""
+        if latest:
+            latest_source = str((latest.get("payload", {}) or {}).get("source", "")).strip().lower()
+
+        # If today's cache is already from live/manual source, trust it.
+        if cached_today is not None and (not use_live_fx or latest_source.startswith("live_") or latest_source == "manual"):
+            return cached_today
+
+        if use_live_fx:
+            live = self._fetch_live_usdkrw_rate()
+            if live is not None:
+                rate, source = live
+                self.storage.log_event(
+                    event_type="fx_rate_usdkrw",
+                    payload={"rate": rate, "source": source, "date": yyyymmdd},
+                    created_at=now_iso(),
+                )
+                return rate
+            self.storage.log_event(
+                event_type="fx_rate_usdkrw_fetch_failed",
+                payload={"date": yyyymmdd, "fallback": "cache_or_env_default"},
+                created_at=now_iso(),
+            )
+            if cached_today is not None:
+                return cached_today
+
+        cached_recent = _extract_cached_rate(latest, max_age_days=3)
+        if cached_recent is not None:
+            return cached_recent
+
         self.storage.log_event(
             event_type="fx_rate_usdkrw",
             payload={"rate": default_rate, "source": "env_default", "date": yyyymmdd},
             created_at=now_iso(),
         )
         return default_rate
+
+    def _fetch_live_usdkrw_rate(self) -> Optional[Tuple[float, str]]:
+        # Primary + fallback public FX endpoints.
+        providers: List[Tuple[str, str]] = [
+            ("open_er_api", "https://open.er-api.com/v6/latest/USD"),
+            ("frankfurter", "https://api.frankfurter.app/latest?from=USD&to=KRW"),
+        ]
+        timeout_sec = float(os.getenv("AGENT_LAB_FX_TIMEOUT_SECONDS", "8") or 8.0)
+
+        for name, url in providers:
+            try:
+                resp = requests.get(url, timeout=timeout_sec)
+                resp.raise_for_status()
+                data = resp.json()
+                rate: Optional[float] = None
+                if name == "open_er_api":
+                    rates = data.get("rates", {}) if isinstance(data, dict) else {}
+                    rate = float(rates.get("KRW"))
+                elif name == "frankfurter":
+                    rates = data.get("rates", {}) if isinstance(data, dict) else {}
+                    rate = float(rates.get("KRW"))
+                if rate is not None and _valid_usdkrw(rate):
+                    return rate, f"live_{name}"
+            except Exception:
+                continue
+        return None
 
     def init_lab(self, capital_krw: float, agents: int) -> Dict[str, Any]:
         profiles = build_default_agent_profiles(total_capital_krw=capital_krw, count=agents)
@@ -319,6 +391,7 @@ class AgentLabOrchestrator:
                 session_payload=signal["payload"],
                 params=active["params"],
                 available_cash_krw=float(ledger["cash_krw"]),
+                usdkrw_rate=usdkrw,
             )
             raw_orders = [o.__dict__ for o in proposed_orders]
             decision = self.risk.evaluate(
@@ -328,6 +401,7 @@ class AgentLabOrchestrator:
                 week_return_pct=float(week_ret),
                 current_exposure_krw=float(self.accounting.current_exposure_krw(agent_id)),
                 orders=raw_orders,
+                usdkrw_rate=usdkrw,
             )
             status = (
                 PROPOSAL_STATUS_APPROVED

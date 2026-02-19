@@ -56,8 +56,11 @@ Optional for LLM-assisted agent updates:
 - `OPENAI_MAX_DAILY_COST=5.0`
 - `AGENT_LAB_EXECUTION_MODE=mojito_mock` (mock-account API execution)
 - `AGENT_LAB_AUTO_APPROVE=1` (auto execute without manual approval)
+- `AGENT_LAB_USE_LIVE_FX=1` (try live USD/KRW rate first)
+- `AGENT_LAB_FX_TIMEOUT_SECONDS=8` (timeout per FX provider call)
 - `AGENT_LAB_TELEGRAM_USE_ENV_PROXY=0` (default; set `1` only if your network requires env proxy)
 - `SYSTEMATIC_ALPHA_PROXY_MODE=auto` (`auto|off|clear_all`, network guard for broken proxy env)
+- `AGENT_LAB_USDKRW_DEFAULT=1300` (fallback if live FX/cache unavailable)
 
 ## WSL One Command: Activate Everything
 
@@ -96,6 +99,14 @@ ps -ef | grep run_agent_lab_wsl.sh | grep -v grep
 
 ```bash
 ./scripts/remove_all_tasks_wsl.sh
+```
+
+## WSL One Command: Reset Tasks (Down + Up)
+
+Use this after code/config updates when you want to fully restart scheduler + daemons in one line.
+
+```bash
+./scripts/reset_all_tasks_wsl.sh
 ```
 
 ## Check Registered Cron Jobs

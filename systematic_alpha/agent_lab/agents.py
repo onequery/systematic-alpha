@@ -162,10 +162,18 @@ class AgentDecisionEngine:
         session_payload: Dict[str, Any],
         params: Dict[str, Any],
         available_cash_krw: float,
+        usdkrw_rate: float = 1300.0,
     ) -> Tuple[List[ProposedOrder], str]:
         candidates = _extract_ranked_candidates(session_payload)
         if not candidates:
             return [], "No ranked candidates from session signal payload."
+
+        market_norm = str(market).strip().upper()
+        fx_rate = float(usdkrw_rate or 1300.0)
+        if market_norm != "US":
+            fx_rate = 1.0
+        if fx_rate <= 0:
+            fx_rate = 1300.0 if market_norm == "US" else 1.0
 
         max_picks = int(params.get("max_daily_picks", 3) or 3)
         max_picks = max(1, min(3, max_picks))
@@ -173,12 +181,13 @@ class AgentDecisionEngine:
         if not picked:
             return [], "No candidate passed agent-specific picker."
 
-        budget_cap = available_cash_krw * self._risk_budget_ratio(agent.agent_id)
+        budget_cap = max(0.0, float(available_cash_krw)) * self._risk_budget_ratio(agent.agent_id)
         per_order_budget = budget_cap / max(1, len(picked))
         orders: List[ProposedOrder] = []
         for c in picked:
-            price = float(c["price"])
-            qty = int(math.floor(per_order_budget / price))
+            price = float(c["price"])  # KR: KRW price, US: USD price
+            price_krw = price * fx_rate
+            qty = int(math.floor(per_order_budget / price_krw))
             if qty <= 0:
                 continue
             orders.append(
@@ -202,7 +211,7 @@ class AgentDecisionEngine:
         rationale = (
             f"{agent.name} proposed {len(orders)} order(s). "
             f"available_cash_krw={available_cash_krw:.0f}, budget_cap={budget_cap:.0f}, "
-            f"per_order_budget={per_order_budget:.0f}"
+            f"per_order_budget={per_order_budget:.0f}, fx_rate={fx_rate:.2f}"
         )
         return orders, rationale
 
