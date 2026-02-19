@@ -77,11 +77,19 @@ This registers cron-based automation in WSL:
 - Telegram chat worker (`@reboot`)
 - Auto strategy daemon (`@reboot`)
 - Agent Lab initialization (`10,000,000 KRW`, `3 agents`) by default
+- Plus immediate bootstrap: `telegram-chat` and `auto-strategy-daemon` are started right away.
 
 Default behavior:
 
 - Agent proposals are auto-executed in paper account mode when `AGENT_LAB_AUTO_APPROVE=1`.
 - Agent workflow notifications are sent from python orchestrator (if Telegram is configured).
+
+Quick check after registration:
+
+```bash
+crontab -l
+ps -ef | grep run_agent_lab_wsl.sh | grep -v grep
+```
 
 ## WSL One Command: Remove Everything
 
@@ -149,33 +157,67 @@ python -m systematic_alpha.agent_lab.cli --project-root . self-heal --market KR 
 ./scripts/run_agent_lab_wsl.sh --action auto-strategy-daemon --auto-strategy-once
 ```
 
-## Telegram Agent Chat Commands
+## Telegram 사용 가이드
 
-Send these commands in the configured Telegram chat:
+텔레그램에서 아래 명령어로 에이전트와 직접 소통할 수 있습니다.
 
-- `/help`
-- `/agents`
-- `/status`
-- `/status agent_a`
-- `/plan agent_b`
-- `/ask agent_c Why did you avoid the top symbol today?`
-- `/memory agent_a`
-- `/directive agent_a Consider sector leadership in your weekly review.`
-- `/setparam agent_b min_strength 115 tighten entry quality`
-- `/directives`
-- `/approve 42 apply now`
-- `/reject 42 not aligned with risk rules`
+사전 확인:
+
+1. `.env`에 `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`가 설정되어 있어야 합니다.
+2. `telegram-chat` 데몬이 실행 중이어야 합니다.
+3. 아래 명령으로 실행 상태를 확인할 수 있습니다.
+
+```bash
+ps -ef | grep run_agent_lab_wsl.sh | grep -v grep
+```
+
+주요 명령어:
+
+| 명령어 | 용도 | 예시 입력 | 예상 응답(요약) |
+|---|---|---|---|
+| `/help` | 사용 가능한 명령 확인 | `/help` | 명령어 목록과 사용법 |
+| `/agents` | 활성 에이전트 목록 확인 | `/agents` | `agent_a`, `agent_b`, `agent_c` 역할 요약 |
+| `/status` | 전체 상태 요약 | `/status` | 최근 KR/US 실행 상태, 제안/주문/에러 요약 |
+| `/status <agent_id>` | 특정 에이전트 상태 | `/status agent_a` | 해당 에이전트의 최신 포지션/최근 의사결정 |
+| `/plan <agent_id>` | 현재 운용 계획 확인 | `/plan agent_b` | 금일 계획, 진입/회피 기준, 리스크 관점 |
+| `/ask <agent_id> <질문>` | 자유 질의응답 | `/ask agent_c 오늘 상위 종목 대신 5위를 고른 이유?` | 해당 판단 근거와 대안 설명 |
+| `/memory <agent_id>` | 최근 기억(학습 로그) 확인 | `/memory agent_a` | 최근 의사결정/교훈/다음 액션 |
+| `/directive <agent_id> <지시문>` | 자연어 지시 생성(PENDING) | `/directive agent_a 거래량 급증 종목을 더 우선 고려해` | 지시 ID 생성, 상태 `PENDING` |
+| `/setparam <agent_id> <key> <value> <메모>` | 파라미터 수정 지시(PENDING) | `/setparam agent_b min_strength 115 체결강도 기준 상향` | 파라미터 지시 ID 생성 |
+| `/directives` | 지시 대기열 조회 | `/directives` | 승인/거절 대기 ID 목록 |
+| `/approve <id> <메모>` | 지시 승인 적용 | `/approve 42 apply now` | 적용 완료, 전략/메모리 반영 결과 |
+| `/reject <id> <사유>` | 지시 거절 | `/reject 42 risk too high` | 거절 처리, 사유 기록 |
+
+실전 대화 예시:
+
+1. 상태 점검
+입력: `/status`
+응답 예시: `KR latest=SUCCESS, US latest=SUCCESS, pending_directives=1, openai_budget=ok`
+2. 전략 이유 질의
+입력: `/ask agent_a 오늘 1순위 종목을 선택한 핵심 이유 3가지만 알려줘`
+응답 예시: `체결강도 유지, VWAP 상단 유지, 호가비율 우위`
+3. 전략 수정 요청
+입력: `/setparam agent_b min_bid_ask_ratio 1.3 보수적으로 상향`
+응답 예시: `directive_id=57, status=PENDING`
+입력: `/approve 57 apply now`
+응답 예시: `directive 57 applied, strategy version promoted`
+
+지시(Directive) 처리 순서:
+
+1. `/directive` 또는 `/setparam`으로 지시 생성 (`PENDING`)
+2. `/directives`로 대기열 확인
+3. `/approve` 또는 `/reject`로 확정
+4. 적용된 지시는 `state/agent_lab/agents/<agent_id>/memory.jsonl`에 기록
+5. `setparam` 적용 시 전략 버전이 갱신되고, 주간 회의 맥락에도 반영
+
+운영 팁:
+
+1. 실행 직후에는 `/status`로 먼저 상태를 확인한 뒤 질의하세요.
+2. 전략 변경은 반드시 `PENDING -> approve` 순서로 적용하세요.
+3. 응답이 없으면 `telegram-chat` 데몬 프로세스와 `logs/cron/agent_telegram_chat.log`를 확인하세요.
 
 Identity and memory are persisted in `state/agent_lab/agents/<agent_id>/`.
 If you stop and restart tasks for code updates, agents warm-start from identity + recent memory + latest checkpoint.
-
-Directive workflow:
-
-1. Create directive with `/directive` or `/setparam` (status=`PENDING`)
-2. Review queue with `/directives`
-3. Apply with `/approve <id>` or reject with `/reject <id>`
-4. Applied directives are saved to agent memory, and `/setparam` creates a new promoted strategy version automatically
-5. Applied freeform directives are injected into weekly council debate context so agents can reflect them in next strategy updates
 
 ## Note on Legacy Signal Code
 

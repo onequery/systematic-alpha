@@ -7,6 +7,7 @@ PYTHON_BIN="${PYTHON_BIN:-$PYTHON_BIN_DEFAULT}"
 INIT_AGENT_LAB="${INIT_AGENT_LAB:-1}"
 INIT_CAPITAL_KRW="${INIT_CAPITAL_KRW:-10000000}"
 INIT_AGENTS="${INIT_AGENTS:-3}"
+START_DAEMONS_NOW="${START_DAEMONS_NOW:-1}"
 MARK_START="# >>> systematic-alpha tasks start >>>"
 MARK_END="# <<< systematic-alpha tasks end <<<"
 
@@ -54,4 +55,23 @@ if [[ "$INIT_AGENT_LAB" == "1" ]]; then
     --action init \
     --capital-krw "$INIT_CAPITAL_KRW" \
     --agents "$INIT_AGENTS"
+fi
+
+start_daemon_if_needed() {
+  local action="$1"
+  local marker="run_agent_lab_wsl.sh --action $action"
+  local log_path="$ROOT_DIR/logs/cron/agent_${action}_bootstrap.log"
+  if pgrep -f "$marker" >/dev/null 2>&1; then
+    echo "Daemon already running: $action"
+    return 0
+  fi
+  echo "Starting daemon now: $action"
+  nohup /usr/bin/env bash "$ROOT_DIR/scripts/run_agent_lab_wsl.sh" --action "$action" >> "$log_path" 2>&1 &
+}
+
+if [[ "$START_DAEMONS_NOW" == "1" ]]; then
+  start_daemon_if_needed "telegram-chat"
+  start_daemon_if_needed "auto-strategy-daemon"
+  echo "Daemon bootstrap done (telegram-chat, auto-strategy-daemon)."
+  echo "Check running: ps -ef | grep run_agent_lab_wsl.sh | grep -v grep"
 fi
