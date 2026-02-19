@@ -3,9 +3,10 @@ from __future__ import annotations
 import json
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -99,6 +100,19 @@ class TelegramChatRuntime:
             "agent_b": "agent_b",
             "agent_c": "agent_c",
         }
+        self.market_alias: Dict[str, str] = {
+            "kr": "KR",
+            "krx": "KR",
+            "kor": "KR",
+            "korea": "KR",
+            "us": "US",
+            "usa": "US",
+            "nasd": "US",
+            "nyse": "US",
+            "amex": "US",
+        }
+        self.kst = ZoneInfo("Asia/Seoul")
+        self.et = ZoneInfo("America/New_York")
 
     def _sanitize_error(self, value: Any) -> str:
         text = repr(value)
@@ -190,6 +204,242 @@ class TelegramChatRuntime:
             if key == name:
                 return aid
         return None
+
+    def _normalize_market(self, token: str) -> Optional[str]:
+        key = str(token or "").strip().lower()
+        if not key:
+            return None
+        if key in self.market_alias:
+            return self.market_alias[key]
+        up = key.upper()
+        if up in {"KR", "US"}:
+            return up
+        return None
+
+    def _parse_status_filters(self, args: List[str]) -> Tuple[Optional[str], Optional[str], str]:
+        if len(args) > 2:
+            return None, None, "Usage: /status [agent_id] [KR|US] or /queue [agent_id] [KR|US]"
+        agent_id: Optional[str] = None
+        market: Optional[str] = None
+        for raw in args[:2]:
+            m = self._normalize_market(raw)
+            a = self._normalize_agent_id(raw)
+            if m and market and market != m:
+                return None, None, "Conflicting market args. Use KR or US once."
+            if a and agent_id and agent_id != a:
+                return None, None, "Conflicting agent args. Use one agent only."
+            if m:
+                market = m
+                continue
+            if a:
+                agent_id = a
+                continue
+            return None, None, f"Unknown filter '{raw}'. Use /agents and KR|US."
+        return agent_id, market, ""
+
+    @staticmethod
+    def _parse_iso(value: Any) -> Optional[datetime]:
+        try:
+            return datetime.fromisoformat(str(value))
+        except Exception:
+            return None
+
+    def _as_tz(self, dt: datetime, tz: ZoneInfo) -> datetime:
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=tz)
+        return dt.astimezone(tz)
+
+    def _next_weekday_at(self, now: datetime, hour: int, minute: int) -> datetime:
+        target = now.replace(hour=int(hour), minute=int(minute), second=0, microsecond=0)
+        if target <= now:
+            target += timedelta(days=1)
+        while target.weekday() >= 5:
+            target += timedelta(days=1)
+        return target
+
+    def _next_weekly_at(self, now: datetime, weekday: int, hour: int, minute: int) -> datetime:
+        # weekday: Monday=0 ... Sunday=6
+        days_ahead = (weekday - now.weekday()) % 7
+        target = now + timedelta(days=days_ahead)
+        target = target.replace(hour=int(hour), minute=int(minute), second=0, microsecond=0)
+        if target <= now:
+            target += timedelta(days=7)
+        return target
+
+    @staticmethod
+    def _eta_seconds(now: datetime, target: datetime) -> int:
+        return max(0, int((target - now).total_seconds()))
+
+    @staticmethod
+    def _format_orders_short(orders: List[Dict[str, Any]], limit: int = 3) -> str:
+        if not orders:
+            return "none"
+        chunks: List[str] = []
+        for row in orders[: max(1, int(limit))]:
+            side = str(row.get("side", "")).strip() or "?"
+            symbol = str(row.get("symbol", "")).strip() or "?"
+            qty = float(row.get("quantity", 0.0) or 0.0)
+            chunks.append(f"{side} {symbol} x{qty:.0f}")
+        return ", ".join(chunks)
+
+    def _latest_event_by_market(self, event_type: str, market: str, limit: int = 200) -> Optional[Dict[str, Any]]:
+        rows = self.storage.list_events(event_type=event_type, limit=limit)
+        m = str(market or "").upper()
+        for row in rows:
+            payload = row.get("payload", {})
+            if not isinstance(payload, dict):
+                continue
+            if str(payload.get("market", "")).upper() == m:
+                return row
+        return None
+
+    def _latest_proposal(self, agent_id: str, market: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        auto_approve = _truthy(os.getenv("AGENT_LAB_AUTO_APPROVE", "1"))
+        where_market = ""
+        params_base: List[Any] = [agent_id]
+        if market:
+            where_market = " AND market = ?"
+            params_base.append(str(market).upper())
+
+        row = None
+        if auto_approve:
+            row = self.storage.query_one(
+                f"""
+                SELECT *
+                FROM order_proposals
+                WHERE agent_id = ?{where_market} AND status <> 'PENDING_APPROVAL'
+                ORDER BY created_at DESC, proposal_id DESC
+                LIMIT 1
+                """,
+                tuple(params_base),
+            )
+        if row is None:
+            row = self.storage.query_one(
+                f"""
+                SELECT *
+                FROM order_proposals
+                WHERE agent_id = ?{where_market}
+                ORDER BY created_at DESC, proposal_id DESC
+                LIMIT 1
+                """,
+                tuple(params_base),
+            )
+        if row is None:
+            return None
+        try:
+            row["orders"] = json.loads(row.pop("orders_json"))
+        except Exception:
+            row["orders"] = []
+        return row
+
+    def _market_schedule_rows(self, market: str) -> List[Dict[str, Any]]:
+        m = str(market).upper()
+        now_kst = datetime.now(self.kst)
+        rows: List[Dict[str, Any]] = []
+        if m == "KR":
+            now_local = now_kst
+            specs = [
+                ("prefetch", 7, 30, self.kst),
+                ("signal-scan", 9, 0, self.kst),
+                ("agent-exec", 9, 20, self.kst),
+            ]
+        else:
+            now_local = now_kst.astimezone(self.et)
+            specs = [
+                ("prefetch", 8, 30, self.et),
+                ("signal-scan", 9, 30, self.et),
+                ("agent-exec", 9, 45, self.et),
+            ]
+        for label, hour, minute, tz in specs:
+            next_run = self._next_weekday_at(now_local, hour, minute)
+            eta = self._eta_seconds(now_local, next_run)
+            rows.append(
+                {
+                    "label": label,
+                    "next_run_local": next_run.strftime("%Y-%m-%d %H:%M:%S %Z"),
+                    "next_run_kst": next_run.astimezone(self.kst).strftime("%Y-%m-%d %H:%M:%S %Z"),
+                    "eta_seconds": eta,
+                    "tz": tz.key if hasattr(tz, "key") else str(tz),
+                }
+            )
+        return rows
+
+    def _runtime_health_lines(self) -> List[str]:
+        now_kst = datetime.now(self.kst)
+        lines: List[str] = []
+
+        auto_start = self.storage.get_latest_event("auto_strategy_daemon_start")
+        auto_stop = self.storage.get_latest_event("auto_strategy_daemon_stop")
+        auto_alive = False
+        next_poll_sec = None
+        if auto_start is not None:
+            st = self._parse_iso(auto_start.get("created_at"))
+            ed = self._parse_iso(auto_stop.get("created_at")) if auto_stop else None
+            if st is not None and (ed is None or self._as_tz(st, self.kst) > self._as_tz(ed, self.kst)):
+                auto_alive = True
+                poll = int((auto_start.get("payload", {}) or {}).get("poll_seconds", 300) or 300)
+                elapsed = int((now_kst - self._as_tz(st, self.kst)).total_seconds())
+                if poll > 0 and elapsed >= 0:
+                    next_poll_sec = poll - (elapsed % poll)
+        auto_upd = self.storage.get_latest_event("auto_strategy_update")
+        auto_upd_at = str(auto_upd.get("created_at", "-")) if auto_upd else "-"
+        if auto_alive and next_poll_sec is not None:
+            lines.append(f"- daemon:auto_strategy=alive next_poll_in={next_poll_sec}s last_update={auto_upd_at}")
+        else:
+            lines.append(f"- daemon:auto_strategy=stopped last_update={auto_upd_at}")
+
+        chat_start = self.storage.get_latest_event("telegram_chat_worker_start")
+        chat_stop = self.storage.get_latest_event("telegram_chat_worker_stop")
+        chat_alive = False
+        if chat_start is not None:
+            st = self._parse_iso(chat_start.get("created_at"))
+            ed = self._parse_iso(chat_stop.get("created_at")) if chat_stop else None
+            if st is not None and (ed is None or self._as_tz(st, self.kst) > self._as_tz(ed, self.kst)):
+                chat_alive = True
+        chat_last_err = self.storage.get_latest_event("telegram_chat_worker_error")
+        err_at = str(chat_last_err.get("created_at", "-")) if chat_last_err else "-"
+        lines.append(f"- daemon:telegram_chat={'alive' if chat_alive else 'stopped'} last_error={err_at}")
+        return lines
+
+    def _format_market_pipeline_block(self, market: str) -> List[str]:
+        m = str(market).upper()
+        out: List[str] = [f"[{m}] pipeline"]
+        ingest_evt = self._latest_event_by_market("session_ingested", m)
+        prop_evt = self._latest_event_by_market("orders_proposed", m)
+        if ingest_evt:
+            p = ingest_evt.get("payload", {}) or {}
+            out.append(
+                f"- last_ingest: date={p.get('date', p.get('session_date', '-'))} status={p.get('status_code', '-')} "
+                f"at={ingest_evt.get('created_at', '-')}"
+            )
+        else:
+            out.append("- last_ingest: -")
+        if prop_evt:
+            p = prop_evt.get("payload", {}) or {}
+            proposals = p.get("proposals") or []
+            total = len(proposals)
+            blocked = sum(1 for x in proposals if str((x or {}).get("status", "")).upper() == "BLOCKED")
+            executed = sum(1 for x in proposals if str((x or {}).get("status", "")).upper() == "EXECUTED")
+            out.append(
+                f"- last_propose: date={p.get('date', '-')} total={total} executed={executed} blocked={blocked} "
+                f"at={prop_evt.get('created_at', '-')}"
+            )
+        else:
+            out.append("- last_propose: -")
+        for row in self._market_schedule_rows(m):
+            dt_local = str(row.get("next_run_local", "-"))
+            if m == "US":
+                dt_kst = str(row.get("next_run_kst", "-"))
+                out.append(
+                    f"- next_{row.get('label', 'run')}: {dt_local} / {dt_kst} "
+                    f"(in {int(row.get('eta_seconds', 0))}s)"
+                )
+            else:
+                out.append(
+                    f"- next_{row.get('label', 'run')}: {dt_local} "
+                    f"(in {int(row.get('eta_seconds', 0))}s)"
+                )
+        return out
 
     @staticmethod
     def _as_int_param_key(key: str) -> bool:
@@ -550,39 +800,6 @@ class TelegramChatRuntime:
         )
         return True, f"directive #{did} REJECTED"
 
-    def _latest_proposal(self, agent_id: str) -> Optional[Dict[str, Any]]:
-        auto_approve = _truthy(os.getenv("AGENT_LAB_AUTO_APPROVE", "1"))
-        row = None
-        if auto_approve:
-            row = self.storage.query_one(
-                """
-                SELECT *
-                FROM order_proposals
-                WHERE agent_id = ? AND status <> 'PENDING_APPROVAL'
-                ORDER BY created_at DESC, proposal_id DESC
-                LIMIT 1
-                """,
-                (agent_id,),
-            )
-        if row is None:
-            row = self.storage.query_one(
-                """
-                SELECT *
-                FROM order_proposals
-                WHERE agent_id = ?
-                ORDER BY created_at DESC, proposal_id DESC
-                LIMIT 1
-                """,
-                (agent_id,),
-            )
-        if row is None:
-            return None
-        try:
-            row["orders"] = json.loads(row.pop("orders_json"))
-        except Exception:
-            row["orders"] = []
-        return row
-
     def _latest_equity(self, agent_id: str) -> Optional[Dict[str, Any]]:
         return self.storage.query_one(
             """
@@ -616,6 +833,8 @@ class TelegramChatRuntime:
         warm = self.identity.build_warm_start_context(agent_id, memory_limit=self.memory_limit)
         active = self.registry.get_active_strategy(agent_id)
         latest_proposal = self._latest_proposal(agent_id)
+        latest_proposal_kr = self._latest_proposal(agent_id, "KR")
+        latest_proposal_us = self._latest_proposal(agent_id, "US")
         latest_equity = self._latest_equity(agent_id)
         recent_directives = self._list_directives(agent_id=agent_id, limit=8)
         positions = self.storage.list_positions(agent_id)
@@ -629,9 +848,25 @@ class TelegramChatRuntime:
             "latest_checkpoint": warm.get("latest_checkpoint"),
             "active_strategy": active,
             "latest_proposal": latest_proposal,
+            "latest_proposal_by_market": {
+                "KR": latest_proposal_kr,
+                "US": latest_proposal_us,
+            },
             "latest_equity": latest_equity,
             "recent_directives": recent_directives,
             "positions": positions,
+            "market_pipeline": {
+                "KR": {
+                    "last_ingest": self._latest_event_by_market("session_ingested", "KR"),
+                    "last_propose": self._latest_event_by_market("orders_proposed", "KR"),
+                    "next_schedule": self._market_schedule_rows("KR"),
+                },
+                "US": {
+                    "last_ingest": self._latest_event_by_market("session_ingested", "US"),
+                    "last_propose": self._latest_event_by_market("orders_proposed", "US"),
+                    "next_schedule": self._market_schedule_rows("US"),
+                },
+            },
         }
 
     def _fallback_answer(self, agent_id: str, question: str, ctx: Dict[str, Any]) -> str:
@@ -755,54 +990,81 @@ class TelegramChatRuntime:
             lines.append(f"(mode={mode}, reason={reason or 'fallback'})")
         return "\n".join(lines)
 
-    def _format_agent_status(self, agent_id: str) -> str:
+    def _format_agent_status(self, agent_id: str, market: Optional[str] = None) -> str:
         ctx = self._build_agent_context(agent_id)
-        latest = ctx.get("latest_proposal") or {}
-        orders = latest.get("orders") or []
-        order_summary = "none"
-        if orders:
-            chunks = []
-            for row in orders[:3]:
-                chunks.append(
-                    f"{row.get('side', '')} {row.get('symbol', '')} x{float(row.get('quantity', 0.0) or 0.0):.0f}"
-                )
-            order_summary = ", ".join(chunks)
         eq = ctx.get("latest_equity") or {}
         pos = ctx.get("positions") or []
         active = ctx.get("active_strategy") or {}
         version_tag = str(active.get("version_tag", "N/A"))
-        score = float((latest or {}).get("strategy_version_id", 0) or 0)
+        markets = [str(market).upper()] if market else ["KR", "US"]
+        lines = [
+            f"[{agent_id}] status",
+            f"- strategy: {version_tag}",
+            f"- positions: {len(pos)}",
+            f"- equity_krw: {float(eq.get('equity_krw', 0.0) or 0.0):.0f}",
+            f"- drawdown: {float(eq.get('drawdown', 0.0) or 0.0):.4f}",
+        ]
+        for mk in markets:
+            latest = self._latest_proposal(agent_id, mk) or {}
+            orders = latest.get("orders") or []
+            score = float((latest or {}).get("strategy_version_id", 0) or 0)
+            lines.append(
+                f"- {mk}_latest_proposal: {latest.get('status', 'N/A')} ({latest.get('session_date', 'N/A')})"
+            )
+            lines.append(f"- {mk}_latest_orders: {self._format_orders_short(orders, limit=3)}")
+            lines.append(f"- {mk}_proposal_version_id: {score:.0f}")
+            sched = self._market_schedule_rows(mk)
+            if sched:
+                next_exec = next((x for x in sched if str(x.get("label")) == "agent-exec"), sched[0])
+                lines.append(f"- {mk}_next_agent_exec_in: {int(next_exec.get('eta_seconds', 0))}s")
+        return "\n".join(lines)
 
-        return (
-            f"[{agent_id}] status\n"
-            f"- strategy: {version_tag}\n"
-            f"- latest_proposal: {latest.get('status', 'N/A')} ({latest.get('market', 'N/A')} {latest.get('session_date', 'N/A')})\n"
-            f"- latest_orders: {order_summary}\n"
-            f"- positions: {len(pos)}\n"
-            f"- equity_krw: {float(eq.get('equity_krw', 0.0) or 0.0):.0f}\n"
-            f"- drawdown: {float(eq.get('drawdown', 0.0) or 0.0):.4f}\n"
-            f"- proposal_version_id: {score:.0f}"
-        )
-
-    def _format_all_status(self) -> str:
+    def _format_all_status(self, market: Optional[str] = None) -> str:
         agents = self.storage.list_agents()
         if not agents:
             return "No agents found. Run Agent Lab init first."
         lines = ["[AgentLab] all agents status"]
-        for row in agents:
-            aid = str(row.get("agent_id", ""))
-            latest = self._latest_proposal(aid) or {}
-            eq = self._latest_equity(aid) or {}
-            lines.append(
-                f"- {aid}: proposal={latest.get('status', 'N/A')} "
-                f"market={latest.get('market', 'N/A')} date={latest.get('session_date', 'N/A')} "
-                f"equity={float(eq.get('equity_krw', 0.0) or 0.0):.0f}"
-            )
+        markets = [str(market).upper()] if market else ["KR", "US"]
+        for mk in markets:
+            lines.append(f"[{mk}]")
+            for row in agents:
+                aid = str(row.get("agent_id", ""))
+                latest = self._latest_proposal(aid, mk) or {}
+                eq = self._latest_equity(aid) or {}
+                lines.append(
+                    f"- {aid}: proposal={latest.get('status', 'N/A')} "
+                    f"date={latest.get('session_date', 'N/A')} equity={float(eq.get('equity_krw', 0.0) or 0.0):.0f}"
+                )
+            lines.extend(self._format_market_pipeline_block(mk))
+        lines.extend(self._runtime_health_lines())
         council = self._latest_weekly_council()
         if council:
             lines.append(
                 f"- latest_council: {council.get('week_id', 'N/A')} champion={council.get('champion_agent_id', 'N/A')}"
             )
+        return "\n".join(lines)
+
+    def _format_queue_status(self, agent_id: Optional[str] = None, market: Optional[str] = None) -> str:
+        markets = [str(market).upper()] if market else ["KR", "US"]
+        lines = ["[AgentLab] queue"]
+        if agent_id:
+            lines.append(f"- agent={agent_id}")
+            for mk in markets:
+                latest = self._latest_proposal(agent_id, mk) or {}
+                lines.append(
+                    f"- {mk}: latest={latest.get('status', 'N/A')} date={latest.get('session_date', 'N/A')} "
+                    f"orders={self._format_orders_short(list(latest.get('orders') or []), limit=2)}"
+                )
+                sched = self._market_schedule_rows(mk)
+                next_exec = next((x for x in sched if str(x.get("label")) == "agent-exec"), sched[0] if sched else {})
+                lines.append(
+                    f"- {mk}: next_agent_exec={next_exec.get('next_run_local', '-')} "
+                    f"(in {int(next_exec.get('eta_seconds', 0) or 0)}s)"
+                )
+        else:
+            for mk in markets:
+                lines.extend(self._format_market_pipeline_block(mk))
+        lines.extend(self._runtime_health_lines())
         return "\n".join(lines)
 
     def _format_recent_memory(self, agent_id: str) -> str:
@@ -857,6 +1119,9 @@ class TelegramChatRuntime:
             "/agents\n"
             "/status\n"
             "/status <agent_id>\n"
+            "/status KR|US\n"
+            "/status <agent_id> KR|US\n"
+            "/queue [agent_id] [KR|US]\n"
             "/plan <agent_id>\n"
             "/ask <agent_id> <question>\n"
             "/memory <agent_id>\n\n"
@@ -867,6 +1132,9 @@ class TelegramChatRuntime:
             "/reject <directive_id> [reason]\n\n"
             "Examples:\n"
             "/status agent_a\n"
+            "/status KR\n"
+            "/status agent_b US\n"
+            "/queue agent_a KR\n"
             "/plan agent_b\n"
             "/ask agent_c Why did you avoid the top-ranked symbol today?\n"
             "/directive agent_a Consider including sector leadership in your weekly review.\n"
@@ -912,14 +1180,21 @@ class TelegramChatRuntime:
         elif cmd == "/agents":
             out = self._agent_list_text()
         elif cmd == "/status":
-            if not args:
-                out = self._format_all_status()
+            aid, market, err = self._parse_status_filters(args)
+            if err:
+                out = err
+            elif aid:
+                out = self._format_agent_status(aid, market=market)
             else:
-                aid = self._normalize_agent_id(args[0])
-                if not aid:
-                    out = "Unknown agent. Use /agents."
-                else:
-                    out = self._format_agent_status(aid)
+                out = self._format_all_status(market=market)
+        elif cmd == "/queue":
+            aid, market, err = self._parse_status_filters(args)
+            if err:
+                out = err
+            elif aid:
+                out = self._format_queue_status(agent_id=aid, market=market)
+            else:
+                out = self._format_queue_status(market=market)
         elif cmd == "/plan":
             if len(args) < 1:
                 out = "Usage: /plan <agent_id>"

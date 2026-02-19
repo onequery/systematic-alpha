@@ -142,7 +142,7 @@ When Telegram is configured, Agent Lab sends:
 - Weekly council debate summary (champion, promoted versions, moderator summary)
 - Weekly debate excerpts (opening/rebuttal, short form)
 - OpenAI token/quota alerts during council (daily budget, quota, token/context limits)
-- Interactive chat replies from agents (`/ask`, `/plan`, `/status`)
+- Interactive chat replies from agents (`/ask`, `/plan`, `/status`, `/queue`)
 - Automatic data-reception self-heal events (critical failure detection + safe patch attempts)
 - Automatic strategy-update events from auto strategy daemon
 - OpenAI token/quota/budget alerts from auto strategy daemon
@@ -206,6 +206,10 @@ ps -ef | grep run_agent_lab_wsl.sh | grep -v grep
 | `/agents` | 활성 에이전트 목록 확인 | `/agents` | `agent_a`, `agent_b`, `agent_c` 역할 요약 |
 | `/status` | 전체 상태 요약 | `/status` | 최근 KR/US 실행 상태, 제안/주문/에러 요약 |
 | `/status <agent_id>` | 특정 에이전트 상태 | `/status agent_a` | 해당 에이전트의 최신 포지션/최근 의사결정 |
+| `/status KR\|US` | 시장별 상태 요약 | `/status KR` | KR 파이프라인 상태와 다음 실행 시각/남은 초 |
+| `/status <agent_id> KR\|US` | 에이전트+시장 상태 | `/status agent_a US` | 해당 에이전트의 US 최신 제안/주문/다음 실행까지 남은 초 |
+| `/queue` | 큐/스케줄 점검 | `/queue` | KR/US 파이프라인 마지막 실행 + 다음 실행 시각/남은 초 + 데몬 상태 |
+| `/queue <agent_id> KR\|US` | 에이전트별 큐 점검 | `/queue agent_b KR` | 해당 에이전트의 KR 최신 proposal 상태 + 다음 실행 남은 초 |
 | `/plan <agent_id>` | 현재 운용 계획 확인 | `/plan agent_b` | 금일 계획, 진입/회피 기준, 리스크 관점 |
 | `/ask <agent_id> <질문>` | 자유 질의응답 | `/ask agent_c 오늘 상위 종목 대신 5위를 고른 이유?` | 해당 판단 근거와 대안 설명 |
 | `/memory <agent_id>` | 최근 기억(학습 로그) 확인 | `/memory agent_a` | 최근 의사결정/교훈/다음 액션 |
@@ -217,13 +221,16 @@ ps -ef | grep run_agent_lab_wsl.sh | grep -v grep
 
 실전 대화 예시:
 
-1. 상태 점검
-입력: `/status`
-응답 예시: `KR latest=SUCCESS, US latest=SUCCESS, pending_directives=1, openai_budget=ok`
-2. 전략 이유 질의
+1. 시장 분리 상태 점검
+입력: `/status KR`
+응답 예시: `KR pipeline + next_prefetch/next_signal-scan/next_agent-exec (in N seconds)`
+2. 큐/남은 시간 점검
+입력: `/queue agent_a US`
+응답 예시: `US latest=BLOCKED, next_agent_exec=... (in N seconds), daemon status`
+3. 전략 이유 질의
 입력: `/ask agent_a 오늘 1순위 종목을 선택한 핵심 이유 3가지만 알려줘`
 응답 예시: `체결강도 유지, VWAP 상단 유지, 호가비율 우위`
-3. 전략 수정 요청
+4. 전략 수정 요청
 입력: `/setparam agent_b min_bid_ask_ratio 1.3 보수적으로 상향`
 응답 예시: `directive_id=57, status=PENDING`
 입력: `/approve 57 apply now`
@@ -239,7 +246,7 @@ ps -ef | grep run_agent_lab_wsl.sh | grep -v grep
 
 운영 팁:
 
-1. 실행 직후에는 `/status`로 먼저 상태를 확인한 뒤 질의하세요.
+1. 실행 직후에는 `/status KR`, `/status US`, `/queue`로 먼저 상태/남은 시간을 확인한 뒤 질의하세요.
 2. 전략 변경은 반드시 `PENDING -> approve` 순서로 적용하세요.
 3. 응답이 없으면 `telegram-chat` 데몬 프로세스와 `logs/cron/agent_telegram_chat.log`를 확인하세요.
 
