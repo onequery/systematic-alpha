@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import os
 from pathlib import Path
 from typing import Any, Dict
 
@@ -37,13 +36,7 @@ def parse_args() -> argparse.Namespace:
     p_prop = sub.add_parser("propose-orders")
     p_prop.add_argument("--market", type=str, choices=["KR", "US", "kr", "us"], required=True)
     p_prop.add_argument("--date", type=str, required=True)
-    p_prop.add_argument("--auto-execute", dest="auto_execute", action="store_true", default=None)
-    p_prop.add_argument("--no-auto-execute", dest="auto_execute", action="store_false", default=None)
-
-    p_approve = sub.add_parser("approve-orders")
-    p_approve.add_argument("--proposal-id", type=str, required=True)
-    p_approve.add_argument("--approved-by", type=str, default=os.getenv("USERNAME", "manual"))
-    p_approve.add_argument("--note", type=str, default="")
+    p_prop.add_argument("--auto-execute", dest="auto_execute", action="store_true", default=True)
 
     p_daily = sub.add_parser("daily-review")
     p_daily.add_argument("--date", type=str, required=True)
@@ -128,12 +121,6 @@ def main() -> None:
                 market=str(args.market).upper(),
                 yyyymmdd=args.date,
                 auto_execute=args.auto_execute,
-            )
-        elif cmd == "approve-orders":
-            payload = orchestrator.approve_orders(
-                proposal_identifier=args.proposal_id,
-                approved_by=args.approved_by,
-                note=args.note,
             )
         elif cmd == "daily-review":
             payload = orchestrator.daily_review(yyyymmdd=args.date)

@@ -551,16 +551,30 @@ class TelegramChatRuntime:
         return True, f"directive #{did} REJECTED"
 
     def _latest_proposal(self, agent_id: str) -> Optional[Dict[str, Any]]:
-        row = self.storage.query_one(
-            """
-            SELECT *
-            FROM order_proposals
-            WHERE agent_id = ?
-            ORDER BY created_at DESC, proposal_id DESC
-            LIMIT 1
-            """,
-            (agent_id,),
-        )
+        auto_approve = _truthy(os.getenv("AGENT_LAB_AUTO_APPROVE", "1"))
+        row = None
+        if auto_approve:
+            row = self.storage.query_one(
+                """
+                SELECT *
+                FROM order_proposals
+                WHERE agent_id = ? AND status <> 'PENDING_APPROVAL'
+                ORDER BY created_at DESC, proposal_id DESC
+                LIMIT 1
+                """,
+                (agent_id,),
+            )
+        if row is None:
+            row = self.storage.query_one(
+                """
+                SELECT *
+                FROM order_proposals
+                WHERE agent_id = ?
+                ORDER BY created_at DESC, proposal_id DESC
+                LIMIT 1
+                """,
+                (agent_id,),
+            )
         if row is None:
             return None
         try:

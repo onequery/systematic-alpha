@@ -83,6 +83,7 @@ Default behavior:
 
 - Agent proposals are auto-executed in paper account mode when `AGENT_LAB_AUTO_APPROVE=1`.
 - Agent workflow notifications are sent from python orchestrator (if Telegram is configured).
+- Manual order approval step is disabled in this WSL setup. Order proposal status is expected to be `EXECUTED` or `BLOCKED` (not `PENDING_APPROVAL`).
 
 Quick check after registration:
 
@@ -136,8 +137,8 @@ When Telegram is configured, Agent Lab sends:
 ./scripts/run_agent_lab_wsl.sh --action init --capital-krw 10000000 --agents 3
 
 # KR/US ingest + propose + auto-execute
-./scripts/run_agent_lab_wsl.sh --action ingest-propose --market KR --auto-approve
-./scripts/run_agent_lab_wsl.sh --action ingest-propose --market US --auto-approve
+./scripts/run_agent_lab_wsl.sh --action ingest-propose --market KR
+./scripts/run_agent_lab_wsl.sh --action ingest-propose --market US
 
 # review / council
 ./scripts/run_agent_lab_wsl.sh --action daily-review --date YYYYMMDD

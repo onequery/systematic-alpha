@@ -15,6 +15,7 @@ from systematic_alpha.agent_lab.notify import TelegramNotifier
 from systematic_alpha.agent_lab.paper_broker import PaperBroker
 from systematic_alpha.agent_lab.risk_engine import RiskEngine
 from systematic_alpha.agent_lab.schemas import (
+    PROPOSAL_STATUS_APPROVED,
     PROPOSAL_STATUS_BLOCKED,
     PROPOSAL_STATUS_EXECUTED,
     PROPOSAL_STATUS_PENDING_APPROVAL,
@@ -283,14 +284,27 @@ class AgentLabOrchestrator:
         if signal is None:
             raise RuntimeError("failed to load session signal")
 
+        requested_auto_execute = auto_execute
         if auto_execute is None:
             auto_execute = _truthy(os.getenv("AGENT_LAB_AUTO_APPROVE", "1"))
+        # Agent-first repository policy: order proposals are always auto-executed.
+        if not bool(auto_execute):
+            self.storage.log_event(
+                "auto_execute_forced",
+                {
+                    "market": market,
+                    "date": yyyymmdd,
+                    "requested_auto_execute": bool(requested_auto_execute),
+                    "forced_auto_execute": True,
+                },
+                now_iso(),
+            )
+            auto_execute = True
 
         agents = self.storage.list_agents()
         if not agents:
             raise RuntimeError("no agents registered. run `init` first.")
         output_rows: List[Dict[str, Any]] = []
-        hold_mode = self._days_since_initialized(yyyymmdd) < 28
         usdkrw = self._usdkrw_rate(yyyymmdd) if market == "US" else 1.0
         for agent in agents:
             agent_id = str(agent["agent_id"])
@@ -315,7 +329,11 @@ class AgentLabOrchestrator:
                 current_exposure_krw=float(self.accounting.current_exposure_krw(agent_id)),
                 orders=raw_orders,
             )
-            status = PROPOSAL_STATUS_PENDING_APPROVAL if decision.allowed else PROPOSAL_STATUS_BLOCKED
+            status = (
+                PROPOSAL_STATUS_APPROVED
+                if decision.allowed and bool(auto_execute)
+                else (PROPOSAL_STATUS_PENDING_APPROVAL if decision.allowed else PROPOSAL_STATUS_BLOCKED)
+            )
 
             proposal_uuid = str(uuid.uuid4())
             proposal_id = self.storage.insert_order_proposal(
@@ -374,14 +392,15 @@ class AgentLabOrchestrator:
         execution_results: List[Dict[str, Any]] = []
         if bool(auto_execute):
             for row in output_rows:
-                if str(row.get("status", "")) != PROPOSAL_STATUS_PENDING_APPROVAL:
+                if str(row.get("status", "")) != PROPOSAL_STATUS_APPROVED:
                     continue
                 proposal_id = int(row["proposal_id"])
                 try:
-                    executed = self.approve_orders(
+                    executed = self._execute_proposal(
                         proposal_identifier=str(proposal_id),
                         approved_by="auto_executor",
                         note=f"auto-approved market={market} date={yyyymmdd}",
+                        allowed_statuses=[PROPOSAL_STATUS_APPROVED],
                     )
                     row["status"] = str(executed.get("status", row["status"]))
                     row["auto_execution"] = {"ok": True, "status": row["status"]}
@@ -395,6 +414,13 @@ class AgentLabOrchestrator:
                         }
                     )
                 except Exception as exc:
+                    self.storage.update_order_proposal_status(
+                        proposal_id=proposal_id,
+                        status=PROPOSAL_STATUS_BLOCKED,
+                        blocked_reason=f"auto_execute_error:{repr(exc)}",
+                        updated_at=now_iso(),
+                    )
+                    row["status"] = PROPOSAL_STATUS_BLOCKED
                     row["auto_execution"] = {"ok": False, "error": repr(exc)}
                     execution_results.append(
                         {
@@ -408,7 +434,7 @@ class AgentLabOrchestrator:
         payload = {
             "market": market,
             "date": yyyymmdd,
-            "hold_mode_pending_approval": hold_mode,
+            "hold_mode_pending_approval": False,
             "auto_execute": bool(auto_execute),
             "proposals": output_rows,
             "execution_results": execution_results,
@@ -434,7 +460,14 @@ class AgentLabOrchestrator:
         self._notify("\n".join(lines))
         return payload
 
-    def approve_orders(self, proposal_identifier: str, approved_by: str = "manual", note: str = "") -> Dict[str, Any]:
+    def _execute_proposal(
+        self,
+        proposal_identifier: str,
+        approved_by: str = "manual",
+        note: str = "",
+        *,
+        allowed_statuses: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
         proposal = None
         if proposal_identifier.isdigit():
             proposal = self.storage.get_order_proposal_by_id(int(proposal_identifier))
@@ -442,8 +475,12 @@ class AgentLabOrchestrator:
             proposal = self.storage.get_order_proposal_by_uuid(proposal_identifier)
         if proposal is None:
             raise ValueError(f"proposal not found: {proposal_identifier}")
-        if str(proposal["status"]) != PROPOSAL_STATUS_PENDING_APPROVAL:
-            raise RuntimeError(f"proposal status is not pending: {proposal['status']}")
+        expected = allowed_statuses or [PROPOSAL_STATUS_PENDING_APPROVAL]
+        current_status = str(proposal["status"])
+        if current_status not in expected:
+            raise RuntimeError(
+                f"proposal status is not executable: {current_status} (allowed={','.join(expected)})"
+            )
 
         proposal_id = int(proposal["proposal_id"])
         market = str(proposal["market"]).upper()
@@ -511,6 +548,14 @@ class AgentLabOrchestrator:
             f"fills={self._orders_to_text(fills, limit=5)}"
         )
         return out
+
+    def approve_orders(self, proposal_identifier: str, approved_by: str = "manual", note: str = "") -> Dict[str, Any]:
+        return self._execute_proposal(
+            proposal_identifier=proposal_identifier,
+            approved_by=approved_by,
+            note=note,
+            allowed_statuses=[PROPOSAL_STATUS_PENDING_APPROVAL],
+        )
 
     def daily_review(self, yyyymmdd: str) -> Dict[str, Any]:
         agents = self.storage.list_agents()

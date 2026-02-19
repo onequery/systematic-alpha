@@ -41,12 +41,8 @@ RUN_DATE="$(TZ=Asia/Seoul date +%Y%m%d)"
 WEEK_ID=""
 CAPITAL_KRW=10000000
 AGENTS=3
-PROPOSAL_ID=""
-APPROVED_BY="wsl_auto"
-NOTE=""
 DATE_FROM=""
 DATE_TO=""
-AUTO_APPROVE="${AGENT_LAB_AUTO_APPROVE:-1}"
 CHAT_ONCE="0"
 AUTO_STRATEGY_ONCE="0"
 CHAT_POLL_TIMEOUT=25
@@ -64,13 +60,9 @@ while [[ $# -gt 0 ]]; do
     --week) WEEK_ID="${2:-}"; shift 2 ;;
     --capital-krw) CAPITAL_KRW="${2:-10000000}"; shift 2 ;;
     --agents) AGENTS="${2:-3}"; shift 2 ;;
-    --proposal-id) PROPOSAL_ID="${2:-}"; shift 2 ;;
-    --approved-by) APPROVED_BY="${2:-wsl_auto}"; shift 2 ;;
-    --note) NOTE="${2:-}"; shift 2 ;;
     --from) DATE_FROM="${2:-}"; shift 2 ;;
     --to) DATE_TO="${2:-}"; shift 2 ;;
-    --auto-approve) AUTO_APPROVE="1"; shift ;;
-    --no-auto-approve) AUTO_APPROVE="0"; shift ;;
+    --auto-approve) shift ;; # backward compatible no-op (always auto-execute)
     --chat-once) CHAT_ONCE="1"; shift ;;
     --auto-strategy-once) AUTO_STRATEGY_ONCE="1"; shift ;;
     --chat-poll-timeout) CHAT_POLL_TIMEOUT="${2:-25}"; shift 2 ;;
@@ -104,18 +96,7 @@ case "$ACTION" in
     ;;
   ingest-propose)
     run_cli ingest-session --market "$MARKET" --date "$RUN_DATE"
-    if [[ "$AUTO_APPROVE" == "1" ]]; then
-      run_cli propose-orders --market "$MARKET" --date "$RUN_DATE" --auto-execute
-    else
-      run_cli propose-orders --market "$MARKET" --date "$RUN_DATE" --no-auto-execute
-    fi
-    ;;
-  approve-orders)
-    if [[ -z "$PROPOSAL_ID" ]]; then
-      echo "--proposal-id is required for approve-orders" >&2
-      exit 2
-    fi
-    run_cli approve-orders --proposal-id "$PROPOSAL_ID" --approved-by "$APPROVED_BY" --note "$NOTE"
+    run_cli propose-orders --market "$MARKET" --date "$RUN_DATE" --auto-execute
     ;;
   daily-review)
     run_cli daily-review --date "$RUN_DATE"
