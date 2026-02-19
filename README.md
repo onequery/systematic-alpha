@@ -80,7 +80,7 @@ This registers cron-based automation in WSL:
 - Telegram chat worker (`@reboot`)
 - Auto strategy daemon (`@reboot`)
 - Agent Lab initialization (`10,000,000 KRW`, `3 agents`) by default
-- Plus immediate bootstrap: `telegram-chat` and `auto-strategy-daemon` are started right away.
+- Plus immediate bootstrap: `telegram-chat` and `auto-strategy-daemon` are restarted right away (even if already running).
 
 Default behavior:
 
@@ -107,6 +107,21 @@ Use this after code/config updates when you want to fully restart scheduler + da
 
 ```bash
 ./scripts/reset_all_tasks_wsl.sh
+```
+
+## WSL One Command: Reset Tasks (Preserve State)
+
+Use this during live operation to restart scheduler + daemons **without** re-running Agent Lab init.
+This preserves current capital/accounting state, strategy versions, and agent memories.
+
+```bash
+./scripts/reset_tasks_preserve_state_wsl.sh
+```
+
+Equivalent one-liner:
+
+```bash
+INIT_AGENT_LAB=0 ./scripts/reset_all_tasks_wsl.sh
 ```
 
 ## Check Registered Cron Jobs

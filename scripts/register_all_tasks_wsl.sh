@@ -60,12 +60,11 @@ fi
 start_daemon_if_needed() {
   local action="$1"
   local marker="run_agent_lab_wsl.sh --action $action"
+  local py_marker="systematic_alpha.agent_lab.cli --project-root $ROOT_DIR $action"
   local log_path="$ROOT_DIR/logs/cron/agent_${action}_bootstrap.log"
-  if pgrep -f "$marker" >/dev/null 2>&1; then
-    echo "Daemon already running: $action"
-    return 0
-  fi
-  echo "Starting daemon now: $action"
+  echo "Restarting daemon now: $action"
+  pkill -f "$marker" >/dev/null 2>&1 || true
+  pkill -f "$py_marker" >/dev/null 2>&1 || true
   nohup /usr/bin/env bash "$ROOT_DIR/scripts/run_agent_lab_wsl.sh" --action "$action" >> "$log_path" 2>&1 &
 }
 
