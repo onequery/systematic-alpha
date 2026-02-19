@@ -13,4 +13,5 @@ __all__ = [
     "orchestrator",
     "telegram_chat",
     "self_heal",
+    "auto_strategy",
 ]

@@ -33,7 +33,7 @@ Write-Output "[2/4] Registering US selector task..."
     -RegisterPrefetch:$RegisterPrefetch `
     -DisableTelegram:$DisableBaseSelectorTelegram
 
-Write-Output "[3/4] Registering Agent Lab follow-up/review tasks..."
+Write-Output "[3/4] Registering Agent Lab follow-up/review/chat/auto-strategy tasks..."
 & $registerAgentLab -PythonExe $PythonExe
 
 if ($InitAgentLab) {
@@ -51,4 +51,3 @@ Write-Output ""
 Write-Output "All tasks registered with one command."
 Write-Output "Recommended check:"
 Write-Output "  Get-ScheduledTask -TaskName 'SystematicAlpha*' | Format-Table TaskName, State -AutoSize"
-

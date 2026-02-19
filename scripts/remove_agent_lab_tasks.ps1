@@ -10,7 +10,8 @@ $taskNames = @(
     "${TaskPrefix}_US_PostOpen_0930ET",
     "${TaskPrefix}_DailyReview_0710",
     "${TaskPrefix}_WeeklyCouncil_Sat0800",
-    "${TaskPrefix}_TelegramChat_Logon"
+    "${TaskPrefix}_TelegramChat_Logon",
+    "${TaskPrefix}_AutoStrategy_Logon"
 )
 
 foreach ($name in $taskNames) {

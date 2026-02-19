@@ -66,6 +66,7 @@ This command registers all required tasks and initializes Agent Lab:
 - US signal generation tasks
 - Agent Lab post-session/review/weekly tasks
 - Agent Lab Telegram chat worker task (logon trigger)
+- Agent Lab auto strategy daemon task (logon trigger, autonomous strategy update timing)
 - Agent initialization (`agent_a`, `agent_b`, `agent_c`)
 
 Default behavior:
@@ -97,6 +98,8 @@ When Telegram is configured, Agent Lab sends:
 - OpenAI token/quota alerts during council (daily budget, quota, token/context limits)
 - Interactive chat replies from agents (`/ask`, `/plan`, `/status`)
 - Automatic data-reception self-heal events (critical failure detection + safe patch attempts)
+- Automatic strategy-update events from auto strategy daemon
+- OpenAI token/quota/budget alerts from auto strategy daemon
 
 ## Important Paths
 
@@ -125,6 +128,12 @@ python -m systematic_alpha.agent_lab.cli --project-root . self-heal --market KR 
 
 # Telegram interactive worker
 powershell -ExecutionPolicy Bypass -File .\scripts\run_agent_lab.ps1 -Action telegram-chat
+
+# Auto strategy daemon (agents decide strategy-update timing)
+powershell -ExecutionPolicy Bypass -File .\scripts\run_agent_lab.ps1 -Action auto-strategy-daemon
+
+# One-shot check
+powershell -ExecutionPolicy Bypass -File .\scripts\run_agent_lab.ps1 -Action auto-strategy-daemon -AutoStrategyOnce
 ```
 
 ## Telegram Agent Chat Commands

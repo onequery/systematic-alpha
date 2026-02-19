@@ -1,8 +1,8 @@
 [CmdletBinding()]
 param(
-    [string]$ProjectRoot = (Split-Path -Parent $PSScriptRoot),
+    [string]$ProjectRoot = "",
     [string]$PythonExe = "",
-    [ValidateSet("init", "ingest-propose", "approve-orders", "daily-review", "weekly-council", "report", "telegram-chat")]
+    [ValidateSet("init", "ingest-propose", "approve-orders", "daily-review", "weekly-council", "report", "telegram-chat", "auto-strategy-daemon")]
     [string]$Action = "ingest-propose",
     [ValidateSet("KR", "US")]
     [string]$Market = "KR",
@@ -23,7 +23,11 @@ param(
     [int]$ChatPollTimeoutSeconds = 25,
     [double]$ChatIdleSleepSeconds = 1.0,
     [int]$ChatMemoryLimit = 20,
-    [switch]$ChatOnce = $false
+    [switch]$ChatOnce = $false,
+    [int]$AutoStrategyPollSeconds = 300,
+    [int]$AutoStrategyCooldownMinutes = 180,
+    [int]$AutoStrategyMaxUpdatesPerDay = 2,
+    [switch]$AutoStrategyOnce = $false
 )
 
 $ErrorActionPreference = "Stop"
@@ -489,6 +493,14 @@ if (-not (Test-Path $ProjectRoot)) {
 }
 
 $PythonExe = Resolve-PythonExe -Current $PythonExe
+
+if ([string]::IsNullOrWhiteSpace($ProjectRoot)) {
+    if (-not [string]::IsNullOrWhiteSpace($PSScriptRoot)) {
+        $ProjectRoot = Split-Path -Parent $PSScriptRoot
+    } else {
+        $ProjectRoot = (Get-Location).Path
+    }
+}
 Set-Location $ProjectRoot
 
 $env:PYTHONIOENCODING = "utf-8"
@@ -723,6 +735,21 @@ switch ($Action) {
             "--memory-limit", "$ChatMemoryLimit"
         )
         if ($ChatOnce) {
+            $args += "--once"
+        }
+        $result = Invoke-AgentLabCli -PyExe $PythonExe -CliArgs $args
+        $code = Resolve-ExitCode -Result $result
+        exit $code
+    }
+
+    "auto-strategy-daemon" {
+        $args = $commonPrefix + @(
+            "auto-strategy-daemon",
+            "--poll-seconds", "$AutoStrategyPollSeconds",
+            "--cooldown-minutes", "$AutoStrategyCooldownMinutes",
+            "--max-updates-per-day", "$AutoStrategyMaxUpdatesPerDay"
+        )
+        if ($AutoStrategyOnce) {
             $args += "--once"
         }
         $result = Invoke-AgentLabCli -PyExe $PythonExe -CliArgs $args

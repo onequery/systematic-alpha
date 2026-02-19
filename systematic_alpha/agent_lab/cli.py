@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Dict
 
 from systematic_alpha.dotenv import load_dotenv
+from systematic_alpha.agent_lab.auto_strategy import run_auto_strategy_daemon
 from systematic_alpha.agent_lab.orchestrator import AgentLabOrchestrator
 from systematic_alpha.agent_lab.self_heal import run_data_reception_self_heal
 from systematic_alpha.agent_lab.telegram_chat import run_telegram_chat_worker
@@ -58,6 +59,12 @@ def parse_args() -> argparse.Namespace:
     p_chat.add_argument("--memory-limit", type=int, default=20)
     p_chat.add_argument("--once", action="store_true")
 
+    p_auto = sub.add_parser("auto-strategy-daemon")
+    p_auto.add_argument("--poll-seconds", type=int, default=300)
+    p_auto.add_argument("--cooldown-minutes", type=int, default=180)
+    p_auto.add_argument("--max-updates-per-day", type=int, default=2)
+    p_auto.add_argument("--once", action="store_true")
+
     p_heal = sub.add_parser("self-heal")
     p_heal.add_argument("--market", type=str, choices=["KR", "US", "kr", "us"], required=True)
     p_heal.add_argument("--date", type=str, required=True)
@@ -93,6 +100,16 @@ def main() -> None:
             output_json_path=str(args.output_json or "").strip() or None,
             failure_tail=args.failure_tail or "",
             auto_apply=not bool(args.no_auto_apply),
+        )
+        _echo(payload)
+        return
+    if args.command == "auto-strategy-daemon":
+        payload = run_auto_strategy_daemon(
+            project_root=Path(args.project_root),
+            poll_seconds=args.poll_seconds,
+            cooldown_minutes=args.cooldown_minutes,
+            max_updates_per_day=args.max_updates_per_day,
+            once=bool(args.once),
         )
         _echo(payload)
         return
