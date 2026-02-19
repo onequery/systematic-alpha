@@ -12,7 +12,7 @@ import requests
 from systematic_alpha.agent_lab.identity import AgentIdentityStore
 from systematic_alpha.agent_lab.llm_client import LLMClient
 from systematic_alpha.agent_lab.storage import AgentLabStorage
-from systematic_alpha.agent_lab.strategy_registry import StrategyRegistry
+from systematic_alpha.agent_lab.strategy_registry import ALLOWED_PARAM_RANGES, StrategyRegistry
 
 
 def _truthy(value: str) -> bool:
@@ -39,6 +39,11 @@ def _truncate(text: str, max_chars: int = 3500) -> str:
 
 
 class TelegramChatRuntime:
+    DIRECTIVE_EVENT_TYPE = "telegram_directive"
+    DIRECTIVE_STATUS_PENDING = "PENDING"
+    DIRECTIVE_STATUS_APPLIED = "APPLIED"
+    DIRECTIVE_STATUS_REJECTED = "REJECTED"
+
     def __init__(
         self,
         *,
@@ -186,6 +191,365 @@ class TelegramChatRuntime:
                 return aid
         return None
 
+    @staticmethod
+    def _as_int_param_key(key: str) -> bool:
+        return key in {"min_pass_conditions", "collect_seconds"}
+
+    def _actor_from_message(self, message: Dict[str, Any]) -> str:
+        user = message.get("from") or {}
+        uid = str(user.get("id", "")).strip()
+        username = str(user.get("username", "")).strip()
+        first = str(user.get("first_name", "")).strip()
+        last = str(user.get("last_name", "")).strip()
+        if username:
+            return f"telegram:{uid}/{username}"
+        name = " ".join([x for x in [first, last] if x]).strip()
+        if name:
+            return f"telegram:{uid}/{name}"
+        return f"telegram:{uid}" if uid else "telegram:unknown"
+
+    def _insert_directive(self, payload: Dict[str, Any]) -> int:
+        created_at = _now_iso()
+        with self.storage.tx():
+            cur = self.storage.execute(
+                """
+                INSERT INTO state_events(event_type, payload_json, created_at)
+                VALUES (?, ?, ?)
+                """,
+                (self.DIRECTIVE_EVENT_TYPE, json.dumps(payload, ensure_ascii=False), created_at),
+            )
+            return int(cur.lastrowid)
+
+    def _directive_by_id(self, directive_id: int) -> Optional[Dict[str, Any]]:
+        row = self.storage.query_one(
+            """
+            SELECT event_id, payload_json, created_at
+            FROM state_events
+            WHERE event_type = ? AND event_id = ?
+            LIMIT 1
+            """,
+            (self.DIRECTIVE_EVENT_TYPE, int(directive_id)),
+        )
+        if row is None:
+            return None
+        payload: Dict[str, Any] = {}
+        try:
+            decoded = json.loads(str(row.get("payload_json") or "{}"))
+            if isinstance(decoded, dict):
+                payload = decoded
+        except Exception:
+            payload = {}
+        payload["directive_id"] = int(row["event_id"])
+        payload["created_at"] = str(row.get("created_at", ""))
+        return payload
+
+    def _update_directive(self, directive_id: int, payload: Dict[str, Any]) -> None:
+        with self.storage.tx():
+            self.storage.execute(
+                """
+                UPDATE state_events
+                SET payload_json = ?
+                WHERE event_type = ? AND event_id = ?
+                """,
+                (
+                    json.dumps(payload, ensure_ascii=False),
+                    self.DIRECTIVE_EVENT_TYPE,
+                    int(directive_id),
+                ),
+            )
+
+    def _list_directives(
+        self,
+        *,
+        agent_id: Optional[str] = None,
+        status: Optional[str] = None,
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        rows = self.storage.query_all(
+            """
+            SELECT event_id, payload_json, created_at
+            FROM state_events
+            WHERE event_type = ?
+            ORDER BY event_id DESC
+            LIMIT ?
+            """,
+            (self.DIRECTIVE_EVENT_TYPE, int(limit)),
+        )
+        out: List[Dict[str, Any]] = []
+        status_norm = str(status or "").strip().upper()
+        for row in rows:
+            payload: Dict[str, Any] = {}
+            try:
+                decoded = json.loads(str(row.get("payload_json") or "{}"))
+                if isinstance(decoded, dict):
+                    payload = decoded
+            except Exception:
+                payload = {}
+            payload["directive_id"] = int(row["event_id"])
+            payload["created_at"] = str(row.get("created_at", ""))
+            aid = str(payload.get("agent_id", "")).strip()
+            st = str(payload.get("status", "")).strip().upper()
+            if agent_id and aid != agent_id:
+                continue
+            if status_norm and st != status_norm:
+                continue
+            out.append(payload)
+        return out
+
+    def _create_freeform_directive(self, agent_id: str, request_text: str, requested_by: str) -> int:
+        payload = {
+            "directive_type": "freeform",
+            "agent_id": agent_id,
+            "request_text": str(request_text or "").strip(),
+            "status": self.DIRECTIVE_STATUS_PENDING,
+            "requested_by": requested_by,
+            "requested_at": _now_iso(),
+            "decision": {},
+            "applied": {},
+        }
+        did = self._insert_directive(payload)
+        self.identity.append_memory(
+            agent_id=agent_id,
+            memory_type="operator_directive_requested",
+            content={
+                "directive_id": did,
+                "directive_type": payload["directive_type"],
+                "request_text": payload["request_text"],
+                "requested_by": requested_by,
+            },
+            ts=_now_iso(),
+        )
+        return did
+
+    def _coerce_param_value(self, key: str, raw: str) -> Tuple[bool, Optional[Any], str]:
+        text = str(raw or "").strip()
+        if key not in ALLOWED_PARAM_RANGES:
+            keys = ", ".join(sorted(ALLOWED_PARAM_RANGES.keys()))
+            return False, None, f"unknown param key: {key}. allowed: {keys}"
+        try:
+            num = float(text)
+        except Exception:
+            return False, None, f"param value must be numeric: {text}"
+        if self._as_int_param_key(key):
+            return True, int(round(num)), ""
+        return True, float(num), ""
+
+    def _create_param_directive(
+        self,
+        agent_id: str,
+        param_key: str,
+        param_value_raw: str,
+        requested_by: str,
+        note: str,
+    ) -> Tuple[bool, str]:
+        ok, value, err = self._coerce_param_value(param_key, param_value_raw)
+        if not ok:
+            return False, err
+        payload = {
+            "directive_type": "param_update",
+            "agent_id": agent_id,
+            "status": self.DIRECTIVE_STATUS_PENDING,
+            "requested_by": requested_by,
+            "requested_at": _now_iso(),
+            "request_text": f"set {param_key}={param_value_raw}",
+            "param_key": param_key,
+            "param_value_raw": param_value_raw,
+            "param_value": value,
+            "note": str(note or "").strip(),
+            "decision": {},
+            "applied": {},
+        }
+        did = self._insert_directive(payload)
+        self.identity.append_memory(
+            agent_id=agent_id,
+            memory_type="operator_directive_requested",
+            content={
+                "directive_id": did,
+                "directive_type": payload["directive_type"],
+                "param_key": param_key,
+                "param_value_raw": param_value_raw,
+                "requested_by": requested_by,
+                "note": payload["note"],
+            },
+            ts=_now_iso(),
+        )
+        return True, f"directive #{did} created: {agent_id} set {param_key}={param_value_raw} (PENDING)"
+
+    def _apply_directive(self, directive: Dict[str, Any], actor: str, note: str) -> Tuple[bool, str]:
+        did = int(directive.get("directive_id", 0) or 0)
+        if did <= 0:
+            return False, "invalid directive id"
+        agent_id = str(directive.get("agent_id", "")).strip()
+        if not agent_id:
+            return False, f"directive #{did} missing agent_id"
+
+        if str(directive.get("status", "")).strip().upper() != self.DIRECTIVE_STATUS_PENDING:
+            return False, f"directive #{did} is not pending"
+
+        dtype = str(directive.get("directive_type", "")).strip()
+        decision_note = str(note or "").strip()
+        updated = dict(directive)
+        updated["status"] = self.DIRECTIVE_STATUS_APPLIED
+        updated["decision"] = {
+            "decision": "APPROVED",
+            "decided_by": actor,
+            "decided_at": _now_iso(),
+            "note": decision_note,
+        }
+        updated["applied"] = {"applied_at": _now_iso(), "applied_by": actor}
+
+        if dtype == "param_update":
+            param_key = str(directive.get("param_key", "")).strip()
+            ok, value, err = self._coerce_param_value(param_key, str(directive.get("param_value_raw", "")))
+            if not ok:
+                return False, f"directive #{did} invalid param value: {err}"
+            active = self.registry.get_active_strategy(agent_id)
+            base_params = dict(active.get("params", {}))
+            prev_value = base_params.get(param_key)
+            base_params[param_key] = value
+            reg = self.registry.register_strategy_version(
+                agent_id=agent_id,
+                params=base_params,
+                notes=(
+                    f"telegram directive #{did} approved by {actor}; "
+                    f"{param_key}={value}; note={decision_note}"
+                ),
+                promote=True,
+            )
+            clamped_params = dict(reg.get("params", {}))
+            applied_value = clamped_params.get(param_key)
+            updated["applied"].update(
+                {
+                    "strategy_version_id": reg.get("strategy_version_id"),
+                    "version_tag": reg.get("version_tag"),
+                    "param_key": param_key,
+                    "previous_value": prev_value,
+                    "requested_value": value,
+                    "applied_value": applied_value,
+                }
+            )
+            self.identity.append_memory(
+                agent_id=agent_id,
+                memory_type="operator_directive_applied",
+                content={
+                    "directive_id": did,
+                    "directive_type": dtype,
+                    "param_key": param_key,
+                    "previous_value": prev_value,
+                    "requested_value": value,
+                    "applied_value": applied_value,
+                    "version_tag": reg.get("version_tag"),
+                    "approved_by": actor,
+                    "note": decision_note,
+                },
+                ts=_now_iso(),
+            )
+            self._update_directive(did, updated)
+            self.storage.log_event(
+                event_type="telegram_directive_applied",
+                payload={
+                    "directive_id": did,
+                    "agent_id": agent_id,
+                    "directive_type": dtype,
+                    "param_key": param_key,
+                    "requested_value": value,
+                    "applied_value": applied_value,
+                    "version_tag": reg.get("version_tag"),
+                    "approved_by": actor,
+                },
+                created_at=_now_iso(),
+            )
+            return (
+                True,
+                (
+                    f"directive #{did} APPLIED\n"
+                    f"agent={agent_id}\n"
+                    f"param={param_key}\n"
+                    f"prev={prev_value}\n"
+                    f"requested={value}\n"
+                    f"applied={applied_value}\n"
+                    f"strategy={reg.get('version_tag')}"
+                ),
+            )
+
+        request_text = str(directive.get("request_text", "")).strip()
+        self.identity.append_memory(
+            agent_id=agent_id,
+            memory_type="operator_directive_applied",
+            content={
+                "directive_id": did,
+                "directive_type": dtype or "freeform",
+                "request_text": request_text,
+                "approved_by": actor,
+                "note": decision_note,
+            },
+            ts=_now_iso(),
+        )
+        self._update_directive(did, updated)
+        self.storage.log_event(
+            event_type="telegram_directive_applied",
+            payload={
+                "directive_id": did,
+                "agent_id": agent_id,
+                "directive_type": dtype or "freeform",
+                "request_text": request_text,
+                "approved_by": actor,
+            },
+            created_at=_now_iso(),
+        )
+        return (
+            True,
+            (
+                f"directive #{did} APPLIED\n"
+                f"agent={agent_id}\n"
+                f"type={dtype or 'freeform'}\n"
+                f"request={request_text or '(empty)'}"
+            ),
+        )
+
+    def _reject_directive(self, directive: Dict[str, Any], actor: str, note: str) -> Tuple[bool, str]:
+        did = int(directive.get("directive_id", 0) or 0)
+        if did <= 0:
+            return False, "invalid directive id"
+        if str(directive.get("status", "")).strip().upper() != self.DIRECTIVE_STATUS_PENDING:
+            return False, f"directive #{did} is not pending"
+        agent_id = str(directive.get("agent_id", "")).strip()
+        updated = dict(directive)
+        updated["status"] = self.DIRECTIVE_STATUS_REJECTED
+        updated["decision"] = {
+            "decision": "REJECTED",
+            "decided_by": actor,
+            "decided_at": _now_iso(),
+            "note": str(note or "").strip(),
+        }
+        updated["applied"] = {}
+        self._update_directive(did, updated)
+        if agent_id:
+            self.identity.append_memory(
+                agent_id=agent_id,
+                memory_type="operator_directive_rejected",
+                content={
+                    "directive_id": did,
+                    "directive_type": str(directive.get("directive_type", "")),
+                    "request_text": str(directive.get("request_text", "")),
+                    "rejected_by": actor,
+                    "note": str(note or "").strip(),
+                },
+                ts=_now_iso(),
+            )
+        self.storage.log_event(
+            event_type="telegram_directive_rejected",
+            payload={
+                "directive_id": did,
+                "agent_id": agent_id,
+                "directive_type": str(directive.get("directive_type", "")),
+                "rejected_by": actor,
+                "note": str(note or "").strip(),
+            },
+            created_at=_now_iso(),
+        )
+        return True, f"directive #{did} REJECTED"
+
     def _latest_proposal(self, agent_id: str) -> Optional[Dict[str, Any]]:
         row = self.storage.query_one(
             """
@@ -239,6 +603,7 @@ class TelegramChatRuntime:
         active = self.registry.get_active_strategy(agent_id)
         latest_proposal = self._latest_proposal(agent_id)
         latest_equity = self._latest_equity(agent_id)
+        recent_directives = self._list_directives(agent_id=agent_id, limit=8)
         positions = self.storage.list_positions(agent_id)
         if len(positions) > 20:
             positions = positions[:20]
@@ -251,6 +616,7 @@ class TelegramChatRuntime:
             "active_strategy": active,
             "latest_proposal": latest_proposal,
             "latest_equity": latest_equity,
+            "recent_directives": recent_directives,
             "positions": positions,
         }
 
@@ -442,6 +808,33 @@ class TelegramChatRuntime:
             lines.append(f"- {created_at} | {mem_type} | {compact}")
         return "\n".join(lines)
 
+    def _format_directives(self, *, agent_id: Optional[str], status: Optional[str]) -> str:
+        rows = self._list_directives(agent_id=agent_id, status=status, limit=12)
+        title = "[AgentLab] directives"
+        if agent_id:
+            title += f" agent={agent_id}"
+        if status:
+            title += f" status={status.upper()}"
+        if not rows:
+            return title + "\n- (none)"
+        lines = [title]
+        for row in rows:
+            did = int(row.get("directive_id", 0) or 0)
+            aid = str(row.get("agent_id", ""))
+            dtype = str(row.get("directive_type", ""))
+            st = str(row.get("status", ""))
+            requested = str(row.get("requested_at", row.get("created_at", "")))
+            if dtype == "param_update":
+                detail = f"{row.get('param_key', '')}={row.get('param_value_raw', '')}"
+            else:
+                detail = str(row.get("request_text", ""))
+            if len(detail) > 72:
+                detail = detail[:72] + "..."
+            lines.append(
+                f"- #{did} {st} {aid} [{dtype}] {detail} (at={requested})"
+            )
+        return "\n".join(lines)
+
     def _help_text(self) -> str:
         return (
             "[AgentLab Bot]\n"
@@ -453,10 +846,18 @@ class TelegramChatRuntime:
             "/plan <agent_id>\n"
             "/ask <agent_id> <question>\n"
             "/memory <agent_id>\n\n"
+            "/directive <agent_id> <request>\n"
+            "/setparam <agent_id> <param_key> <value> [note]\n"
+            "/directives [agent_id] [pending|applied|rejected]\n"
+            "/approve <directive_id> [note]\n"
+            "/reject <directive_id> [reason]\n\n"
             "Examples:\n"
             "/status agent_a\n"
             "/plan agent_b\n"
-            "/ask agent_c Why did you avoid the top-ranked symbol today?"
+            "/ask agent_c Why did you avoid the top-ranked symbol today?\n"
+            "/directive agent_a Consider including sector leadership in your weekly review.\n"
+            "/setparam agent_b min_strength 115 tighten entry quality\n"
+            "/approve 42 looks good"
         )
 
     def _agent_list_text(self) -> str:
@@ -489,6 +890,7 @@ class TelegramChatRuntime:
         if not text:
             return
 
+        actor = self._actor_from_message(message)
         cmd, args = self._parse_command(text)
         out = ""
         if cmd in {"/start", "/help"}:
@@ -532,6 +934,94 @@ class TelegramChatRuntime:
                     out = "Unknown agent. Use /agents."
                 else:
                     out = self._format_recent_memory(aid)
+        elif cmd == "/directive":
+            if len(args) < 2:
+                out = "Usage: /directive <agent_id> <request>"
+            else:
+                aid = self._normalize_agent_id(args[0])
+                if not aid:
+                    out = "Unknown agent. Use /agents."
+                else:
+                    request_text = " ".join(args[1:]).strip()
+                    if not request_text:
+                        out = "Request text is empty. Usage: /directive <agent_id> <request>"
+                    else:
+                        did = self._create_freeform_directive(aid, request_text, actor)
+                        out = (
+                            f"directive #{did} created (PENDING)\n"
+                            f"agent={aid}\n"
+                            f"request={request_text}\n"
+                            "next: /approve <id> [note] or /reject <id> [reason]"
+                        )
+        elif cmd == "/setparam":
+            if len(args) < 3:
+                out = "Usage: /setparam <agent_id> <param_key> <value> [note]"
+            else:
+                aid = self._normalize_agent_id(args[0])
+                if not aid:
+                    out = "Unknown agent. Use /agents."
+                else:
+                    key = str(args[1]).strip()
+                    value = str(args[2]).strip()
+                    note = " ".join(args[3:]).strip() if len(args) > 3 else ""
+                    ok, msg = self._create_param_directive(
+                        agent_id=aid,
+                        param_key=key,
+                        param_value_raw=value,
+                        requested_by=actor,
+                        note=note,
+                    )
+                    out = msg
+                    if ok:
+                        out += "\nnext: /approve <id> [note] or /reject <id> [reason]"
+        elif cmd == "/directives":
+            aid = None
+            status = None
+            if len(args) >= 1:
+                maybe_agent = self._normalize_agent_id(args[0])
+                if maybe_agent:
+                    aid = maybe_agent
+                else:
+                    status = str(args[0]).strip()
+            if len(args) >= 2:
+                status = str(args[1]).strip()
+            out = self._format_directives(agent_id=aid, status=status)
+        elif cmd in {"/approve", "/apply"}:
+            if len(args) < 1:
+                out = "Usage: /approve <directive_id> [note]"
+            else:
+                try:
+                    did = int(args[0])
+                except Exception:
+                    did = 0
+                if did <= 0:
+                    out = "directive_id must be a positive integer."
+                else:
+                    directive = self._directive_by_id(did)
+                    if directive is None:
+                        out = f"directive #{did} not found."
+                    else:
+                        note = " ".join(args[1:]).strip()
+                        ok, msg = self._apply_directive(directive, actor, note)
+                        out = msg
+        elif cmd == "/reject":
+            if len(args) < 1:
+                out = "Usage: /reject <directive_id> [reason]"
+            else:
+                try:
+                    did = int(args[0])
+                except Exception:
+                    did = 0
+                if did <= 0:
+                    out = "directive_id must be a positive integer."
+                else:
+                    directive = self._directive_by_id(did)
+                    if directive is None:
+                        out = f"directive #{did} not found."
+                    else:
+                        note = " ".join(args[1:]).strip()
+                        ok, msg = self._reject_directive(directive, actor, note)
+                        out = msg
         elif cmd:
             out = "Unknown command. Use /help."
         else:

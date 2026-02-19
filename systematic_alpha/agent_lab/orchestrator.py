@@ -516,12 +516,36 @@ class AgentLabOrchestrator:
             active_strategy_map[aid] = self.registry.get_active_strategy(aid)
             agent_profiles.append(profile_from_agent_row(agent))
 
+        operator_directives_map: Dict[str, List[str]] = {}
+        for agent in agents:
+            aid = str(agent["agent_id"])
+            memories = self.storage.list_agent_memories(aid, limit=40)
+            applied: List[str] = []
+            for mem in reversed(memories):
+                if str(mem.get("memory_type", "")) != "operator_directive_applied":
+                    continue
+                content = mem.get("content", {})
+                if not isinstance(content, dict):
+                    continue
+                dtype = str(content.get("directive_type", "")).strip()
+                if dtype == "param_update":
+                    key = str(content.get("param_key", "")).strip()
+                    val = content.get("applied_value", content.get("requested_value"))
+                    text = f"param_update: {key}={val}"
+                else:
+                    text = str(content.get("request_text", "")).strip()
+                if text:
+                    applied.append(text)
+            if applied:
+                operator_directives_map[aid] = applied[-5:]
+
         discussion = self.agent_engine.run_weekly_council_debate(
             agent_profiles=agent_profiles,
             active_params_map={aid: dict(v["params"]) for aid, v in active_strategy_map.items()},
             scored_rows=scored_rows,
             score_board=scores,
             week_id=week_id,
+            operator_directives_map=operator_directives_map,
         )
         llm_alerts = list(discussion.get("llm_warnings", []) or [])
         for alert in llm_alerts:

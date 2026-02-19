@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from systematic_alpha.agent_lab.llm_client import LLMClient
 from systematic_alpha.agent_lab.schemas import (
@@ -232,8 +232,10 @@ class AgentDecisionEngine:
         scored_rows: List[Dict[str, Any]],
         score_board: Dict[str, float],
         week_id: str,
+        operator_directives_map: Optional[Dict[str, List[str]]] = None,
     ) -> Dict[str, Any]:
         row_by_agent = {str(row.get("agent_id", "")): row for row in scored_rows}
+        directives_map = operator_directives_map or {}
         llm_warnings: List[Dict[str, str]] = []
         rounds: List[Dict[str, Any]] = []
 
@@ -258,6 +260,7 @@ class AgentDecisionEngine:
                 f"score={float(score_board.get(aid, 0.0)):.6f}\n"
                 f"metrics={row_by_agent.get(aid, {})}\n"
                 f"active_params={active_params_map.get(aid, {})}\n"
+                f"operator_directives={directives_map.get(aid, [])}\n"
                 f"allowed_param_keys={list(ALLOWED_PARAM_RANGES.keys())}\n\n"
                 "Output JSON schema:\n"
                 "{"
@@ -438,4 +441,3 @@ class AgentDecisionEngine:
             if key in ALLOWED_PARAM_RANGES:
                 merged[key] = val
         return self.registry.clamp_params(merged)
-

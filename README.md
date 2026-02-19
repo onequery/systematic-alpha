@@ -147,9 +147,22 @@ Send these commands in the configured Telegram chat:
 - `/plan agent_b`
 - `/ask agent_c Why did you avoid the top symbol today?`
 - `/memory agent_a`
+- `/directive agent_a Consider sector leadership in your weekly review.`
+- `/setparam agent_b min_strength 115 tighten entry quality`
+- `/directives`
+- `/approve 42 apply now`
+- `/reject 42 not aligned with risk rules`
 
 Identity and memory are persisted in `state/agent_lab/agents/<agent_id>/`.
 If you stop and restart tasks for code updates, agents warm-start from identity + recent memory + latest checkpoint.
+
+Directive workflow:
+
+1. Create directive with `/directive` or `/setparam` (status=`PENDING`)
+2. Review queue with `/directives`
+3. Apply with `/approve <id>` or reject with `/reject <id>`
+4. Applied directives are saved to agent memory, and `/setparam` creates a new promoted strategy version automatically
+5. Applied freeform directives are injected into weekly council debate context so agents can reflect them in next strategy updates
 
 ## Note on Legacy Signal Code
 
