@@ -56,7 +56,9 @@ class TelegramNotifier:
             self.session.trust_env = False
         default_events = "trade_executed,preopen_plan,session_close_report,weekly_council"
         raw_events = os.getenv("AGENT_LAB_NOTIFY_EVENTS", default_events)
-        self.allowed_events = _parse_csv_set(raw_events)
+        mandatory = {"trade_executed", "preopen_plan", "session_close_report", "weekly_council"}
+        parsed = _parse_csv_set(raw_events)
+        self.allowed_events = parsed.union(mandatory)
 
     def _allow_event(self, event: str) -> bool:
         if "*" in self.allowed_events:

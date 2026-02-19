@@ -95,7 +95,9 @@ class AutoStrategyDaemon:
         self.http = requests.Session()
         self.http.trust_env = False
         default_events = "trade_executed,preopen_plan,session_close_report,weekly_council"
-        self.allowed_notify_events = _parse_csv_set(os.getenv("AGENT_LAB_NOTIFY_EVENTS", default_events))
+        mandatory = {"trade_executed", "preopen_plan", "session_close_report", "weekly_council"}
+        parsed = _parse_csv_set(os.getenv("AGENT_LAB_NOTIFY_EVENTS", default_events))
+        self.allowed_notify_events = parsed.union(mandatory)
 
     def close(self) -> None:
         self.orchestrator.close()
@@ -194,6 +196,31 @@ class AutoStrategyDaemon:
 
     def _recent_auto_updates(self, limit: int = 100) -> List[Dict[str, Any]]:
         return self.storage.list_events(event_type="auto_strategy_update", limit=limit)
+
+    @staticmethod
+    def _auto_weekly_council_enabled() -> bool:
+        # Default OFF: weekly council/report should be driven by scheduled weekly task.
+        return _truthy(os.getenv("AGENT_LAB_AUTO_WEEKLY_COUNCIL", "0"))
+
+    def _within_weekly_council_window(self, now_kst: datetime) -> bool:
+        # Sunday 08:00~08:20 KST window only.
+        if now_kst.weekday() != 6:
+            return False
+        start = now_kst.replace(hour=8, minute=0, second=0, microsecond=0)
+        end = now_kst.replace(hour=8, minute=20, second=0, microsecond=0)
+        return start <= now_kst <= end
+
+    def _weekly_council_done(self, week_id: str) -> bool:
+        row = self.storage.query_one(
+            """
+            SELECT weekly_council_id
+            FROM weekly_councils
+            WHERE week_id = ?
+            LIMIT 1
+            """,
+            (str(week_id),),
+        )
+        return row is not None
 
     def _latest_event_by_market(self, event_type: str, market: str, limit: int = 240) -> Optional[Dict[str, Any]]:
         rows = self.storage.list_events(event_type=event_type, limit=limit)
@@ -834,6 +861,36 @@ class AutoStrategyDaemon:
                 "intraday_monitor": intraday_monitor,
             }
             return result
+
+        if not self._auto_weekly_council_enabled():
+            return {
+                "action": "skip",
+                "reason": "auto_weekly_council_disabled",
+                "now_kst": now_kst.isoformat(),
+                "triggers": [t.__dict__ for t in triggers],
+                "intraday_monitor": intraday_monitor,
+            }
+
+        iso_year, iso_week, _ = now_kst.isocalendar()
+        week_id = f"{iso_year}-W{iso_week:02d}"
+        if not self._within_weekly_council_window(now_kst):
+            return {
+                "action": "skip",
+                "reason": "outside_weekly_council_window",
+                "week_id": week_id,
+                "now_kst": now_kst.isoformat(),
+                "triggers": [t.__dict__ for t in triggers],
+                "intraday_monitor": intraday_monitor,
+            }
+        if self._weekly_council_done(week_id):
+            return {
+                "action": "skip",
+                "reason": "weekly_council_already_done",
+                "week_id": week_id,
+                "now_kst": now_kst.isoformat(),
+                "triggers": [t.__dict__ for t in triggers],
+                "intraday_monitor": intraday_monitor,
+            }
 
         updated = self._run_council_update(now_kst, triggers, vote)
         self.storage.log_event(

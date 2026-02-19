@@ -359,14 +359,14 @@ class AgentDecisionEngine:
         for profile in agent_profiles:
             aid = profile.agent_id
             fallback = {
-                "thesis": f"{profile.name}: fallback thesis (LLM unavailable).",
-                "risk_notes": ["Fallback mode active."],
+                "thesis": f"{profile.name}: LLM 미가용으로 기본 전략 관점에서 보수적으로 유지한다.",
+                "risk_notes": ["LLM fallback 모드가 활성화됨."],
                 "param_changes": {},
                 "confidence": 0.4,
             }
             system_prompt = (
-                "You are one trader agent in a weekly quant strategy council. "
-                "Return compact JSON only."
+                "너는 주간 트레이딩 전략 회의에 참여하는 에이전트다. "
+                "반드시 간결한 JSON만 반환하라."
             )
             user_prompt = (
                 f"week_id={week_id}\n"
@@ -378,14 +378,14 @@ class AgentDecisionEngine:
                 f"active_params={active_params_map.get(aid, {})}\n"
                 f"operator_directives={directives_map.get(aid, [])}\n"
                 f"allowed_param_keys={list(ALLOWED_PARAM_RANGES.keys())}\n\n"
-                "Output JSON schema:\n"
+                "반환 JSON 스키마:\n"
                 "{"
-                '"thesis": string, '
-                '"risk_notes": [string], '
+                '"thesis": string(한국어), '
+                '"risk_notes": [string(한국어)], '
                 '"param_changes": {key:value}, '
                 '"confidence": number(0~1)'
                 "}\n"
-                "Do not add keys outside schema."
+                "스키마 외 키는 추가하지 마라. 설명 문장은 반드시 한국어로 작성하라."
             )
             resp = self.llm.generate_json(
                 system_prompt=system_prompt,
@@ -416,13 +416,13 @@ class AgentDecisionEngine:
             aid = profile.agent_id
             peer_openings = [x for x in opening_speeches if x["agent_id"] != aid]
             fallback = {
-                "rebuttal": f"{profile.name}: fallback rebuttal (LLM unavailable).",
+                "rebuttal": f"{profile.name}: LLM 미가용으로 동료 주장 대비 리스크 관점 반박을 보류한다.",
                 "counter_points": [],
                 "param_changes": {},
             }
             system_prompt = (
-                "You are one trader agent in a weekly quant strategy debate. "
-                "Review peer claims and return compact JSON only."
+                "너는 주간 트레이딩 전략 토론의 에이전트다. "
+                "동료 주장을 검토하고 간결한 JSON만 반환하라."
             )
             user_prompt = (
                 f"week_id={week_id}\n"
@@ -431,13 +431,13 @@ class AgentDecisionEngine:
                 f"active_params={active_params_map.get(aid, {})}\n"
                 f"peer_openings={peer_openings}\n"
                 f"allowed_param_keys={list(ALLOWED_PARAM_RANGES.keys())}\n\n"
-                "Output JSON schema:\n"
+                "반환 JSON 스키마:\n"
                 "{"
-                '"rebuttal": string, '
-                '"counter_points": [string], '
+                '"rebuttal": string(한국어), '
+                '"counter_points": [string(한국어)], '
                 '"param_changes": {key:value}'
                 "}\n"
-                "Do not add keys outside schema."
+                "스키마 외 키는 추가하지 마라. 설명 문장은 반드시 한국어로 작성하라."
             )
             resp = self.llm.generate_json(
                 system_prompt=system_prompt,
@@ -463,27 +463,27 @@ class AgentDecisionEngine:
         rounds.append({"round": 2, "phase": "rebuttal", "speeches": rebuttal_speeches})
 
         moderator_fallback = {
-            "summary": "Fallback moderator summary: preserve adaptive realtime operation and review risk events.",
+            "summary": "LLM 미가용으로 이번 주 전략은 유지하되 리스크 이벤트와 회전율을 우선 점검한다.",
             "consensus_actions": [],
-            "risk_watch": ["LLM fallback mode during council."],
+            "risk_watch": ["LLM fallback 모드로 요약 품질이 제한됨."],
         }
         moderator_resp = self.llm.generate_json(
             system_prompt=(
-                "You are the moderator of a quant trading weekly council. "
-                "Return compact JSON only."
+                "너는 정량 트레이딩 주간 회의의 사회자다. "
+                "간결한 JSON만 반환하라."
             ),
             user_prompt=(
                 f"week_id={week_id}\n"
                 f"score_board={score_board}\n"
                 f"opening_speeches={opening_speeches}\n"
                 f"rebuttal_speeches={rebuttal_speeches}\n\n"
-                "Output JSON schema:\n"
+                "반환 JSON 스키마:\n"
                 "{"
-                '"summary": string, '
-                '"consensus_actions": [string], '
-                '"risk_watch": [string]'
+                '"summary": string(한국어), '
+                '"consensus_actions": [string(한국어)], '
+                '"risk_watch": [string(한국어)]'
                 "}\n"
-                "Do not add keys outside schema."
+                "스키마 외 키는 추가하지 마라. 설명 문장은 반드시 한국어로 작성하라."
             ),
             fallback=moderator_fallback,
             temperature=0.2,

@@ -1458,12 +1458,12 @@ class AgentLabOrchestrator:
             "llm_alerts": llm_alerts,
         }
         markdown = (
-            f"# Weekly Council {week_id}\n\n"
-            f"- Champion: `{champion}`\n"
-            f"- Scores: `{scores}`\n"
-            f"- Promoted Versions: `{promoted_versions}`\n"
-            f"- LLM Alerts: `{len(llm_alerts)}`\n\n"
-            "## Moderator Summary\n"
+            f"# 주간 회의 {week_id}\n\n"
+            f"- 우승 전략: `{champion}`\n"
+            f"- 점수표: `{scores}`\n"
+            f"- 승격 버전: `{promoted_versions}`\n"
+            f"- LLM 경고 수: `{len(llm_alerts)}`\n\n"
+            "## 사회자 요약\n"
             f"{str((discussion.get('moderator') or {}).get('summary') or '')}\n"
         )
         stamp = week_end.strftime("%Y%m%d")

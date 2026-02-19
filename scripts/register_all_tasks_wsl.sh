@@ -28,7 +28,7 @@ CRON_TZ=America/New_York
 10 16 * * 1-5 cd "$ROOT_DIR" && /usr/bin/env bash "$ROOT_DIR/scripts/run_agent_lab_wsl.sh" --action close-report --market US >> "$ROOT_DIR/logs/cron/agent_us_close.log" 2>&1
 
 CRON_TZ=Asia/Seoul
-0 8 * * 6 cd "$ROOT_DIR" && /usr/bin/env bash "$ROOT_DIR/scripts/run_agent_lab_wsl.sh" --action weekly-council >> "$ROOT_DIR/logs/cron/agent_weekly_council.log" 2>&1
+0 8 * * 0 cd "$ROOT_DIR" && /usr/bin/env bash "$ROOT_DIR/scripts/run_agent_lab_wsl.sh" --action weekly-council >> "$ROOT_DIR/logs/cron/agent_weekly_council.log" 2>&1
 @reboot cd "$ROOT_DIR" && /usr/bin/env bash "$ROOT_DIR/scripts/run_agent_lab_wsl.sh" --action telegram-chat >> "$ROOT_DIR/logs/cron/agent_telegram_chat.log" 2>&1
 @reboot cd "$ROOT_DIR" && /usr/bin/env bash "$ROOT_DIR/scripts/run_agent_lab_wsl.sh" --action auto-strategy-daemon >> "$ROOT_DIR/logs/cron/agent_auto_strategy.log" 2>&1
 $MARK_END

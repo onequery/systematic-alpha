@@ -370,13 +370,17 @@ class TelegramChatRuntime:
             now_local = now_kst
             specs = [
                 ("prefetch", 7, 30, self.kst),
+                ("preopen-plan", 8, 50, self.kst),
                 ("signal-scan", 9, 0, self.kst),
+                ("close-report", 15, 40, self.kst),
             ]
         else:
             now_local = now_kst.astimezone(self.et)
             specs = [
                 ("prefetch", 8, 30, self.et),
+                ("preopen-plan", 9, 20, self.et),
                 ("signal-scan", 9, 30, self.et),
+                ("close-report", 16, 10, self.et),
             ]
         for label, hour, minute, tz in specs:
             next_run = self._next_weekday_at(now_local, hour, minute)
@@ -463,6 +467,8 @@ class TelegramChatRuntime:
         out: List[str] = [f"[{m}] 파이프라인"]
         ingest_evt = self._latest_event_by_market("session_ingested", m)
         prop_evt = self._latest_event_by_market("orders_proposed", m)
+        pre_evt = self._latest_event_by_market("preopen_plan", m)
+        close_evt = self._latest_event_by_market("session_close_report", m)
         if ingest_evt:
             p = ingest_evt.get("payload", {}) or {}
             out.append(
@@ -483,6 +489,22 @@ class TelegramChatRuntime:
             )
         else:
             out.append("- 마지막_propose: -")
+        if pre_evt:
+            p = pre_evt.get("payload", {}) or {}
+            out.append(
+                f"- 마지막_preopen_plan: 일자={p.get('date', '-')} "
+                f"시각={pre_evt.get('created_at', '-')}"
+            )
+        else:
+            out.append("- 마지막_preopen_plan: -")
+        if close_evt:
+            p = close_evt.get("payload", {}) or {}
+            out.append(
+                f"- 마지막_close_report: 일자={p.get('date', '-')} "
+                f"시각={close_evt.get('created_at', '-')}"
+            )
+        else:
+            out.append("- 마지막_close_report: -")
         for row in self._market_schedule_rows(m):
             dt_local = str(row.get("next_run_local", "-"))
             if m == "US":

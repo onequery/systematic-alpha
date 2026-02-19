@@ -82,8 +82,12 @@ chmod +x scripts/*.sh
 
 ### 공통
 
-- 매주 토요일 08:00 KST: 주간 토의 보고
+- 매주 일요일 08:00 KST: 주간 토의 보고
 - `@reboot`: `telegram-chat`, `auto-strategy-daemon` 자동 시작
+
+참고:
+- `auto-strategy-daemon`은 기본값에서 주간회의를 임의 호출하지 않습니다.
+- 주간회의/주간보고는 위 일요일 스케줄 태스크가 담당합니다.
 
 ## 6. 텔레그램으로 받는 보고(요구사항 반영)
 
