@@ -294,6 +294,60 @@ class AutoStrategyDaemon:
         raw = str(value or "").strip()
         return mapping.get(raw, raw or "-")
 
+    def _should_use_uncapped_scan(self, market: str) -> bool:
+        if not self._max_freedom_mode():
+            return False
+        if not _truthy(os.getenv("AGENT_LAB_INTRADAY_UNCAPPED_WHEN_STABLE", "1")):
+            return False
+        max_elapsed = float(os.getenv("AGENT_LAB_INTRADAY_UNCAPPED_MAX_ELAPSED_SEC", "180") or 180.0)
+        rows = self.storage.list_events(event_type="auto_intraday_signal_refresh", limit=24)
+        market_rows: List[Dict[str, Any]] = []
+        for row in rows:
+            payload = row.get("payload", {}) if isinstance(row, dict) else {}
+            if not isinstance(payload, dict):
+                continue
+            if str(payload.get("market", "")).strip().upper() != str(market).strip().upper():
+                continue
+            market_rows.append(payload)
+        if not market_rows:
+            return True
+        fail_count = 0
+        slow_count = 0
+        for payload in market_rows[:8]:
+            ok = bool(payload.get("ok", False))
+            returncode = int(payload.get("returncode", 0) or 0)
+            elapsed = float(payload.get("elapsed_sec", 0.0) or 0.0)
+            if (not ok) or returncode != 0:
+                fail_count += 1
+            if elapsed > max_elapsed:
+                slow_count += 1
+        return fail_count < 2 and slow_count < 3
+
+    def _afterhours_risk_snapshot(self, market: str) -> Dict[str, Dict[str, float]]:
+        out: Dict[str, Dict[str, float]] = {}
+        market_upper = str(market).strip().upper()
+        for row in self.storage.list_agents():
+            aid = str(row.get("agent_id", "")).strip()
+            if not aid:
+                continue
+            ledger = self.orchestrator.accounting.rebuild_agent_ledger(aid)
+            positions = list(ledger.get("positions", []))
+            market_positions = [
+                p
+                for p in positions
+                if str(p.get("market", "")).strip().upper() == market_upper
+            ]
+            exposure = 0.0
+            for p in market_positions:
+                exposure += float(p.get("market_value_krw", 0.0) or 0.0)
+            out[aid] = {
+                "cash_krw": float(ledger.get("cash_krw", 0.0) or 0.0),
+                "equity_krw": float(ledger.get("equity_krw", 0.0) or 0.0),
+                "market_exposure_krw": float(exposure),
+                "market_positions": float(len(market_positions)),
+            }
+        return out
+
     def _refresh_intraday_signal(self, market: str, now_kst: datetime) -> Dict[str, Any]:
         market = str(market).upper()
         market_lc = market.lower()
@@ -318,6 +372,15 @@ class AutoStrategyDaemon:
         kr_universe_size = int(float(os.getenv("AGENT_LAB_INTRADAY_KR_UNIVERSE_SIZE", "300") or 300))
         us_universe_size = int(float(os.getenv("AGENT_LAB_INTRADAY_US_UNIVERSE_SIZE", "500") or 500))
         us_exchange = str(os.getenv("AGENT_LAB_US_EXCHANGE", "NASD")).strip().upper() or "NASD"
+        uncapped_mode = self._should_use_uncapped_scan(market)
+        uncapped_limit = int(float(os.getenv("AGENT_LAB_INTRADAY_UNCAPPED_LIMIT", "1000000") or 1000000))
+        uncapped_limit = max(1000, uncapped_limit)
+        if uncapped_mode:
+            max_symbols_scan = uncapped_limit
+            if market == "KR":
+                kr_universe_size = uncapped_limit
+            else:
+                us_universe_size = uncapped_limit
 
         cmd = [
             sys.executable,
@@ -332,11 +395,11 @@ class AutoStrategyDaemon:
             "--pre-candidates",
             str(max(1, pre_candidates)),
             "--max-symbols-scan",
-            str(max(50, max_symbols_scan)),
+            str(max(50, int(max_symbols_scan))),
             "--kr-universe-size",
-            str(max(50, kr_universe_size)),
+            str(max(50, int(kr_universe_size))),
             "--us-universe-size",
-            str(max(50, us_universe_size)),
+            str(max(50, int(us_universe_size))),
             "--min-change-pct",
             str(float(os.getenv("AGENT_LAB_INTRADAY_MIN_CHANGE_PCT", "0") or 0.0)),
             "--min-gap-pct",
@@ -357,7 +420,7 @@ class AutoStrategyDaemon:
             str(analytics_dir),
             "--overnight-report-path",
             str(overnight_path),
-            "--long-only",
+            "--allow-short-bias",
         ]
         allow_low_cov = _truthy(os.getenv("AGENT_LAB_INTRADAY_ALLOW_LOW_COVERAGE", "1"))
         cmd.append("--allow-low-coverage" if allow_low_cov else "--invalidate-on-low-coverage")
@@ -365,36 +428,54 @@ class AutoStrategyDaemon:
             cmd.extend(["--exchange", us_exchange])
 
         started = time.perf_counter()
-        completed = subprocess.run(
-            cmd,
-            cwd=str(self.project_root),
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=max(120, collect_seconds + 180),
-        )
+        timed_out = False
+        completed = None
+        stdout_text = ""
+        stderr_text = ""
+        returncode = 0
+        try:
+            completed = subprocess.run(
+                cmd,
+                cwd=str(self.project_root),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=max(120, collect_seconds + 180),
+            )
+            stdout_text = str(completed.stdout or "")
+            stderr_text = str(completed.stderr or "")
+            returncode = int(completed.returncode)
+        except subprocess.TimeoutExpired as exc:
+            timed_out = True
+            returncode = 124
+            stdout_text = str(exc.stdout or "")
+            stderr_text = str(exc.stderr or "")
         elapsed = time.perf_counter() - started
         log_body = (
             f"[intraday-refresh] started={now_kst.isoformat()}\n"
             f"command={' '.join(cmd)}\n"
-            f"returncode={completed.returncode}\n"
+            f"returncode={returncode}\n"
             f"elapsed_sec={elapsed:.1f}\n\n"
-            f"[stdout]\n{completed.stdout}\n\n[stderr]\n{completed.stderr}\n"
+            f"uncapped_mode={uncapped_mode}\n"
+            f"timed_out={timed_out}\n\n"
+            f"[stdout]\n{stdout_text}\n\n[stderr]\n{stderr_text}\n"
         )
         log_path.write_text(log_body, encoding="utf-8")
 
         payload = {
             "market": market,
             "run_date": run_date,
-            "ok": bool(completed.returncode == 0 and output_json.exists()),
-            "returncode": int(completed.returncode),
+            "ok": bool(returncode == 0 and output_json.exists()),
+            "returncode": int(returncode),
             "elapsed_sec": round(elapsed, 2),
             "output_json": str(output_json),
             "log_path": str(log_path),
+            "uncapped_mode": bool(uncapped_mode),
+            "timed_out": bool(timed_out),
         }
-        if completed.returncode != 0:
-            payload["error"] = f"returncode={completed.returncode}"
+        if returncode != 0:
+            payload["error"] = f"returncode={returncode}"
         self.storage.log_event("auto_intraday_signal_refresh", payload, _now_iso())
         return payload
 
@@ -469,13 +550,16 @@ class AutoStrategyDaemon:
             out[str(row.get("status", "UNKNOWN"))] = int(row.get("c", 0) or 0)
         return out
 
-    def _run_intraday_monitor_cycle(self, market: str, now_kst: datetime) -> Dict[str, Any]:
+    def _run_intraday_monitor_cycle(self, market: str, now_kst: datetime, *, market_open: bool) -> Dict[str, Any]:
         market = str(market).upper()
-        refresh_enabled = self._max_freedom_mode() or _truthy(os.getenv("AGENT_LAB_INTRADAY_SIGNAL_REFRESH", "1"))
+        refresh_enabled = market_open and (
+            self._max_freedom_mode() or _truthy(os.getenv("AGENT_LAB_INTRADAY_SIGNAL_REFRESH", "1"))
+        )
         payload: Dict[str, Any] = {
             "market": market,
             "executed_at_kst": now_kst.isoformat(),
-            "mode": "observe",
+            "mode": "observe" if market_open else "afterhours_observe",
+            "market_open": bool(market_open),
             "session_date": "",
             "signal_status": "NO_SIGNAL",
             "proposal_status_counts": {},
@@ -512,8 +596,10 @@ class AutoStrategyDaemon:
         payload["signal_status"] = signal_status
         payload["proposal_status_counts"] = status_counts
 
-        # Optional advanced mode: re-run propose cycle during open sessions.
-        propose_enabled = self._max_freedom_mode() or _truthy(os.getenv("AGENT_LAB_INTRADAY_MONITOR_PROPOSE", "1"))
+        # Optional advanced mode: re-run propose cycle during regular sessions only.
+        propose_enabled = market_open and (
+            self._max_freedom_mode() or _truthy(os.getenv("AGENT_LAB_INTRADAY_MONITOR_PROPOSE", "1"))
+        )
         if propose_enabled and signal and signal_status == "SIGNAL_OK":
             try:
                 proposed = self.orchestrator.propose_orders(
@@ -534,6 +620,8 @@ class AutoStrategyDaemon:
                 payload["propose_triggered"] = True
                 payload["propose_ok"] = False
                 payload["propose_error"] = repr(exc)
+        if not market_open:
+            payload["afterhours_risk"] = self._afterhours_risk_snapshot(market)
 
         self.storage.log_event("auto_intraday_monitor_cycle", payload, _now_iso())
         signal_text = self._ko_signal_status(signal_status)
@@ -566,6 +654,10 @@ class AutoStrategyDaemon:
             return result
 
         interval_sec = max(10, int(result["interval_sec"] or 10))
+        outside_interval_sec = max(
+            interval_sec,
+            int(float(os.getenv("AGENT_LAB_AFTERHOURS_MONITOR_INTERVAL_SEC", "300") or 300)),
+        )
         now_naive = now_kst.replace(tzinfo=None)
         for mk in ["KR", "US"]:
             open_now = self._is_market_open_now(mk, now_kst)
@@ -573,32 +665,29 @@ class AutoStrategyDaemon:
             last_cycle = self._latest_event_by_market("auto_intraday_monitor_cycle", mk)
             if last_cycle:
                 state["last_cycle_at"] = str(last_cycle.get("created_at", ""))
-            if not open_now:
-                state["state"] = "outside_window"
-                result["markets"][mk] = state
-                continue
-
             due = True
+            target_interval = interval_sec if open_now else outside_interval_sec
             if last_cycle:
                 created = _parse_iso(str(last_cycle.get("created_at", "")))
                 if created is not None:
                     elapsed = (now_naive - created).total_seconds()
-                    if elapsed < interval_sec:
+                    if elapsed < target_interval:
                         due = False
-                        state["state"] = "waiting"
-                        state["seconds_until_next"] = int(max(0.0, interval_sec - elapsed))
+                        state["state"] = "waiting" if open_now else "outside_window"
+                        state["seconds_until_next"] = int(max(0.0, target_interval - elapsed))
             if not due:
                 result["markets"][mk] = state
                 continue
 
-            cycle = self._run_intraday_monitor_cycle(mk, now_kst)
-            state["state"] = "executed"
+            cycle = self._run_intraday_monitor_cycle(mk, now_kst, market_open=open_now)
+            state["state"] = "executed" if open_now else "outside_window"
             state["session_date"] = str(cycle.get("session_date", ""))
             state["signal_status"] = str(cycle.get("signal_status", ""))
             state["propose_triggered"] = bool(cycle.get("propose_triggered", False))
             state["propose_ok"] = bool(cycle.get("propose_ok", False))
-            state["seconds_until_next"] = interval_sec
-            result["executed_markets"].append(mk)
+            state["seconds_until_next"] = target_interval
+            if open_now:
+                result["executed_markets"].append(mk)
             result["markets"][mk] = state
         return result
 

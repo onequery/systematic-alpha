@@ -29,19 +29,37 @@ class PaperBroker:
         except Exception:
             self._creds = {}
 
-    def _exchange_label(self, market: str) -> str:
-        # self-heal:us-exchange-resolver-v1
-        if market.upper() == "KR":
-            return "KR"
-
-        normalized = {
+    @staticmethod
+    def _normalize_us_exchange(raw: str) -> str:
+        upper = str(raw or "").strip().upper()
+        return {
             "NASD": "NASD",
             "NASDAQ": "NASD",
             "NYSE": "NYSE",
             "NYS": "NYSE",
             "AMEX": "AMEX",
             "AMS": "AMEX",
-        }.get(self.us_exchange.upper(), self.us_exchange.upper())
+        }.get(upper, upper or "NASD")
+
+    def _exchange_candidates(self, market: str) -> List[str]:
+        if market.upper() == "KR":
+            return ["KR"]
+        ordered = [self._normalize_us_exchange(self.us_exchange), "NASD", "NYSE", "AMEX"]
+        out: List[str] = []
+        seen = set()
+        for ex in ordered:
+            if ex in seen:
+                continue
+            seen.add(ex)
+            out.append(ex)
+        return out
+
+    def _exchange_label(self, market: str, us_exchange_code: str = "") -> str:
+        # self-heal:us-exchange-resolver-v1
+        if market.upper() == "KR":
+            return "KR"
+
+        normalized = self._normalize_us_exchange(us_exchange_code or self.us_exchange)
 
         try:
             mojito = import_mojito_module()
@@ -61,8 +79,10 @@ class PaperBroker:
         }
         return fallback.get(normalized, "나스닥")
 
-    def _get_broker(self, market: str):
-        key = market.upper()
+    def _get_broker(self, market: str, us_exchange_code: str = ""):
+        market_upper = market.upper()
+        exchange_code = self._normalize_us_exchange(us_exchange_code or self.us_exchange)
+        key = f"{market_upper}:{exchange_code}" if market_upper == "US" else market_upper
         if key in self._brokers:
             return self._brokers[key]
         self._load_creds()
@@ -83,7 +103,7 @@ class PaperBroker:
                     api_key=self._creds["key"],
                     api_secret=self._creds["secret"],
                     acc_no=self._creds["acc_no"],
-                    exchange=self._exchange_label(key),
+                    exchange=self._exchange_label(market_upper, exchange_code),
                     mock=True,
                 )
             self._brokers[key] = broker
@@ -92,28 +112,33 @@ class PaperBroker:
             return None
 
     def _send_order(self, market: str, order: Dict[str, Any]) -> Dict[str, Any]:
-        broker = self._get_broker(market)
-        if broker is None:
-            return {"ok": False, "reason": "broker_unavailable"}
         symbol = str(order["symbol"])
         qty = int(float(order["quantity"]))
         order_type = str(order.get("order_type", "MARKET")).upper()
         side = str(order.get("side", "BUY")).upper()
-        try:
-            if order_type == "LIMIT":
-                px = int(float(order.get("limit_price") or order.get("reference_price") or 0))
-                if side == "BUY":
-                    resp = broker.create_limit_buy_order(symbol, px, qty)
+        attempts: List[Dict[str, Any]] = []
+        for exchange_code in self._exchange_candidates(market):
+            broker = self._get_broker(market, exchange_code)
+            if broker is None:
+                attempts.append({"exchange": exchange_code, "ok": False, "reason": "broker_unavailable"})
+                continue
+            try:
+                if order_type == "LIMIT":
+                    px = int(float(order.get("limit_price") or order.get("reference_price") or 0))
+                    if side == "BUY":
+                        resp = broker.create_limit_buy_order(symbol, px, qty)
+                    else:
+                        resp = broker.create_limit_sell_order(symbol, px, qty)
                 else:
-                    resp = broker.create_limit_sell_order(symbol, px, qty)
-            else:
-                if side == "BUY":
-                    resp = broker.create_market_buy_order(symbol, qty)
-                else:
-                    resp = broker.create_market_sell_order(symbol, qty)
-            return {"ok": True, "response": resp}
-        except Exception as exc:
-            return {"ok": False, "reason": repr(exc)}
+                    if side == "BUY":
+                        resp = broker.create_market_buy_order(symbol, qty)
+                    else:
+                        resp = broker.create_market_sell_order(symbol, qty)
+                return {"ok": True, "response": resp, "exchange": exchange_code, "attempts": attempts}
+            except Exception as exc:
+                attempts.append({"exchange": exchange_code, "ok": False, "reason": repr(exc)})
+                continue
+        return {"ok": False, "reason": "all_exchange_attempts_failed", "attempts": attempts}
 
     def execute_orders(
         self,

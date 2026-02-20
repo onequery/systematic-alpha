@@ -1,16 +1,23 @@
 from __future__ import annotations
 
+import copy
 import json
 import os
 import uuid
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 import requests
 
 from systematic_alpha.agent_lab.accounting import AccountingEngine
-from systematic_alpha.agent_lab.agents import AgentDecisionEngine, build_default_agent_profiles, profile_from_agent_row
+from systematic_alpha.agent_lab.agents import (
+    AgentDecisionEngine,
+    build_default_agent_profiles,
+    normalize_agent_constraints,
+    profile_from_agent_row,
+)
 from systematic_alpha.agent_lab.identity import AgentIdentityStore
 from systematic_alpha.agent_lab.llm_client import LLMClient
 from systematic_alpha.agent_lab.notify import TelegramNotifier
@@ -29,6 +36,12 @@ from systematic_alpha.agent_lab.storage import AgentLabStorage
 from systematic_alpha.agent_lab.strategy_registry import DEFAULT_STRATEGY_PARAMS, StrategyRegistry
 
 PROMOTION_SCORE_THRESHOLD = 0.60
+PROMOTION_MAX_RISK_VIOLATIONS = 3
+PROMOTION_MAX_RISK_RATE = 0.15
+PROMOTION_MIN_PROPOSALS = 10
+FORCED_CONSERVATIVE_CONSECUTIVE_WEEKS = 3
+FORCED_CONSERVATIVE_MIN_VIOLATIONS = 4
+FORCED_CONSERVATIVE_MIN_RATE = 0.25
 
 
 def now_iso() -> str:
@@ -69,6 +82,69 @@ class AgentLabOrchestrator:
         self.risk = RiskEngine()
         self.paper_broker = PaperBroker(self.storage)
         self.notifier = TelegramNotifier()
+        self.kst = ZoneInfo("Asia/Seoul")
+        self.et = ZoneInfo("America/New_York")
+
+    @staticmethod
+    def _strict_report_windows_enabled() -> bool:
+        return _truthy(os.getenv("AGENT_LAB_STRICT_REPORT_WINDOWS", "1"))
+
+    @staticmethod
+    def _allow_offschedule_weekly() -> bool:
+        return _truthy(os.getenv("AGENT_LAB_ALLOW_OFFSCHEDULE_WEEKLY", "0"))
+
+    def _event_already_reported(self, event_type: str, market: str, yyyymmdd: str, *, limit: int = 500) -> bool:
+        market_upper = str(market).strip().upper()
+        date_str = str(yyyymmdd).strip()
+        rows = self.storage.list_events(event_type=event_type, limit=limit)
+        for row in rows:
+            payload = row.get("payload", {})
+            if not isinstance(payload, dict):
+                continue
+            if str(payload.get("market", "")).strip().upper() != market_upper:
+                continue
+            if str(payload.get("date", "")).strip() != date_str:
+                continue
+            return True
+        return False
+
+    def _within_preopen_window(self, market: str, now_utc: Optional[datetime] = None) -> Tuple[bool, str]:
+        market_upper = str(market).strip().upper()
+        now = now_utc.astimezone(self.kst if market_upper == "KR" else self.et) if now_utc else datetime.now(self.kst if market_upper == "KR" else self.et)
+        if market_upper == "KR":
+            if now.weekday() >= 5:
+                return False, f"weekend_kst={now.isoformat(timespec='seconds')}"
+            start = now.replace(hour=8, minute=40, second=0, microsecond=0)
+            end = now.replace(hour=9, minute=5, second=0, microsecond=0)
+            return (start <= now <= end), f"now_kst={now.isoformat(timespec='seconds')}, window=08:40~09:05"
+        if now.weekday() >= 5:
+            return False, f"weekend_et={now.isoformat(timespec='seconds')}"
+        start = now.replace(hour=9, minute=5, second=0, microsecond=0)
+        end = now.replace(hour=9, minute=30, second=0, microsecond=0)
+        return (start <= now <= end), f"now_et={now.isoformat(timespec='seconds')}, window=09:05~09:30"
+
+    def _within_close_report_window(self, market: str, now_utc: Optional[datetime] = None) -> Tuple[bool, str]:
+        market_upper = str(market).strip().upper()
+        now = now_utc.astimezone(self.kst if market_upper == "KR" else self.et) if now_utc else datetime.now(self.kst if market_upper == "KR" else self.et)
+        if market_upper == "KR":
+            if now.weekday() >= 5:
+                return False, f"weekend_kst={now.isoformat(timespec='seconds')}"
+            start = now.replace(hour=15, minute=35, second=0, microsecond=0)
+            end = now.replace(hour=16, minute=10, second=0, microsecond=0)
+            return (start <= now <= end), f"now_kst={now.isoformat(timespec='seconds')}, window=15:35~16:10"
+        if now.weekday() >= 5:
+            return False, f"weekend_et={now.isoformat(timespec='seconds')}"
+        start = now.replace(hour=16, minute=5, second=0, microsecond=0)
+        end = now.replace(hour=16, minute=40, second=0, microsecond=0)
+        return (start <= now <= end), f"now_et={now.isoformat(timespec='seconds')}, window=16:05~16:40"
+
+    def _within_weekly_window(self, now_kst: Optional[datetime] = None) -> Tuple[bool, str]:
+        now = now_kst or datetime.now(self.kst)
+        if now.weekday() != 6:
+            return False, f"weekday={now.weekday()}, now_kst={now.isoformat(timespec='seconds')}, required=Sunday"
+        start = now.replace(hour=7, minute=50, second=0, microsecond=0)
+        end = now.replace(hour=8, minute=30, second=0, microsecond=0)
+        return (start <= now <= end), f"now_kst={now.isoformat(timespec='seconds')}, window=07:50~08:30"
 
     def close(self) -> None:
         self.storage.close()
@@ -146,6 +222,314 @@ class AgentLabOrchestrator:
                 out[code] = name
         return out
 
+    @staticmethod
+    def _safe_float(value: Any, default: float = 0.0) -> float:
+        try:
+            return float(value)
+        except Exception:
+            return float(default)
+
+    @staticmethod
+    def _clamp(value: float, lo: float, hi: float) -> float:
+        return max(float(lo), min(float(hi), float(value)))
+
+    @staticmethod
+    def _status_base_signal_strength(status_code: str) -> float:
+        code = str(status_code or "").strip().upper()
+        if code == STATUS_SIGNAL_OK:
+            return 55.0
+        if code == STATUS_DATA_QUALITY_LOW:
+            return 30.0
+        if code == STATUS_MARKET_CLOSED:
+            return 20.0
+        if code == STATUS_INVALID_SIGNAL:
+            return 20.0
+        return 50.0
+
+    @classmethod
+    def _signal_strength_from_payload(cls, payload: Dict[str, Any], topn: int = 12) -> float:
+        rows = []
+        if isinstance(payload, dict):
+            rows = list(payload.get("all_ranked") or payload.get("final") or [])
+        scores: List[float] = []
+        for row in rows[: max(1, int(topn))]:
+            if not isinstance(row, dict):
+                continue
+            score = cls._safe_float(row.get("recommendation_score"), -1.0)
+            if score < 0:
+                continue
+            scores.append(score)
+        if not scores:
+            return 0.0
+        return float(sum(scores) / float(len(scores)))
+
+    def _load_recent_signal_snapshot(self, market: str, yyyymmdd: str, *, lookback_days: int) -> Dict[str, Any]:
+        market_upper = str(market or "").strip().upper()
+        max_lookback = max(1, int(lookback_days))
+        try:
+            run_date = datetime.strptime(str(yyyymmdd), "%Y%m%d").date()
+        except Exception:
+            run_date = datetime.now(self.kst).date()
+        min_date = (run_date - timedelta(days=max_lookback)).strftime("%Y%m%d")
+        max_date = run_date.strftime("%Y%m%d")
+        row = self.storage.query_one(
+            """
+            SELECT *
+            FROM session_signals
+            WHERE market = ? AND session_date >= ? AND session_date <= ?
+            ORDER BY session_date DESC, generated_at DESC, session_signal_id DESC
+            LIMIT 1
+            """,
+            (market_upper, min_date, max_date),
+        )
+        if row is None:
+            return {
+                "market": market_upper,
+                "session_date": "",
+                "status_code": "NO_SIGNAL",
+                "signal_strength": 50.0,
+                "signal_age_days": None,
+                "lookback_days": max_lookback,
+            }
+        try:
+            payload = json.loads(str(row.get("payload_json") or "{}"))
+        except Exception:
+            payload = {}
+        status_code = str(row.get("status_code", "NO_SIGNAL") or "NO_SIGNAL").strip().upper()
+        strength = self._status_base_signal_strength(status_code)
+        payload_strength = self._signal_strength_from_payload(payload)
+        if payload_strength > 0:
+            # Keep a status prior while still reflecting ranked-signal quality.
+            strength = 0.35 * strength + 0.65 * payload_strength
+        strength = self._clamp(strength, 0.0, 100.0)
+        signal_date = str(row.get("session_date", "") or "")
+        age_days: Optional[int] = None
+        try:
+            age_days = max(0, (run_date - datetime.strptime(signal_date, "%Y%m%d").date()).days)
+        except Exception:
+            age_days = None
+        return {
+            "market": market_upper,
+            "session_date": signal_date,
+            "status_code": status_code,
+            "signal_strength": float(strength),
+            "signal_age_days": age_days,
+            "lookback_days": max_lookback,
+        }
+
+    def _build_cross_market_plan(
+        self,
+        *,
+        profile: Any,
+        active_params: Dict[str, Any],
+        market: str,
+        yyyymmdd: str,
+        ledger: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        market_upper = str(market or "").strip().upper()
+        peer_market = "US" if market_upper == "KR" else "KR"
+        constraints = normalize_agent_constraints(getattr(profile, "constraints", {}), risk_style=getattr(profile, "risk_style", ""))
+        cross_market = constraints.get("cross_market", {})
+        if not isinstance(cross_market, dict):
+            cross_market = {}
+
+        base_weights = cross_market.get("base_weights", {})
+        if not isinstance(base_weights, dict):
+            base_weights = {}
+        base_kr = self._safe_float(
+            active_params.get("market_split_kr"),
+            self._safe_float(base_weights.get("KR"), 0.50),
+        )
+        base_kr = self._clamp(base_kr, 0.05, 0.95)
+
+        min_weight = self._safe_float(active_params.get("market_min_weight"), self._safe_float(cross_market.get("min_weight"), 0.20))
+        max_weight = self._safe_float(active_params.get("market_max_weight"), self._safe_float(cross_market.get("max_weight"), 0.80))
+        min_weight = self._clamp(min_weight, 0.05, 0.95)
+        max_weight = self._clamp(max_weight, min_weight, 0.95)
+
+        tilt_scale = self._safe_float(
+            active_params.get("market_tilt_scale"),
+            self._safe_float(cross_market.get("signal_tilt_scale"), 0.16),
+        )
+        tilt_scale = self._clamp(tilt_scale, 0.0, 0.50)
+        lookback_days = int(
+            self._clamp(
+                self._safe_float(active_params.get("market_signal_lookback_days"), 5.0),
+                1.0,
+                15.0,
+            )
+        )
+        enabled = bool(cross_market.get("enabled", True))
+
+        signal_kr = self._load_recent_signal_snapshot("KR", yyyymmdd, lookback_days=lookback_days)
+        signal_us = self._load_recent_signal_snapshot("US", yyyymmdd, lookback_days=lookback_days)
+        signal_strength_kr = float(signal_kr.get("signal_strength", 50.0) or 50.0)
+        signal_strength_us = float(signal_us.get("signal_strength", 50.0) or 50.0)
+        if enabled:
+            signal_gap_norm = (signal_strength_kr - signal_strength_us) / 100.0
+            target_kr = base_kr + (tilt_scale * signal_gap_norm)
+        else:
+            target_kr = base_kr
+        target_kr = self._clamp(target_kr, min_weight, max_weight)
+        target_us = 1.0 - target_kr
+
+        positions = list(ledger.get("positions") or [])
+        exposure_by_market = {"KR": 0.0, "US": 0.0}
+        for pos in positions:
+            pos_market = str(pos.get("market", "")).strip().upper()
+            if pos_market not in exposure_by_market:
+                continue
+            exposure_by_market[pos_market] += float(pos.get("market_value_krw", 0.0) or 0.0)
+        cash_krw = max(0.0, float(ledger.get("cash_krw", 0.0) or 0.0))
+        total_equity = cash_krw + exposure_by_market["KR"] + exposure_by_market["US"]
+        if total_equity <= 0:
+            total_equity = max(1.0, float(getattr(profile, "allocated_capital_krw", 1.0) or 1.0))
+
+        target_weights = {"KR": float(target_kr), "US": float(target_us)}
+        market_target_exposure = total_equity * target_weights[market_upper]
+        market_current_exposure = float(exposure_by_market.get(market_upper, 0.0) or 0.0)
+        market_raw_budget_cap = max(0.0, market_target_exposure - market_current_exposure)
+        market_buy_budget_cap = min(cash_krw, market_raw_budget_cap)
+
+        if _truthy(os.getenv("AGENT_LAB_MAX_FREEDOM", "1")):
+            global_picks = int(float(os.getenv("AGENT_LAB_MAX_FREEDOM_PICKS", "20") or 20))
+        else:
+            global_picks = int(self._safe_float(active_params.get("max_daily_picks"), 20.0))
+        global_picks = max(1, min(200, global_picks))
+        picks = max(1, int(round(global_picks * target_weights[market_upper])))
+        rebalance_gap_ratio = (market_target_exposure - market_current_exposure) / max(total_equity, 1.0)
+        if rebalance_gap_ratio >= 0.15:
+            picks += 2
+        elif rebalance_gap_ratio <= -0.10:
+            picks -= 2
+        picks = max(1, min(global_picks, picks))
+
+        signal_strength_market = signal_strength_kr if market_upper == "KR" else signal_strength_us
+        signal_strength_peer = signal_strength_us if market_upper == "KR" else signal_strength_kr
+        market_overweight = market_current_exposure > (market_target_exposure * 1.05)
+        weakness = max(0.0, signal_strength_peer - signal_strength_market)
+        min_recommendation_score = 0.0
+        if weakness >= 8.0 or market_overweight:
+            min_recommendation_score = 58.0 + 0.35 * weakness + (6.0 if market_overweight else 0.0)
+            min_recommendation_score = self._clamp(min_recommendation_score, 55.0, 88.0)
+
+        return {
+            "enabled": enabled,
+            "market": market_upper,
+            "peer_market": peer_market,
+            "signal_lookback_days": lookback_days,
+            "base_weights": {"KR": float(base_kr), "US": float(1.0 - base_kr)},
+            "target_weights": target_weights,
+            "signal_strength": {"KR": signal_strength_kr, "US": signal_strength_us},
+            "signal_status": {
+                "KR": str(signal_kr.get("status_code", "NO_SIGNAL")),
+                "US": str(signal_us.get("status_code", "NO_SIGNAL")),
+            },
+            "signal_session_date": {
+                "KR": str(signal_kr.get("session_date", "")),
+                "US": str(signal_us.get("session_date", "")),
+            },
+            "signal_age_days": {
+                "KR": signal_kr.get("signal_age_days"),
+                "US": signal_us.get("signal_age_days"),
+            },
+            "cash_krw": cash_krw,
+            "total_equity_krw": total_equity,
+            "exposure_by_market_krw": exposure_by_market,
+            "market_target_exposure_krw": market_target_exposure,
+            "market_current_exposure_krw": market_current_exposure,
+            "buy_budget_cap_krw": market_buy_budget_cap,
+            "max_picks_override": picks,
+            "min_recommendation_score": float(min_recommendation_score),
+        }
+
+    @classmethod
+    def _agent_signal_score(
+        cls,
+        agent_id: str,
+        row: Dict[str, Any],
+        *,
+        session_date: str,
+        index: int,
+    ) -> float:
+        metrics = row.get("metrics", {})
+        if not isinstance(metrics, dict):
+            metrics = {}
+        code = str(row.get("code", "")).strip().upper()
+        rec = cls._safe_float(row.get("recommendation_score"), 0.0)
+        strength = cls._safe_float(metrics.get("strength_avg"), 0.0)
+        vol = cls._safe_float(metrics.get("volume_ratio"), 0.0)
+        bid_ask = cls._safe_float(metrics.get("bid_ask_avg"), 0.0)
+        change = cls._safe_float(metrics.get("current_change_pct"), 0.0)
+        gap = cls._safe_float(metrics.get("gap_pct"), 0.0)
+
+        seed_text = f"{agent_id}:{session_date}:{code}:{index}"
+        seed = sum((idx + 1) * ord(ch) for idx, ch in enumerate(seed_text))
+        jitter = ((seed % 997) / 997.0) - 0.5  # [-0.5, +0.5)
+
+        if agent_id == "agent_a":
+            return rec + 0.12 * strength + 4.0 * max(change, 0.0) + 2.0 * max(gap, 0.0) + 0.8 * vol
+        if agent_id == "agent_b":
+            downside = abs(min(change, 0.0)) + abs(min(gap, 0.0))
+            return rec + 0.08 * strength + 0.5 * bid_ask + 0.4 * vol - 3.5 * downside
+        # agent_c: diversify exploration with deterministic jitter.
+        crowd_penalty = rec / 100.0
+        return rec + 0.05 * strength + 1.0 * vol + 0.8 * bid_ask - 0.8 * crowd_penalty + 6.0 * jitter
+
+    def _build_agent_specific_payload(
+        self,
+        *,
+        base_payload: Dict[str, Any],
+        agent_id: str,
+        market: str,
+        session_date: str,
+    ) -> Dict[str, Any]:
+        payload = copy.deepcopy(base_payload if isinstance(base_payload, dict) else {})
+        rows = list(payload.get("all_ranked") or payload.get("final") or [])
+        rows = [row for row in rows if isinstance(row, dict)]
+        if not rows:
+            return payload
+
+        scored: List[Tuple[float, int, Dict[str, Any]]] = []
+        for idx, row in enumerate(rows, start=1):
+            score = self._agent_signal_score(agent_id, row, session_date=session_date, index=idx)
+            rank = int(row.get("rank", idx) or idx)
+            scored.append((score, rank, row))
+        scored.sort(key=lambda item: (item[0], -item[1]), reverse=True)
+        reordered = [row for _, __, row in scored]
+
+        if agent_id == "agent_c" and len(reordered) > 8:
+            # Interleave head/mid/tail to widen exploration while keeping strong names.
+            head = reordered[: max(6, len(reordered) // 3)]
+            tail = reordered[max(6, len(reordered) // 3) :]
+            mixed: List[Dict[str, Any]] = []
+            while head or tail:
+                if head:
+                    mixed.append(head.pop(0))
+                if tail:
+                    mixed.append(tail.pop(0))
+                if tail:
+                    mixed.append(tail.pop(-1))
+            reordered = mixed
+
+        for idx, row in enumerate(reordered, start=1):
+            row["rank"] = idx
+
+        topn = int(float(os.getenv("AGENT_LAB_AGENT_SIGNAL_TOPN", "80") or 80))
+        topn = max(3, min(len(reordered), topn))
+        payload["all_ranked"] = reordered
+        payload["final"] = reordered[:topn]
+        payload["agent_signal_view"] = {
+            "agent_id": agent_id,
+            "market": str(market).upper(),
+            "session_date": session_date,
+            "base_ranked_count": len(rows),
+            "view_ranked_count": len(reordered),
+            "view_topn": topn,
+            "mode": "agent_specific_reorder",
+        }
+        return payload
+
     def _load_symbol_name_map(self, market: str, yyyymmdd: str) -> Dict[str, str]:
         signal = self.storage.get_latest_session_signal(str(market).upper(), str(yyyymmdd))
         if not signal:
@@ -217,13 +601,8 @@ class AgentLabOrchestrator:
         return datetime.now().strftime("%Y%m%d")
 
     @staticmethod
-    def _sanitized_agent_constraints() -> Dict[str, Any]:
-        return {
-            "markets": ["KR", "US"],
-            "budget_isolated": True,
-            "cross_agent_budget_access": False,
-            "autonomy_mode": "max_freedom_realtime",
-        }
+    def _sanitized_agent_constraints(risk_style: str = "") -> Dict[str, Any]:
+        return normalize_agent_constraints({}, risk_style=risk_style)
 
     def _find_session_json(self, market: str, yyyymmdd: str) -> Optional[Path]:
         market_tag = market.strip().lower()
@@ -281,6 +660,74 @@ class AgentLabOrchestrator:
             if start_key <= d <= end_key:
                 count += 1
         return count
+
+    def _proposal_count(self, agent_id: str, week_start: date, week_end: date) -> int:
+        start_key = week_start.strftime("%Y%m%d")
+        end_key = week_end.strftime("%Y%m%d")
+        row = self.storage.query_one(
+            """
+            SELECT COUNT(*) AS c
+            FROM order_proposals
+            WHERE agent_id = ? AND session_date >= ? AND session_date <= ?
+            """,
+            (str(agent_id), start_key, end_key),
+        )
+        return int((row or {}).get("c", 0) or 0)
+
+    def _risk_violation_stats(self, agent_id: str, week_start: date, week_end: date) -> Dict[str, float]:
+        violations = self._risk_violation_count(agent_id, week_start, week_end)
+        proposals = self._proposal_count(agent_id, week_start, week_end)
+        rate = (float(violations) / float(proposals)) if proposals > 0 else 0.0
+        return {
+            "risk_violations": int(violations),
+            "proposal_count": int(proposals),
+            "risk_violation_rate": float(rate),
+        }
+
+    @staticmethod
+    def _shift_week(week_start: date, weeks_back: int) -> Tuple[date, date]:
+        start = week_start - timedelta(days=7 * int(weeks_back))
+        end = start + timedelta(days=6)
+        return start, end
+
+    @staticmethod
+    def _is_high_risk_week(stats: Dict[str, float]) -> bool:
+        violations = int(stats.get("risk_violations", 0) or 0)
+        proposals = int(stats.get("proposal_count", 0) or 0)
+        rate = float(stats.get("risk_violation_rate", 0.0) or 0.0)
+        if violations >= FORCED_CONSERVATIVE_MIN_VIOLATIONS:
+            return True
+        if proposals >= PROMOTION_MIN_PROPOSALS and rate >= FORCED_CONSERVATIVE_MIN_RATE:
+            return True
+        return False
+
+    @staticmethod
+    def _build_forced_conservative_params(base_params: Dict[str, Any]) -> Dict[str, Any]:
+        params = dict(base_params)
+
+        def _f(key: str, default: float) -> float:
+            try:
+                return float(params.get(key, default) or default)
+            except Exception:
+                return default
+
+        def _i(key: str, default: int) -> int:
+            try:
+                return int(float(params.get(key, default) or default))
+            except Exception:
+                return default
+
+        params["risk_budget_ratio"] = min(_f("risk_budget_ratio", 1.0), 0.60)
+        params["exposure_cap_ratio"] = min(_f("exposure_cap_ratio", 1.0), 0.70)
+        params["position_cap_ratio"] = min(_f("position_cap_ratio", 1.0), 0.33)
+        params["max_daily_picks"] = max(1, min(_i("max_daily_picks", 20), 5))
+        params["min_strength"] = max(_f("min_strength", 0.0), 120.0)
+        params["min_vol_ratio"] = max(_f("min_vol_ratio", 0.0), 0.20)
+        params["min_bid_ask_ratio"] = max(_f("min_bid_ask_ratio", 0.0), 1.10)
+        params["min_pass_conditions"] = max(_i("min_pass_conditions", 1), 3)
+        params["day_loss_limit"] = max(_f("day_loss_limit", -1.0), -0.02)
+        params["week_loss_limit"] = max(_f("week_loss_limit", -1.0), -0.05)
+        return params
 
     def _usdkrw_rate(self, yyyymmdd: str) -> Optional[float]:
         default_rate = float(os.getenv("AGENT_LAB_USDKRW_DEFAULT", "1300") or 1300.0)
@@ -428,7 +875,7 @@ class AgentLabOrchestrator:
                 philosophy=old_profile.philosophy,
                 allocated_capital_krw=old_profile.allocated_capital_krw,
                 risk_style=old_profile.risk_style,
-                constraints=self._sanitized_agent_constraints(),
+                constraints=self._sanitized_agent_constraints(old_profile.risk_style),
             )
             self.storage.upsert_agent(
                 agent_id=refreshed_profile.agent_id,
@@ -598,13 +1045,23 @@ class AgentLabOrchestrator:
             raise RuntimeError("no agents registered. run `init` first.")
         output_rows: List[Dict[str, Any]] = []
         usdkrw = self._usdkrw_rate(yyyymmdd) if market == "US" else 1.0
-        symbol_name_map = self._build_symbol_name_map_from_payload(signal.get("payload", {}))
+        base_payload = signal.get("payload", {})
+        if not isinstance(base_payload, dict):
+            base_payload = {}
+        symbol_name_map = self._build_symbol_name_map_from_payload(base_payload)
         for agent in agents:
             agent_id = str(agent["agent_id"])
             profile = profile_from_agent_row(agent)
             active = self.registry.get_active_strategy(agent_id)
             active_params = dict(active.get("params", {}) or {})
             ledger = self.accounting.rebuild_agent_ledger(agent_id)
+            cross_market_plan = self._build_cross_market_plan(
+                profile=profile,
+                active_params=active_params,
+                market=market,
+                yyyymmdd=yyyymmdd,
+                ledger=ledger,
+            )
             day_ret, week_ret = self.accounting.daily_and_weekly_return(agent_id, yyyymmdd)
             position_qty_by_symbol: Dict[str, float] = {}
             for pos in list(ledger.get("positions") or []):
@@ -616,14 +1073,32 @@ class AgentLabOrchestrator:
                 if symbol and qty > 0:
                     position_qty_by_symbol[symbol] = qty
 
+            agent_signal_payload = self._build_agent_specific_payload(
+                base_payload=base_payload,
+                agent_id=agent_id,
+                market=market,
+                session_date=yyyymmdd,
+            )
             proposed_orders, rationale = self.agent_engine.propose_orders(
                 agent=profile,
                 market=market,
-                session_payload=signal["payload"],
+                session_payload=agent_signal_payload,
                 params=active_params,
                 available_cash_krw=float(ledger["cash_krw"]),
                 current_positions=list(ledger.get("positions", [])),
                 usdkrw_rate=usdkrw,
+                market_budget_cap_krw=float(cross_market_plan.get("buy_budget_cap_krw", 0.0) or 0.0),
+                max_picks_override=int(cross_market_plan.get("max_picks_override", 1) or 1),
+                min_recommendation_score=(
+                    None
+                    if float(cross_market_plan.get("min_recommendation_score", 0.0) or 0.0) <= 0
+                    else float(cross_market_plan.get("min_recommendation_score", 0.0) or 0.0)
+                ),
+            )
+            rationale = (
+                f"{rationale} | cross_market: target_weight={float(cross_market_plan.get('target_weights', {}).get(market, 0.0)):.3f}, "
+                f"budget_cap_krw={float(cross_market_plan.get('buy_budget_cap_krw', 0.0) or 0.0):.0f}, "
+                f"max_picks={int(cross_market_plan.get('max_picks_override', 1) or 1)}"
             )
             raw_orders = [o.__dict__ for o in proposed_orders]
             decision = self.risk.evaluate(
@@ -689,6 +1164,7 @@ class AgentLabOrchestrator:
                     "blocked_reason": decision.blocked_reason,
                     "accepted_orders": decision.accepted_orders,
                     "dropped_orders": decision.dropped_orders,
+                    "cross_market_plan": cross_market_plan,
                 },
                 ts=now_iso(),
             )
@@ -702,6 +1178,8 @@ class AgentLabOrchestrator:
                     "orders": decision.accepted_orders,
                     "risk_metrics": decision.metrics,
                     "fx_rate": usdkrw,
+                    "agent_signal_view": agent_signal_payload.get("agent_signal_view", {}),
+                    "cross_market_plan": cross_market_plan,
                 }
             )
 
@@ -885,6 +1363,25 @@ class AgentLabOrchestrator:
 
     def preopen_plan_report(self, market: str, yyyymmdd: str) -> Dict[str, Any]:
         market = str(market).strip().upper()
+        if self._strict_report_windows_enabled():
+            ok, detail = self._within_preopen_window(market)
+            if not ok:
+                return {
+                    "market": market,
+                    "date": yyyymmdd,
+                    "skipped": True,
+                    "reason": "outside_preopen_window",
+                    "detail": detail,
+                    "generated_at": now_iso(),
+                }
+        if self._event_already_reported("preopen_plan", market, yyyymmdd):
+            return {
+                "market": market,
+                "date": yyyymmdd,
+                "skipped": True,
+                "reason": "preopen_already_reported",
+                "generated_at": now_iso(),
+            }
         agents = self.storage.list_agents()
         if not agents:
             raise RuntimeError("no agents registered. run `init` first.")
@@ -1032,6 +1529,25 @@ class AgentLabOrchestrator:
 
     def session_close_report(self, market: str, yyyymmdd: str) -> Dict[str, Any]:
         market = str(market).strip().upper()
+        if self._strict_report_windows_enabled():
+            ok, detail = self._within_close_report_window(market)
+            if not ok:
+                return {
+                    "market": market,
+                    "date": yyyymmdd,
+                    "skipped": True,
+                    "reason": "outside_close_report_window",
+                    "detail": detail,
+                    "generated_at": now_iso(),
+                }
+        if self._event_already_reported("session_close_report", market, yyyymmdd):
+            return {
+                "market": market,
+                "date": yyyymmdd,
+                "skipped": True,
+                "reason": "close_report_already_reported",
+                "generated_at": now_iso(),
+            }
         agents = self.storage.list_agents()
         if not agents:
             raise RuntimeError("no agents registered. run `init` first.")
@@ -1198,10 +1714,11 @@ class AgentLabOrchestrator:
                 f"평가자산={float(r['equity_krw']):.0f}, 실행제안={int(t.get('EXECUTED', 0))}"
             )
         summary = summary_text.strip()
-        if summary:
-            if len(summary) > 220:
-                summary = summary[:220] + "..."
-            msg_lines.append(f"토의요약={summary}")
+        discussion_summary = str(moderator.get("summary", "")).strip()
+        if discussion_summary and discussion_summary != summary:
+            if len(discussion_summary) > 220:
+                discussion_summary = discussion_summary[:220] + "..."
+            msg_lines.append(f"토의요약={discussion_summary}")
         self._notify("\n".join(msg_lines), event="session_close_report")
         return payload
 
@@ -1290,6 +1807,32 @@ class AgentLabOrchestrator:
         return score_board
 
     def weekly_council(self, week_id: str) -> Dict[str, Any]:
+        if not self._allow_offschedule_weekly():
+            ok, detail = self._within_weekly_window()
+            if not ok:
+                return {
+                    "week_id": week_id,
+                    "skipped": True,
+                    "reason": "outside_weekly_window",
+                    "detail": detail,
+                    "generated_at": now_iso(),
+                }
+        existing = self.storage.query_one(
+            """
+            SELECT weekly_council_id
+            FROM weekly_councils
+            WHERE week_id = ?
+            LIMIT 1
+            """,
+            (str(week_id),),
+        )
+        if existing:
+            return {
+                "week_id": week_id,
+                "skipped": True,
+                "reason": "weekly_already_reported",
+                "generated_at": now_iso(),
+            }
         week_start, week_end = parse_week_id(week_id)
         agents = self.storage.list_agents()
         if not agents:
@@ -1322,13 +1865,18 @@ class AgentLabOrchestrator:
 
         scores = self._weekly_score_board(week_rows)
         scored_rows: List[Dict[str, Any]] = []
+        risk_stats_by_agent: Dict[str, Dict[str, float]] = {}
         for row in week_rows:
             aid = str(row["agent_id"])
+            stats = self._risk_violation_stats(aid, week_start, week_end)
+            risk_stats_by_agent[aid] = dict(stats)
             scored_rows.append(
                 {
                     **row,
                     "score": float(scores.get(aid, 0.0)),
-                    "risk_violations": self._risk_violation_count(aid, week_start, week_end),
+                    "risk_violations": int(stats["risk_violations"]),
+                    "proposal_count": int(stats["proposal_count"]),
+                    "risk_violation_rate": float(stats["risk_violation_rate"]),
                 }
             )
         scored_rows.sort(
@@ -1402,43 +1950,95 @@ class AgentLabOrchestrator:
             (prev_week_id,),
         )
         prev_scores: Dict[str, float] = {}
-        prev_risk: Dict[str, int] = {}
         if prev_decision:
             try:
                 decoded = json.loads(str(prev_decision.get("decision_json") or "{}"))
                 if isinstance(decoded, dict):
                     prev_scores = dict(decoded.get("score_board", {}))
-                    prev_rows = list(decoded.get("rows_scored", []))
-                    for r in prev_rows:
-                        aid = str(r.get("agent_id", ""))
-                        prev_risk[aid] = int(r.get("risk_violations", 0) or 0)
             except Exception:
                 prev_scores = {}
-                prev_risk = {}
 
+        weekly_stats_by_agent: Dict[str, Dict[str, Dict[str, float]]] = {}
+        for agent in agents:
+            aid = str(agent["agent_id"])
+            prev1_start, prev1_end = self._shift_week(week_start, 1)
+            prev2_start, prev2_end = self._shift_week(week_start, 2)
+            weekly_stats_by_agent[aid] = {
+                "w0": dict(risk_stats_by_agent.get(aid, self._risk_violation_stats(aid, week_start, week_end))),
+                "w1": self._risk_violation_stats(aid, prev1_start, prev1_end),
+                "w2": self._risk_violation_stats(aid, prev2_start, prev2_end),
+            }
+
+        forced_conservative_agents: List[str] = []
+        promotion_evaluation: Dict[str, Dict[str, Any]] = {}
         for agent in agents:
             aid = str(agent["agent_id"])
             active = active_strategy_map[aid]
             row = next((x for x in scored_rows if x["agent_id"] == aid), {})
             suggested_map = discussion.get("agent_param_suggestions", {}) or {}
             params = dict(suggested_map.get(aid) or active["params"])
+
+            stats = weekly_stats_by_agent.get(aid, {})
+            w0 = dict(stats.get("w0", {}))
+            w1 = dict(stats.get("w1", {}))
+            w2 = dict(stats.get("w2", {}))
+
             current_score = float(scores.get(aid, 0.0))
-            current_risk = int(row.get("risk_violations", 0) or 0) if row else 0
             prev_score = float(prev_scores.get(aid, 0.0))
-            prev_risk_count = int(prev_risk.get(aid, 0) or 0)
-            promote = (
+            current_risk = int(w0.get("risk_violations", 0) or 0)
+            prev_risk_count = int(w1.get("risk_violations", 0) or 0)
+            current_rate = float(w0.get("risk_violation_rate", 0.0) or 0.0)
+            prev_rate = float(w1.get("risk_violation_rate", 0.0) or 0.0)
+            current_props = int(w0.get("proposal_count", 0) or 0)
+            prev_props = int(w1.get("proposal_count", 0) or 0)
+
+            normal_promote = (
                 current_score >= PROMOTION_SCORE_THRESHOLD
                 and prev_score >= PROMOTION_SCORE_THRESHOLD
-                and current_risk == 0
-                and prev_risk_count == 0
+                and current_risk <= PROMOTION_MAX_RISK_VIOLATIONS
+                and prev_risk_count <= PROMOTION_MAX_RISK_VIOLATIONS
+                and current_rate <= PROMOTION_MAX_RISK_RATE
+                and prev_rate <= PROMOTION_MAX_RISK_RATE
+                and current_props >= PROMOTION_MIN_PROPOSALS
+                and prev_props >= PROMOTION_MIN_PROPOSALS
             )
+            force_conservative = (
+                self._is_high_risk_week(w0)
+                and self._is_high_risk_week(w1)
+                and self._is_high_risk_week(w2)
+            )
+
+            promote = bool(force_conservative or normal_promote)
+            mode = "normal_promote" if normal_promote else "hold"
+            if force_conservative:
+                params = self._build_forced_conservative_params(params)
+                mode = "forced_conservative_promote"
+                forced_conservative_agents.append(aid)
+
+            promotion_evaluation[aid] = {
+                "mode": mode,
+                "normal_promote": bool(normal_promote),
+                "force_conservative": bool(force_conservative),
+                "score_current": current_score,
+                "score_prev": prev_score,
+                "risk_violations_current": current_risk,
+                "risk_violations_prev": prev_risk_count,
+                "risk_violation_rate_current": current_rate,
+                "risk_violation_rate_prev": prev_rate,
+                "proposal_count_current": current_props,
+                "proposal_count_prev": prev_props,
+            }
+
             reg = self.registry.register_strategy_version(
                 agent_id=aid,
                 params=params,
                 notes=(
                     f"weekly council update ({week_id}); "
                     f"score={current_score:.4f}, prev_score={prev_score:.4f}, "
-                    f"risk={current_risk}, prev_risk={prev_risk_count}, promote={promote}"
+                    f"risk={current_risk}, prev_risk={prev_risk_count}, "
+                    f"rate={current_rate:.4f}, prev_rate={prev_rate:.4f}, "
+                    f"proposals={current_props}, prev_proposals={prev_props}, "
+                    f"mode={mode}, promote={promote}"
                 ),
                 promote=promote,
             )
@@ -1453,7 +2053,25 @@ class AgentLabOrchestrator:
             "rows_scored": scored_rows,
             "promoted_versions": promoted_versions,
             "promotion_score_threshold": PROMOTION_SCORE_THRESHOLD,
-            "promotion_rule": "current_score>=threshold && prev_score>=threshold && current_week_risk_violations==0 && prev_week_risk_violations==0",
+            "promotion_rule": (
+                "normal: score_current>=0.60 && score_prev>=0.60 && "
+                "risk_current<=3 && risk_prev<=3 && rate_current<=0.15 && rate_prev<=0.15 && "
+                "proposal_current>=10 && proposal_prev>=10; "
+                "forced_conservative: 3-week consecutive high-risk "
+                "(violations>=4 OR (proposals>=10 && rate>=0.25))"
+            ),
+            "promotion_policy": {
+                "score_threshold": PROMOTION_SCORE_THRESHOLD,
+                "max_risk_violations": PROMOTION_MAX_RISK_VIOLATIONS,
+                "max_risk_rate": PROMOTION_MAX_RISK_RATE,
+                "min_proposals": PROMOTION_MIN_PROPOSALS,
+                "forced_consecutive_weeks": FORCED_CONSERVATIVE_CONSECUTIVE_WEEKS,
+                "forced_min_violations": FORCED_CONSERVATIVE_MIN_VIOLATIONS,
+                "forced_min_rate": FORCED_CONSERVATIVE_MIN_RATE,
+            },
+            "forced_conservative_agents": forced_conservative_agents,
+            "weekly_risk_stats_by_agent": weekly_stats_by_agent,
+            "promotion_evaluation": promotion_evaluation,
             "discussion": discussion,
             "llm_alerts": llm_alerts,
         }

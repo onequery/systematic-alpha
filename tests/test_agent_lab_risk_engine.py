@@ -10,6 +10,7 @@ class RiskEngineTests(unittest.TestCase):
         decision = engine.evaluate(
             status_code=STATUS_MARKET_CLOSED,
             allocated_capital_krw=3_333_333,
+            available_cash_krw=3_333_333,
             day_return_pct=0.0,
             week_return_pct=0.0,
             current_exposure_krw=0.0,
@@ -23,6 +24,7 @@ class RiskEngineTests(unittest.TestCase):
         decision = engine.evaluate(
             status_code=STATUS_SIGNAL_OK,
             allocated_capital_krw=3_333_333,
+            available_cash_krw=3_333_333,
             day_return_pct=-0.03,
             week_return_pct=0.0,
             current_exposure_krw=0.0,
@@ -42,6 +44,7 @@ class RiskEngineTests(unittest.TestCase):
         decision = engine.evaluate(
             status_code=STATUS_SIGNAL_OK,
             allocated_capital_krw=3_333_333,
+            available_cash_krw=3_333_333,
             day_return_pct=0.01,
             week_return_pct=0.02,
             current_exposure_krw=0.0,
@@ -54,4 +57,3 @@ class RiskEngineTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

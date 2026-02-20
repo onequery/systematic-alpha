@@ -17,28 +17,50 @@ def _today() -> str:
     return datetime.now().strftime("%Y-%m-%d")
 
 
+def _truthy(value: str) -> bool:
+    norm = str(value or "").strip().lower()
+    return norm in {"1", "true", "yes", "y", "on"}
+
+
 class LLMClient:
     def __init__(self, storage: AgentLabStorage):
         self.storage = storage
-        self.enabled = str(os.getenv("AGENT_LAB_ENABLED", "0")).strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "y",
-            "on",
-        }
         self.api_key = str(os.getenv("OPENAI_API_KEY", "")).strip()
+        enabled_raw = os.getenv("AGENT_LAB_ENABLED")
+        if enabled_raw is None or str(enabled_raw).strip() == "":
+            # Backward-compatible default: if key exists, enable LLM by default.
+            self.enabled = bool(self.api_key)
+        else:
+            self.enabled = _truthy(str(enabled_raw))
         self.model = str(os.getenv("OPENAI_MODEL", "gpt-4o-mini")).strip() or "gpt-4o-mini"
         self.max_daily_cost = float(os.getenv("OPENAI_MAX_DAILY_COST", "5.0") or 5.0)
         self._client = None
-        if self.enabled and self.api_key and OpenAI is not None:
+        self._disabled_reason = ""
+        if not self.enabled:
+            self._disabled_reason = "disabled_by_env"
+        elif not self.api_key:
+            self._disabled_reason = "missing_api_key"
+        elif OpenAI is None:
+            self._disabled_reason = "openai_sdk_not_installed"
+        else:
             try:
                 self._client = OpenAI(api_key=self.api_key)
-            except Exception:
+            except Exception as exc:
                 self._client = None
+                self._disabled_reason = f"client_init_failed:{exc}"
+
+        if self.max_daily_cost <= 0:
+            self._disabled_reason = "daily_budget_nonpositive"
 
     def is_live(self) -> bool:
         return self.enabled and self._client is not None and self.max_daily_cost > 0
+
+    def unavailable_reason(self) -> str:
+        if self.is_live():
+            return ""
+        if self._disabled_reason:
+            return self._disabled_reason
+        return "llm_disabled_or_unavailable"
 
     def _estimate_cost(self, prompt_tokens: int, completion_tokens: int) -> float:
         in_cost = prompt_tokens * 0.0000005
@@ -73,7 +95,7 @@ class LLMClient:
         if not self.is_live():
             return {
                 "mode": "fallback",
-                "reason": "llm_disabled_or_unavailable",
+                "reason": self.unavailable_reason(),
                 "result": fallback,
             }
         if not self._within_budget():

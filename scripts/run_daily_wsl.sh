@@ -112,7 +112,7 @@ CMD=(
   --output-json "$OUTPUT_JSON"
   --analytics-dir "$OUT_BASE/analytics"
   --overnight-report-path "$OUT_BASE/selection_overnight_report.csv"
-  --long-only
+  --allow-short-bias
   --invalidate-on-low-coverage
 )
 

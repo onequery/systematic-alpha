@@ -29,6 +29,11 @@ DEFAULT_STRATEGY_PARAMS: Dict[str, Any] = {
     "day_loss_limit": -1.0,
     "week_loss_limit": -1.0,
     "risk_budget_ratio": 1.0,
+    "market_split_kr": 0.50,
+    "market_min_weight": 0.20,
+    "market_max_weight": 0.80,
+    "market_tilt_scale": 0.18,
+    "market_signal_lookback_days": 5,
 }
 
 
@@ -49,6 +54,11 @@ ALLOWED_PARAM_RANGES: Dict[str, List[float]] = {
     "day_loss_limit": [-1.0, -0.0001],
     "week_loss_limit": [-1.0, -0.0001],
     "risk_budget_ratio": [0.01, 2.0],
+    "market_split_kr": [0.05, 0.95],
+    "market_min_weight": [0.05, 0.95],
+    "market_max_weight": [0.05, 0.95],
+    "market_tilt_scale": [0.0, 0.50],
+    "market_signal_lookback_days": [1.0, 15.0],
 }
 
 
@@ -76,6 +86,7 @@ class StrategyRegistry:
                 "intraday_monitor_interval_sec",
                 "intraday_monitor_enabled",
                 "max_daily_picks",
+                "market_signal_lookback_days",
             }:
                 out[key] = int(max(lo, min(hi, val)))
             else:

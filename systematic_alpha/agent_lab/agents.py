@@ -15,6 +15,75 @@ from systematic_alpha.agent_lab.schemas import (
 from systematic_alpha.agent_lab.strategy_registry import ALLOWED_PARAM_RANGES, StrategyRegistry
 
 
+def _safe_float(value: Any, default: float) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def _default_cross_market_constraints(risk_style: str) -> Dict[str, Any]:
+    style = str(risk_style or "").strip().lower()
+    tilt_scale = {
+        "aggressive": 0.22,
+        "conservative": 0.12,
+        "diversifier": 0.16,
+    }.get(style, 0.16)
+    return {
+        "enabled": True,
+        "base_weights": {"KR": 0.50, "US": 0.50},
+        "min_weight": 0.20,
+        "max_weight": 0.80,
+        "signal_tilt_scale": tilt_scale,
+    }
+
+
+def _normalize_markets(raw: Any) -> List[str]:
+    markets: List[str] = []
+    for value in list(raw or []):
+        token = str(value or "").strip().upper()
+        if token in {"KR", "US"} and token not in markets:
+            markets.append(token)
+    for required in ["KR", "US"]:
+        if required not in markets:
+            markets.append(required)
+    return markets
+
+
+def normalize_agent_constraints(raw: Any, *, risk_style: str = "") -> Dict[str, Any]:
+    constraints = dict(raw) if isinstance(raw, dict) else {}
+    constraints["markets"] = _normalize_markets(constraints.get("markets") or ["KR", "US"])
+    constraints["budget_isolated"] = bool(constraints.get("budget_isolated", True))
+    constraints["cross_agent_budget_access"] = bool(constraints.get("cross_agent_budget_access", False))
+    constraints["autonomy_mode"] = str(constraints.get("autonomy_mode", "max_freedom_realtime") or "max_freedom_realtime")
+
+    default_cross_market = _default_cross_market_constraints(risk_style)
+    raw_cross_market = constraints.get("cross_market")
+    cross_market = dict(raw_cross_market) if isinstance(raw_cross_market, dict) else {}
+
+    base_weights_raw = cross_market.get("base_weights")
+    base_weights = dict(base_weights_raw) if isinstance(base_weights_raw, dict) else {}
+    base_kr = _safe_float(base_weights.get("KR"), _safe_float(base_weights.get("kr"), default_cross_market["base_weights"]["KR"]))
+    base_kr = min(0.95, max(0.05, base_kr))
+    base_us = 1.0 - base_kr
+
+    min_weight = _safe_float(cross_market.get("min_weight"), default_cross_market["min_weight"])
+    max_weight = _safe_float(cross_market.get("max_weight"), default_cross_market["max_weight"])
+    min_weight = min(0.95, max(0.05, min_weight))
+    max_weight = min(0.95, max(min_weight, max_weight))
+
+    cross_market["enabled"] = bool(cross_market.get("enabled", default_cross_market["enabled"]))
+    cross_market["base_weights"] = {"KR": base_kr, "US": base_us}
+    cross_market["min_weight"] = min_weight
+    cross_market["max_weight"] = max_weight
+    cross_market["signal_tilt_scale"] = min(
+        0.50,
+        max(0.0, _safe_float(cross_market.get("signal_tilt_scale"), default_cross_market["signal_tilt_scale"])),
+    )
+    constraints["cross_market"] = cross_market
+    return constraints
+
+
 def build_default_agent_profiles(total_capital_krw: float, count: int = 3) -> List[AgentProfile]:
     size = max(1, min(3, int(count)))
     per_agent = float(total_capital_krw) / float(size)
@@ -52,12 +121,7 @@ def build_default_agent_profiles(total_capital_krw: float, count: int = 3) -> Li
                 philosophy=philosophy,
                 allocated_capital_krw=per_agent,
                 risk_style=risk,
-                constraints={
-                    "markets": ["KR", "US"],
-                    "budget_isolated": True,
-                    "cross_agent_budget_access": False,
-                    "autonomy_mode": "max_freedom_realtime",
-                },
+                constraints=normalize_agent_constraints({}, risk_style=risk),
             )
         )
     return profiles
@@ -74,7 +138,7 @@ def profile_from_agent_row(row: Dict[str, Any]) -> AgentProfile:
         philosophy=str(row.get("philosophy", "")).strip(),
         allocated_capital_krw=float(row.get("allocated_capital_krw", 0.0) or 0.0),
         risk_style=str(row.get("risk_style", "")).strip(),
-        constraints=constraints,
+        constraints=normalize_agent_constraints(constraints, risk_style=str(row.get("risk_style", ""))),
     )
 
 
@@ -219,11 +283,15 @@ class AgentDecisionEngine:
         available_cash_krw: float,
         current_positions: Optional[List[Dict[str, Any]]] = None,
         usdkrw_rate: float = 1300.0,
+        market_budget_cap_krw: Optional[float] = None,
+        max_picks_override: Optional[int] = None,
+        min_recommendation_score: Optional[float] = None,
     ) -> Tuple[List[ProposedOrder], str]:
         candidates = self._filter_candidates(_extract_ranked_candidates(session_payload), params=params)
         if not candidates:
             return [], "No ranked candidates from session signal payload."
 
+        max_freedom = self._max_freedom_mode()
         market_norm = str(market).strip().upper()
         fx_rate = float(usdkrw_rate or 1300.0)
         if market_norm != "US":
@@ -231,12 +299,18 @@ class AgentDecisionEngine:
         if fx_rate <= 0:
             fx_rate = 1300.0 if market_norm == "US" else 1.0
 
-        if self._max_freedom_mode():
+        if max_freedom:
             max_picks = int(float(os.getenv("AGENT_LAB_MAX_FREEDOM_PICKS", "20") or 20))
             max_picks = max(1, min(len(candidates), max_picks))
         else:
             max_picks = int(params.get("max_daily_picks", 3) or 3)
             max_picks = max(1, min(200, max_picks))
+        if max_picks_override is not None:
+            try:
+                override = int(float(max_picks_override))
+            except Exception:
+                override = max_picks
+            max_picks = max(1, min(len(candidates), override))
         picked = self._select_candidates(agent.agent_id, candidates, max_picks=max_picks)
         if not picked:
             return [], "No candidate passed agent-specific picker."
@@ -248,22 +322,51 @@ class AgentDecisionEngine:
         ]
         held_symbols = {str(row.get("symbol", "")).strip().upper(): row for row in held_market_positions}
         target_symbols = {str(row.get("code", "")).strip().upper() for row in picked}
+        ranked_by_code = {str(row.get("code", "")).strip().upper(): row for row in candidates}
+
+        allow_rotation_sell = (not max_freedom) or _truthy(os.getenv("AGENT_LAB_ENABLE_ROTATION_SELL", "0"))
+        rotation_drop_rank = int(float(os.getenv("AGENT_LAB_ROTATION_DROP_RANK", str(max(10, max_picks * 2))) or max(10, max_picks * 2)))
+        rotation_drop_score = float(os.getenv("AGENT_LAB_ROTATION_DROP_SCORE", "45") or 45.0)
+        allow_add_to_held = max_freedom or _truthy(os.getenv("AGENT_LAB_ALLOW_ADD_TO_HELD", "0"))
+        expand_pool = max_freedom or _truthy(os.getenv("AGENT_LAB_EXPAND_BUY_POOL", "1"))
 
         est_sell_krw = sum(float(row.get("market_value_krw", 0.0) or 0.0) for sym, row in held_symbols.items() if sym not in target_symbols)
         base_cash = max(0.0, float(available_cash_krw))
         budget_ratio = self._risk_budget_ratio(agent.agent_id, params)
         tradable_cash_krw = base_cash + max(0.0, est_sell_krw)
-        if self._max_freedom_mode():
+        if max_freedom:
             budget_cap = tradable_cash_krw
         else:
             budget_cap = tradable_cash_krw * min(1.0, max(0.01, budget_ratio))
-        per_order_budget = budget_cap / max(1, len(picked))
+        applied_market_budget_cap = None
+        if market_budget_cap_krw is not None:
+            try:
+                cap_val = max(0.0, float(market_budget_cap_krw))
+            except Exception:
+                cap_val = None
+            if cap_val is not None:
+                applied_market_budget_cap = cap_val
+                budget_cap = min(budget_cap, cap_val)
+        per_order_budget = budget_cap / max(1, max_picks)
         orders: List[ProposedOrder] = []
+        sell_symbols: set[str] = set()
 
-        # First, rotate out symbols that are no longer in target set.
+        # Rotate out stale symbols.
         for sym, row in held_symbols.items():
             if sym in target_symbols:
                 continue
+            if not allow_rotation_sell:
+                continue
+            rank_row = ranked_by_code.get(sym)
+            if max_freedom:
+                should_sell = False
+                if rank_row:
+                    rank_val = int(rank_row.get("rank", 999999) or 999999)
+                    score_val = float(rank_row.get("recommendation_score", 0.0) or 0.0)
+                    if rank_val >= rotation_drop_rank or score_val <= rotation_drop_score:
+                        should_sell = True
+                if not should_sell:
+                    continue
             qty = float(row.get("quantity", 0.0) or 0.0)
             ref_price_krw = float(row.get("avg_price", 0.0) or 0.0)
             if qty <= 0 or ref_price_krw <= 0:
@@ -285,19 +388,57 @@ class AgentDecisionEngine:
                     ),
                 )
             )
+            sell_symbols.add(sym)
 
-        for c in picked:
-            if c["code"] in held_symbols:
+        buy_pool = list(picked)
+        if expand_pool:
+            seen_codes = {str(x.get("code", "")).strip().upper() for x in buy_pool}
+            for c in candidates:
+                code = str(c.get("code", "")).strip().upper()
+                if not code or code in seen_codes:
+                    continue
+                buy_pool.append(c)
+                seen_codes.add(code)
+        if min_recommendation_score is not None:
+            score_floor = float(min_recommendation_score)
+            filtered_pool = [x for x in buy_pool if float(x.get("recommendation_score", 0.0) or 0.0) >= score_floor]
+            if filtered_pool:
+                buy_pool = filtered_pool
+
+        remaining_budget = max(0.0, float(budget_cap))
+        remaining_slots = max(1, int(max_picks))
+        for c in buy_pool:
+            code = str(c.get("code", "")).strip().upper()
+            if not code:
+                continue
+            if code in sell_symbols:
+                continue
+            if code in held_symbols and not allow_add_to_held:
                 continue
             price = float(c["price"])  # KR: KRW price, US: USD price
             price_krw = price * fx_rate
-            qty = int(math.floor(per_order_budget / price_krw))
+            if price_krw <= 0:
+                continue
+            if remaining_budget <= 0:
+                break
+
+            dynamic_budget = remaining_budget / max(1, remaining_slots)
+            qty = int(math.floor(dynamic_budget / price_krw))
+            if qty <= 0 and remaining_budget >= price_krw:
+                # Avoid zero-qty due to equal-weight sizing when at least 1 share is affordable.
+                qty = 1
             if qty <= 0:
                 continue
+            notional_krw = qty * price_krw
+            if notional_krw > remaining_budget:
+                qty = int(math.floor(remaining_budget / price_krw))
+                if qty <= 0:
+                    continue
+                notional_krw = qty * price_krw
             orders.append(
                 ProposedOrder(
                     market=market,
-                    symbol=c["code"],
+                    symbol=code,
                     side=ORDER_SIDE_BUY,
                     order_type=ORDER_TYPE_MARKET,
                     quantity=float(qty),
@@ -311,12 +452,20 @@ class AgentDecisionEngine:
                     ),
                 )
             )
+            remaining_budget = max(0.0, remaining_budget - notional_krw)
+            remaining_slots = max(0, remaining_slots - 1)
+            if remaining_slots <= 0:
+                break
 
         rationale = (
             f"{agent.name} proposed {len(orders)} order(s). "
             f"available_cash_krw={available_cash_krw:.0f}, budget_cap={budget_cap:.0f}, "
             f"per_order_budget={per_order_budget:.0f}, fx_rate={fx_rate:.2f}, "
-            f"held_positions={len(held_market_positions)}, max_freedom={self._max_freedom_mode()}"
+            f"held_positions={len(held_market_positions)}, remaining_budget={remaining_budget:.0f}, "
+            f"max_freedom={max_freedom}, allow_rotation_sell={allow_rotation_sell}, "
+            f"allow_add_to_held={allow_add_to_held}, expand_pool={expand_pool}, "
+            f"market_budget_cap_krw={applied_market_budget_cap}, "
+            f"max_picks={max_picks}, min_recommendation_score={min_recommendation_score}"
         )
         return orders, rationale
 
