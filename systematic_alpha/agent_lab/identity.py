@@ -56,6 +56,7 @@ class AgentIdentityStore:
             f"- Risk Style: {profile.risk_style}",
             f"- Allocated Capital (KRW): {profile.allocated_capital_krw:.2f}",
             "- Budget Isolation: Enabled (this agent can only use its own ledger/cash/equity).",
+            "- Cross-Market Mode: KR/US simultaneous operation with allocation-aware sizing.",
             "- Autonomy Mode: Max-freedom realtime (adaptive intraday monitoring + auto execution).",
             "",
             "## Philosophy",
