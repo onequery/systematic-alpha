@@ -153,6 +153,39 @@ class USDayTradingSelector:
                 }
             )
 
+    @staticmethod
+    def _fetch_price_detail_oversea_compatible(broker: Any, code: str) -> Dict[str, Any]:
+        detail_fn = getattr(broker, "fetch_price_detail_oversea", None)
+        if callable(detail_fn):
+            return detail_fn(code)
+        # Older mojito variants expose only fetch_oversea_price.
+        oversea_price_fn = getattr(broker, "fetch_oversea_price", None)
+        if callable(oversea_price_fn):
+            return oversea_price_fn(code)
+        raise AttributeError("KoreaInvestment has no compatible overseas price-detail method")
+
+    @staticmethod
+    def _fetch_ohlcv_oversea_compatible(broker: Any, code: str) -> Dict[str, Any]:
+        for method_name in ("fetch_ohlcv_oversea", "fetch_ohlcv_overesea"):
+            ohlcv_fn = getattr(broker, method_name, None)
+            if not callable(ohlcv_fn):
+                continue
+            type_error: Optional[TypeError] = None
+            for kwargs in (
+                {"timeframe": "D", "adj_price": True},
+                {"timeframe": "D", "adjusted": True},
+                {"timeframe": "D"},
+                {},
+            ):
+                try:
+                    return ohlcv_fn(code, **kwargs)
+                except TypeError as exc:
+                    type_error = exc
+                    continue
+            if type_error is not None:
+                raise type_error
+        raise AttributeError("KoreaInvestment has no compatible overseas OHLCV method")
+
     def get_api_diagnostics(self) -> Dict[str, Any]:
         return {
             "exchange_input": self.config.us_exchange,
@@ -657,7 +690,7 @@ class USDayTradingSelector:
             if broker is None:
                 continue
             try:
-                resp = broker.fetch_price_detail_oversea(code)
+                resp = self._fetch_price_detail_oversea_compatible(broker, code)
             except Exception as exc:
                 self._record_api_diag("fetch_price_detail_exception", code, f"{exchange_code}:{repr(exc)}")
                 continue
@@ -692,7 +725,7 @@ class USDayTradingSelector:
             if broker is None:
                 continue
             try:
-                candidate_resp = broker.fetch_ohlcv_oversea(code, timeframe="D", adj_price=True)
+                candidate_resp = self._fetch_ohlcv_oversea_compatible(broker, code)
             except Exception as exc:
                 self._record_api_diag("fetch_prev_day_exception", code, f"{exchange_code}:{repr(exc)}")
                 continue
@@ -903,7 +936,7 @@ class USDayTradingSelector:
             if broker is None:
                 continue
             try:
-                resp = broker.fetch_ohlcv_oversea(code, timeframe="D", adj_price=True)
+                resp = self._fetch_ohlcv_oversea_compatible(broker, code)
             except Exception as exc:
                 self._record_api_diag("fetch_daily_bars_exception", code, f"{exchange_code}:{repr(exc)}")
                 continue

@@ -371,6 +371,7 @@ class AutoStrategyDaemon:
         max_symbols_scan = int(float(os.getenv("AGENT_LAB_INTRADAY_MAX_SYMBOLS_SCAN", "200") or 200))
         kr_universe_size = int(float(os.getenv("AGENT_LAB_INTRADAY_KR_UNIVERSE_SIZE", "300") or 300))
         us_universe_size = int(float(os.getenv("AGENT_LAB_INTRADAY_US_UNIVERSE_SIZE", "500") or 500))
+        rest_sleep = float(os.getenv("AGENT_LAB_INTRADAY_REST_SLEEP", "0.08") or 0.08)
         us_exchange = str(os.getenv("AGENT_LAB_US_EXCHANGE", "NASD")).strip().upper() or "NASD"
         uncapped_mode = self._should_use_uncapped_scan(market)
         uncapped_limit = int(float(os.getenv("AGENT_LAB_INTRADAY_UNCAPPED_LIMIT", "1000000") or 1000000))
@@ -414,6 +415,8 @@ class AutoStrategyDaemon:
             str(int(float(os.getenv("AGENT_LAB_INTRADAY_MIN_PASS_CONDITIONS", "1") or 1))),
             "--min-maintain-ratio",
             str(float(os.getenv("AGENT_LAB_INTRADAY_MIN_MAINTAIN_RATIO", "0") or 0.0)),
+            "--rest-sleep",
+            str(max(0.0, rest_sleep)),
             "--output-json",
             str(output_json),
             "--analytics-dir",
