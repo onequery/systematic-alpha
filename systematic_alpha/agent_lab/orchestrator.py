@@ -93,6 +93,27 @@ class AgentLabOrchestrator:
     def _allow_offschedule_weekly() -> bool:
         return _truthy(os.getenv("AGENT_LAB_ALLOW_OFFSCHEDULE_WEEKLY", "0"))
 
+    @staticmethod
+    def _enforce_market_hours() -> bool:
+        return _truthy(os.getenv("AGENT_LAB_ENFORCE_MARKET_HOURS", "1"))
+
+    def _is_market_open_now(self, market: str, now_utc: Optional[datetime] = None) -> Tuple[bool, str]:
+        market_upper = str(market).strip().upper()
+        if market_upper == "KR":
+            now = now_utc.astimezone(self.kst) if now_utc else datetime.now(self.kst)
+            if now.weekday() >= 5:
+                return False, f"weekend_kst={now.isoformat(timespec='seconds')}"
+            start = now.replace(hour=9, minute=0, second=0, microsecond=0)
+            end = now.replace(hour=15, minute=35, second=0, microsecond=0)
+            return (start <= now <= end), f"now_kst={now.isoformat(timespec='seconds')}, window=09:00~15:35"
+
+        now = now_utc.astimezone(self.et) if now_utc else datetime.now(self.et)
+        if now.weekday() >= 5:
+            return False, f"weekend_et={now.isoformat(timespec='seconds')}"
+        start = now.replace(hour=9, minute=30, second=0, microsecond=0)
+        end = now.replace(hour=16, minute=5, second=0, microsecond=0)
+        return (start <= now <= end), f"now_et={now.isoformat(timespec='seconds')}, window=09:30~16:05"
+
     def _event_already_reported(self, event_type: str, market: str, yyyymmdd: str, *, limit: int = 500) -> bool:
         market_upper = str(market).strip().upper()
         date_str = str(yyyymmdd).strip()
@@ -1018,6 +1039,23 @@ class AgentLabOrchestrator:
         auto_execute: Optional[bool] = None,
     ) -> Dict[str, Any]:
         market = market.strip().upper()
+        if self._enforce_market_hours():
+            market_open, market_window_detail = self._is_market_open_now(market)
+            if not market_open:
+                payload = {
+                    "market": market,
+                    "date": yyyymmdd,
+                    "auto_execute": False,
+                    "proposals": [],
+                    "execution_results": [],
+                    "skipped": True,
+                    "reason": "outside_market_hours",
+                    "detail": market_window_detail,
+                }
+                self.storage.log_event("orders_proposed_skipped", payload, now_iso())
+                self._append_activity_artifact(yyyymmdd, "orders_proposed_skipped", payload)
+                return payload
+
         signal = self.storage.get_latest_session_signal(market, yyyymmdd)
         if signal is None:
             self.ingest_session(market, yyyymmdd)
@@ -1285,6 +1323,29 @@ class AgentLabOrchestrator:
         market = str(proposal["market"]).upper()
         yyyymmdd = str(proposal["session_date"])
         agent_id = str(proposal["agent_id"])
+        if self._enforce_market_hours():
+            market_open, market_window_detail = self._is_market_open_now(market)
+            if not market_open:
+                block_reason = f"outside_market_hours:{market_window_detail}"
+                self.storage.update_order_proposal_status(
+                    proposal_id=proposal_id,
+                    status=PROPOSAL_STATUS_BLOCKED,
+                    blocked_reason=block_reason,
+                    updated_at=now_iso(),
+                )
+                blocked_payload = {
+                    "proposal_id": proposal_id,
+                    "proposal_uuid": proposal["proposal_uuid"],
+                    "agent_id": agent_id,
+                    "market": market,
+                    "session_date": yyyymmdd,
+                    "status": PROPOSAL_STATUS_BLOCKED,
+                    "blocked_reason": block_reason,
+                }
+                self.storage.log_event("orders_approval_blocked", blocked_payload, now_iso())
+                self._append_activity_artifact(yyyymmdd, "orders_approval_blocked", blocked_payload)
+                return blocked_payload
+
         fx_rate = 1.0
         if market == "US":
             rate = self._usdkrw_rate(yyyymmdd)

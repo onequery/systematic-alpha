@@ -46,6 +46,9 @@ pip install -r requirements.txt
   - 기본값: `trade_executed,preopen_plan,session_close_report,weekly_council`
   - 이 목록에 없는 이벤트는 텔레그램 푸시를 보내지 않습니다.
 
+정규장 시간 강제(거래 안전장치):
+- `AGENT_LAB_ENFORCE_MARKET_HOURS=1`이면 KR(09:00~15:35 KST), US(09:30~16:05 ET) 외 시간에는 주문 제안/실행을 차단합니다.
+
 ## 4. 작업 등록/해제
 
 ```bash
@@ -89,6 +92,7 @@ chmod +x scripts/*.sh
 참고:
 - `auto-strategy-daemon`은 기본값에서 주간회의를 임의 호출하지 않습니다.
 - 주간회의/주간보고는 위 일요일 스케줄 태스크가 담당합니다.
+- WSL(Ubuntu) `cron`은 작업별 타임존 실행을 지원하지 않으므로, US 작업은 KST에서 DST/비DST 후보 시각 2개에 등록하고 ET 시각 일치 조건으로 실제 실행을 게이트합니다.
 
 전략 승격 규칙(주간회의):
 - 일반 승격: `점수>=0.60` 2주 연속 + `리스크 위반<=3회` + `위반율<=15%` + `주간 제안수>=10`

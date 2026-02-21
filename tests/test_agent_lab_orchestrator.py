@@ -2,6 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from systematic_alpha.agent_lab.orchestrator import AgentLabOrchestrator
 
@@ -81,21 +82,22 @@ class AgentLabOrchestratorTests(unittest.TestCase):
 
             orch = AgentLabOrchestrator(project_root=root)
             try:
-                init_payload = orch.init_lab(capital_krw=10_000_000, agents=3)
-                self.assertEqual(3, len(init_payload["agents"]))
+                with patch.dict("os.environ", {"AGENT_LAB_ENFORCE_MARKET_HOURS": "0"}):
+                    init_payload = orch.init_lab(capital_krw=10_000_000, agents=3)
+                    self.assertEqual(3, len(init_payload["agents"]))
 
-                ingest_payload = orch.ingest_session(market="KR", yyyymmdd=run_date)
-                self.assertEqual("SIGNAL_OK", ingest_payload["status_code"])
+                    ingest_payload = orch.ingest_session(market="KR", yyyymmdd=run_date)
+                    self.assertEqual("SIGNAL_OK", ingest_payload["status_code"])
 
-                proposal_payload = orch.propose_orders(market="KR", yyyymmdd=run_date)
-                self.assertEqual(3, len(proposal_payload["proposals"]))
+                    proposal_payload = orch.propose_orders(market="KR", yyyymmdd=run_date)
+                    self.assertEqual(3, len(proposal_payload["proposals"]))
 
-                statuses = {str(x.get("status", "")) for x in proposal_payload["proposals"]}
-                self.assertIn("EXECUTED", statuses)
+                    statuses = {str(x.get("status", "")) for x in proposal_payload["proposals"]}
+                    self.assertIn("EXECUTED", statuses)
 
-                review_payload = orch.daily_review(run_date)
-                self.assertEqual(run_date, review_payload["date"])
-                self.assertEqual(3, len(review_payload["rows"]))
+                    review_payload = orch.daily_review(run_date)
+                    self.assertEqual(run_date, review_payload["date"])
+                    self.assertEqual(3, len(review_payload["rows"]))
             finally:
                 orch.close()
 
@@ -107,27 +109,46 @@ class AgentLabOrchestratorTests(unittest.TestCase):
 
             orch = AgentLabOrchestrator(project_root=root)
             try:
+                with patch.dict("os.environ", {"AGENT_LAB_ENFORCE_MARKET_HOURS": "0"}):
+                    orch.init_lab(capital_krw=10_000_000, agents=1)
+                    orch.ingest_session(market="KR", yyyymmdd=run_date)
+                    proposal_payload = orch.propose_orders(market="KR", yyyymmdd=run_date)
+                    self.assertEqual(1, len(proposal_payload["proposals"]))
+
+                    proposal = proposal_payload["proposals"][0]
+                    plan = proposal.get("cross_market_plan", {})
+                    self.assertIn("target_weights", plan)
+                    self.assertIn("KR", plan["target_weights"])
+                    self.assertIn("US", plan["target_weights"])
+
+                    budget_cap = float(plan.get("buy_budget_cap_krw", 0.0) or 0.0)
+                    self.assertGreater(budget_cap, 0.0)
+                    self.assertLessEqual(budget_cap, 6_700_000.0)
+
+                    buy_notional = 0.0
+                    for order in list(proposal.get("orders") or []):
+                        if str(order.get("side", "")).upper() != "BUY":
+                            continue
+                        buy_notional += float(order.get("quantity", 0.0) or 0.0) * float(order.get("reference_price", 0.0) or 0.0)
+                    self.assertLessEqual(buy_notional, budget_cap + 1.0)
+            finally:
+                orch.close()
+
+    def test_propose_orders_skips_outside_market_hours(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            run_date = "20260218"
+            _write_signal_file(root, "KR", run_date)
+
+            orch = AgentLabOrchestrator(project_root=root)
+            try:
                 orch.init_lab(capital_krw=10_000_000, agents=1)
-                orch.ingest_session(market="KR", yyyymmdd=run_date)
-                proposal_payload = orch.propose_orders(market="KR", yyyymmdd=run_date)
-                self.assertEqual(1, len(proposal_payload["proposals"]))
-
-                proposal = proposal_payload["proposals"][0]
-                plan = proposal.get("cross_market_plan", {})
-                self.assertIn("target_weights", plan)
-                self.assertIn("KR", plan["target_weights"])
-                self.assertIn("US", plan["target_weights"])
-
-                budget_cap = float(plan.get("buy_budget_cap_krw", 0.0) or 0.0)
-                self.assertGreater(budget_cap, 0.0)
-                self.assertLessEqual(budget_cap, 6_700_000.0)
-
-                buy_notional = 0.0
-                for order in list(proposal.get("orders") or []):
-                    if str(order.get("side", "")).upper() != "BUY":
-                        continue
-                    buy_notional += float(order.get("quantity", 0.0) or 0.0) * float(order.get("reference_price", 0.0) or 0.0)
-                self.assertLessEqual(buy_notional, budget_cap + 1.0)
+                with patch.dict("os.environ", {"AGENT_LAB_ENFORCE_MARKET_HOURS": "1"}):
+                    with patch.object(orch, "_is_market_open_now", return_value=(False, "test_closed_window")):
+                        payload = orch.propose_orders(market="KR", yyyymmdd=run_date)
+                self.assertTrue(bool(payload.get("skipped")))
+                self.assertEqual("outside_market_hours", payload.get("reason"))
+                self.assertEqual([], payload.get("proposals"))
             finally:
                 orch.close()
 

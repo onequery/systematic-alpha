@@ -21,11 +21,14 @@ CRON_TZ=Asia/Seoul
 0 9 * * 1-5 cd "$ROOT_DIR" && /usr/bin/env bash "$ROOT_DIR/scripts/run_daily_wsl.sh" --market KR >> "$ROOT_DIR/logs/cron/kr_daily.log" 2>&1
 40 15 * * 1-5 cd "$ROOT_DIR" && /usr/bin/env bash "$ROOT_DIR/scripts/run_agent_lab_wsl.sh" --action close-report --market KR >> "$ROOT_DIR/logs/cron/agent_kr_close.log" 2>&1
 
-CRON_TZ=America/New_York
-30 8 * * 1-5 cd "$ROOT_DIR" && "$PYTHON_BIN" scripts/prefetch_us_universe.py --output-csv "$ROOT_DIR/out/us/\$(TZ=Asia/Seoul date +\\%Y\\%m\\%d)/cache/us_sp500_constituents.csv" >> "$ROOT_DIR/logs/cron/us_prefetch.log" 2>&1
-20 9 * * 1-5 cd "$ROOT_DIR" && /usr/bin/env bash "$ROOT_DIR/scripts/run_agent_lab_wsl.sh" --action preopen-plan --market US >> "$ROOT_DIR/logs/cron/agent_us_preopen.log" 2>&1
-30 9 * * 1-5 cd "$ROOT_DIR" && /usr/bin/env bash "$ROOT_DIR/scripts/run_daily_wsl.sh" --market US --exchange NASD >> "$ROOT_DIR/logs/cron/us_daily.log" 2>&1
-10 16 * * 1-5 cd "$ROOT_DIR" && /usr/bin/env bash "$ROOT_DIR/scripts/run_agent_lab_wsl.sh" --action close-report --market US >> "$ROOT_DIR/logs/cron/agent_us_close.log" 2>&1
+# NOTE:
+# Ubuntu/WSL cron runs all jobs in system timezone and does not support
+# per-user timezone scheduling. For US jobs, run at both possible KST
+# times (DST/non-DST) and gate execution by current ET wall-clock.
+30 21,22 * * 1-5 cd "$ROOT_DIR" && [ "\$(TZ=America/New_York date +\\%H:\\%M)" = "08:30" ] && "$PYTHON_BIN" scripts/prefetch_us_universe.py --output-csv "$ROOT_DIR/out/us/\$(TZ=Asia/Seoul date +\\%Y\\%m\\%d)/cache/us_sp500_constituents.csv" >> "$ROOT_DIR/logs/cron/us_prefetch.log" 2>&1
+20 22,23 * * 1-5 cd "$ROOT_DIR" && [ "\$(TZ=America/New_York date +\\%H:\\%M)" = "09:20" ] && AGENT_LAB_STRICT_REPORT_WINDOWS=1 /usr/bin/env bash "$ROOT_DIR/scripts/run_agent_lab_wsl.sh" --action preopen-plan --market US >> "$ROOT_DIR/logs/cron/agent_us_preopen.log" 2>&1
+30 22,23 * * 1-5 cd "$ROOT_DIR" && [ "\$(TZ=America/New_York date +\\%H:\\%M)" = "09:30" ] && /usr/bin/env bash "$ROOT_DIR/scripts/run_daily_wsl.sh" --market US --exchange NASD >> "$ROOT_DIR/logs/cron/us_daily.log" 2>&1
+10 5,6 * * 2-6 cd "$ROOT_DIR" && [ "\$(TZ=America/New_York date +\\%H:\\%M)" = "16:10" ] && AGENT_LAB_STRICT_REPORT_WINDOWS=1 /usr/bin/env bash "$ROOT_DIR/scripts/run_agent_lab_wsl.sh" --action close-report --market US >> "$ROOT_DIR/logs/cron/agent_us_close.log" 2>&1
 
 CRON_TZ=Asia/Seoul
 0 8 * * 0 cd "$ROOT_DIR" && /usr/bin/env bash "$ROOT_DIR/scripts/run_agent_lab_wsl.sh" --action weekly-council >> "$ROOT_DIR/logs/cron/agent_weekly_council.log" 2>&1
