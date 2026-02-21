@@ -5,6 +5,19 @@ from typing import Any, Dict
 
 import requests
 
+REPORT_EVENTS = {
+    "trade_executed",
+    "preopen_plan",
+    "session_close_report",
+    "weekly_council",
+    "auto_strategy_update",
+}
+
+ACTION_REQUIRED_EVENTS = {
+    "llm_limit_alert",
+    "daemon_error",
+}
+
 
 def _truthy(value: str) -> bool:
     norm = str(value or "").strip().lower()
@@ -32,6 +45,26 @@ def _parse_csv_set(value: str) -> set[str]:
         if token:
             out.add(token)
     return out
+
+
+def event_label(event: str) -> str:
+    key = str(event or "").strip().lower()
+    if key in ACTION_REQUIRED_EVENTS:
+        return "Action required"
+    if key in REPORT_EVENTS:
+        return "보고"
+    return "이벤트"
+
+
+def event_prefixed_text(text: str, event: str) -> str:
+    body = str(text or "").strip()
+    if not body:
+        body = "-"
+    label = event_label(event)
+    prefix = f"[{label}]"
+    if body.startswith(prefix):
+        return body
+    return f"{prefix} {body}"
 
 
 class TelegramNotifier:
@@ -64,16 +97,23 @@ class TelegramNotifier:
         if "*" in self.allowed_events:
             return True
         key = str(event or "").strip().lower()
-        return key in self.allowed_events
+        if key in self.allowed_events:
+            return True
+        alias = {
+            "session_monitor": "intraday_monitor",
+            "intraday_monitor": "session_monitor",
+        }.get(key)
+        return bool(alias and alias in self.allowed_events)
 
     def send(self, text: str, *, event: str = "misc") -> bool:
         if not self.enabled:
             return False
         if not self._allow_event(event):
             return False
+        rendered = event_prefixed_text(text, event)
         payload: Dict[str, Any] = {
             "chat_id": self.chat_id,
-            "text": _truncate(text),
+            "text": _truncate(rendered),
             "disable_web_page_preview": "true",
         }
         if self.disable_notification:

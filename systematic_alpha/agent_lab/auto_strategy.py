@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo
 import requests
 
 from systematic_alpha.agent_lab.llm_client import LLMClient
+from systematic_alpha.agent_lab.notify import event_prefixed_text
 from systematic_alpha.agent_lab.orchestrator import AgentLabOrchestrator
 from systematic_alpha.agent_lab.schemas import STATUS_DATA_QUALITY_LOW, STATUS_INVALID_SIGNAL
 from systematic_alpha.agent_lab.storage import AgentLabStorage
@@ -120,16 +121,25 @@ class AutoStrategyDaemon:
     def _allow_event(self, event: str) -> bool:
         if "*" in self.allowed_notify_events:
             return True
-        return str(event or "").strip().lower() in self.allowed_notify_events
+        key = str(event or "").strip().lower()
+        if key in self.allowed_notify_events:
+            return True
+        # Backward compatibility for renamed monitor event key.
+        alias = {
+            "session_monitor": "intraday_monitor",
+            "intraday_monitor": "session_monitor",
+        }.get(key)
+        return bool(alias and alias in self.allowed_notify_events)
 
     def _send_telegram(self, text: str, *, event: str = "misc") -> None:
         if not self.telegram_enabled:
             return
         if not self._allow_event(event):
             return
+        rendered = event_prefixed_text(text, event)
         payload: Dict[str, Any] = {
             "chat_id": self.telegram_chat_id,
-            "text": _truncate(text),
+            "text": _truncate(rendered),
             "disable_web_page_preview": True,
         }
         if self.telegram_disable_notification:
@@ -628,18 +638,21 @@ class AutoStrategyDaemon:
 
         self.storage.log_event("auto_intraday_monitor_cycle", payload, _now_iso())
         signal_text = self._ko_signal_status(signal_status)
-        self._send_telegram(
-            "[AgentLab] 장중 모니터링\n"
-            f"시장={market}\n"
-            f"모드={payload.get('mode')}\n"
-            f"신호={signal_text} ({signal_date or '-'})\n"
-            f"리프레시_성공={payload.get('refresh_ok')}\n"
-            f"제안_상태={status_counts if status_counts else '(없음)'}\n"
-            f"제안_트리거={payload.get('propose_triggered')}\n"
-            f"제안_성공={payload.get('propose_ok')}"
-            ,
-            event="intraday_monitor",
-        )
+        monitor_title = "[AgentLab] 장중 모니터링" if market_open else "[AgentLab] 장외 모니터링"
+        notify_afterhours = _truthy(os.getenv("AGENT_LAB_NOTIFY_SESSION_MONITOR_AFTERHOURS", "1"))
+        if market_open or notify_afterhours:
+            self._send_telegram(
+                f"{monitor_title}\n"
+                f"시장={market}\n"
+                f"모드={payload.get('mode')}\n"
+                f"최근신호={signal_text} ({signal_date or '-'})\n"
+                f"리프레시_성공={payload.get('refresh_ok')}\n"
+                f"제안_상태={status_counts if status_counts else '(없음)'}\n"
+                f"제안_트리거={payload.get('propose_triggered')}\n"
+                f"제안_성공={payload.get('propose_ok')}"
+                ,
+                event="session_monitor",
+            )
         return payload
 
     def _run_intraday_monitor(self, now_kst: datetime) -> Dict[str, Any]:
@@ -941,19 +954,6 @@ class AutoStrategyDaemon:
             }
             return result
 
-        vote = self._llm_vote(now_kst, triggers)
-        self._maybe_send_llm_limit_alert(vote.get("raw_reason") or vote.get("reason") or "")
-        if (not vote["should_update_now"]) or vote["wait_minutes"] > 0:
-            result = {
-                "action": "skip",
-                "reason": "agent_vote_delay",
-                "vote": vote,
-                "now_kst": now_kst.isoformat(),
-                "triggers": [t.__dict__ for t in triggers],
-                "intraday_monitor": intraday_monitor,
-            }
-            return result
-
         if not self._auto_weekly_council_enabled():
             return {
                 "action": "skip",
@@ -983,6 +983,19 @@ class AutoStrategyDaemon:
                 "triggers": [t.__dict__ for t in triggers],
                 "intraday_monitor": intraday_monitor,
             }
+
+        vote = self._llm_vote(now_kst, triggers)
+        self._maybe_send_llm_limit_alert(vote.get("raw_reason") or vote.get("reason") or "")
+        if (not vote["should_update_now"]) or vote["wait_minutes"] > 0:
+            result = {
+                "action": "skip",
+                "reason": "agent_vote_delay",
+                "vote": vote,
+                "now_kst": now_kst.isoformat(),
+                "triggers": [t.__dict__ for t in triggers],
+                "intraday_monitor": intraday_monitor,
+            }
+            return result
 
         updated = self._run_council_update(now_kst, triggers, vote)
         self.storage.log_event(
