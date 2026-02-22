@@ -68,6 +68,30 @@ chmod +x scripts/*.sh
 ./scripts/reset_tasks_preserve_state_wsl.sh
 ```
 
+동작 요약:
+- `reset_tasks_preserve_state_wsl.sh`는 내부적으로 `remove_all_tasks_wsl.sh` + `register_all_tasks_wsl.sh`를 실행합니다.
+- `INIT_AGENT_LAB=0`으로 동작하므로 기존 자본/전략/메모리 상태는 유지하고 크론/데몬만 재등록·재기동합니다.
+
+모니터링(실행 중 상태 확인):
+
+```bash
+# 실시간 대시보드 (기본)
+./scripts/monitor_agent_lab_wsl.sh
+
+# 1회 스냅샷만 출력
+./scripts/monitor_agent_lab_wsl.sh --once
+
+# 로그 follow 모드
+./scripts/monitor_agent_lab_wsl.sh --mode follow --tail-lines 80
+```
+
+빠른 점검:
+
+```bash
+crontab -l
+ps -ef | grep run_agent_lab_wsl.sh | grep -v grep
+```
+
 ## 5. 자동 스케줄
 
 ### KR

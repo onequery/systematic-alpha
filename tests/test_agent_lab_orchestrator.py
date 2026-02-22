@@ -152,6 +152,188 @@ class AgentLabOrchestratorTests(unittest.TestCase):
             finally:
                 orch.close()
 
+    def test_weekly_council_live_result_is_not_overwritten_by_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            orch = AgentLabOrchestrator(project_root=root)
+            try:
+                week_id = "2026-W08"
+                live_decision = {
+                    "week_id": week_id,
+                    "champion_agent_id": "agent_b",
+                    "discussion": {
+                        "rounds": [
+                            {
+                                "round": 1,
+                                "phase": "opening",
+                                "speeches": [
+                                    {
+                                        "agent_id": "agent_a",
+                                        "mode": "live",
+                                        "thesis": "live thesis",
+                                    }
+                                ],
+                            }
+                        ],
+                        "moderator": {"mode": "live", "summary": "live summary"},
+                    },
+                    "llm_alerts": [],
+                }
+                fallback_decision = {
+                    "week_id": week_id,
+                    "champion_agent_id": "agent_a",
+                    "discussion": {
+                        "rounds": [
+                            {
+                                "round": 1,
+                                "phase": "opening",
+                                "speeches": [
+                                    {
+                                        "agent_id": "agent_a",
+                                        "mode": "fallback",
+                                        "thesis": "fallback thesis",
+                                    }
+                                ],
+                            }
+                        ],
+                        "moderator": {"mode": "fallback", "summary": "fallback summary"},
+                    },
+                    "llm_alerts": [{"agent_id": "agent_a", "phase": "opening", "reason": "llm_disabled_or_unavailable"}],
+                }
+
+                orch.storage.upsert_weekly_council(
+                    week_id=week_id,
+                    champion_agent_id="agent_b",
+                    decision=live_decision,
+                    markdown="live markdown",
+                    created_at="2026-02-20T04:16:45",
+                )
+                orch.storage.upsert_weekly_council(
+                    week_id=week_id,
+                    champion_agent_id="agent_a",
+                    decision=fallback_decision,
+                    markdown="fallback markdown",
+                    created_at="2026-02-20T15:56:56",
+                )
+
+                row = orch.storage.query_one(
+                    "SELECT champion_agent_id, decision_json, markdown, created_at FROM weekly_councils WHERE week_id = ?",
+                    (week_id,),
+                )
+                self.assertIsNotNone(row)
+                assert row is not None
+                self.assertEqual("agent_b", row["champion_agent_id"])
+                self.assertEqual("live markdown", row["markdown"])
+                self.assertEqual("2026-02-20T04:16:45", row["created_at"])
+                stored = json.loads(str(row["decision_json"]))
+                speech_mode = (
+                    stored.get("discussion", {})
+                    .get("rounds", [{}])[0]
+                    .get("speeches", [{}])[0]
+                    .get("mode")
+                )
+                self.assertEqual("live", speech_mode)
+            finally:
+                orch.close()
+
+    def test_weekly_council_immediately_applies_params_to_active_strategy(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            orch = AgentLabOrchestrator(project_root=root)
+            try:
+                orch.init_lab(capital_krw=10_000_000, agents=3)
+
+                expected_intervals = {
+                    "agent_a": 75,
+                    "agent_b": 90,
+                    "agent_c": 120,
+                }
+                expected_picks = {
+                    "agent_a": 11,
+                    "agent_b": 9,
+                    "agent_c": 7,
+                }
+
+                def _fake_live_weekly_debate(**kwargs):
+                    profiles = list(kwargs.get("agent_profiles", []))
+                    active_params_map = dict(kwargs.get("active_params_map", {}))
+                    suggestions = {}
+                    for profile in profiles:
+                        aid = profile.agent_id
+                        params = dict(active_params_map.get(aid, {}))
+                        params["intraday_monitor_interval_sec"] = expected_intervals[aid]
+                        params["max_daily_picks"] = expected_picks[aid]
+                        suggestions[aid] = params
+                    opening = []
+                    rebuttal = []
+                    for profile in profiles:
+                        aid = profile.agent_id
+                        opening.append(
+                            {
+                                "agent_id": aid,
+                                "mode": "live",
+                                "reason": "",
+                                "thesis": f"{aid} opening",
+                                "risk_notes": [f"{aid} risk note"],
+                                "param_changes": {},
+                                "confidence": 0.7,
+                            }
+                        )
+                        rebuttal.append(
+                            {
+                                "agent_id": aid,
+                                "mode": "live",
+                                "reason": "",
+                                "rebuttal": f"{aid} rebuttal",
+                                "counter_points": [f"{aid} counter"],
+                                "param_changes": {},
+                            }
+                        )
+                    return {
+                        "week_id": kwargs.get("week_id", "2026-W08"),
+                        "rounds": [
+                            {"round": 1, "phase": "opening", "speeches": opening},
+                            {"round": 2, "phase": "rebuttal", "speeches": rebuttal},
+                        ],
+                        "moderator": {
+                            "mode": "live",
+                            "reason": "",
+                            "summary": "live summary",
+                            "consensus_actions": ["apply immediately"],
+                            "risk_watch": ["watch risk"],
+                        },
+                        "agent_param_suggestions": suggestions,
+                        "llm_warnings": [],
+                    }
+
+                with patch.dict(
+                    "os.environ",
+                    {
+                        "AGENT_LAB_ALLOW_OFFSCHEDULE_WEEKLY": "1",
+                        "AGENT_LAB_WEEKLY_APPLY_MODE": "immediate",
+                    },
+                ):
+                    with patch.object(
+                        orch.agent_engine,
+                        "run_weekly_council_debate",
+                        side_effect=_fake_live_weekly_debate,
+                    ):
+                        decision = orch.weekly_council("2026-W08")
+
+                self.assertEqual("immediate", decision.get("promotion_apply_mode"))
+                promoted_versions = decision.get("promoted_versions", {})
+                self.assertEqual({"agent_a", "agent_b", "agent_c"}, set(promoted_versions.keys()))
+                for aid in ["agent_a", "agent_b", "agent_c"]:
+                    active = orch.registry.get_active_strategy(aid)
+                    params = dict(active.get("params", {}))
+                    self.assertEqual(expected_intervals[aid], int(params.get("intraday_monitor_interval_sec", 0)))
+                    self.assertEqual(expected_picks[aid], int(params.get("max_daily_picks", 0)))
+                    eval_row = dict((decision.get("promotion_evaluation", {}) or {}).get(aid, {}))
+                    self.assertTrue(bool(eval_row.get("applied_immediately")))
+                    self.assertIn(str(eval_row.get("mode", "")), {"immediate_promote", "forced_conservative_promote"})
+            finally:
+                orch.close()
+
 
 if __name__ == "__main__":
     unittest.main()

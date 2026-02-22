@@ -94,6 +94,15 @@ class AgentLabOrchestrator:
         return _truthy(os.getenv("AGENT_LAB_ALLOW_OFFSCHEDULE_WEEKLY", "0"))
 
     @staticmethod
+    def _weekly_apply_mode() -> str:
+        # Default policy: apply weekly council outputs immediately as active strategy.
+        # Set AGENT_LAB_WEEKLY_APPLY_MODE=gated to restore legacy score-gated promotion.
+        mode = str(os.getenv("AGENT_LAB_WEEKLY_APPLY_MODE", "immediate") or "immediate").strip().lower()
+        if mode in {"gated", "legacy"}:
+            return "gated"
+        return "immediate"
+
+    @staticmethod
     def _enforce_market_hours() -> bool:
         return _truthy(os.getenv("AGENT_LAB_ENFORCE_MARKET_HOURS", "1"))
 
@@ -1751,7 +1760,7 @@ class AgentLabOrchestrator:
         md_lines.append("")
         rounds = list(discussion.get("rounds", [])) if isinstance(discussion, dict) else []
         for round_row in rounds[:2]:
-            md_lines.append(f"### Round {round_row.get('round')} ({round_row.get('phase')})")
+            md_lines.append(f"### 라운드 {round_row.get('round')} ({round_row.get('phase')})")
             for speech in list(round_row.get("speeches") or [])[:3]:
                 aid = str(speech.get("agent_id", ""))
                 text = str(speech.get("thesis") or speech.get("rebuttal") or "")
@@ -1866,6 +1875,74 @@ class AgentLabOrchestrator:
             )
             score_board[str(r["agent_id"])] = s
         return score_board
+
+    @staticmethod
+    def _render_weekly_markdown(decision: Dict[str, Any]) -> str:
+        if not isinstance(decision, dict):
+            return "# 주간 회의\n\n- 유효한 의사결정 데이터가 없습니다.\n"
+
+        week_id = str(decision.get("week_id", "") or "")
+        champion = str(decision.get("champion_agent_id", "") or "")
+        score_board = decision.get("score_board", {})
+        promoted_versions = decision.get("promoted_versions", {})
+        apply_mode = str(decision.get("promotion_apply_mode", "") or "")
+        llm_alerts = list(decision.get("llm_alerts", []) or [])
+        discussion = decision.get("discussion", {}) if isinstance(decision.get("discussion"), dict) else {}
+        moderator = discussion.get("moderator", {}) if isinstance(discussion.get("moderator"), dict) else {}
+        summary = str(moderator.get("summary", "") or "")
+
+        lines = [
+            f"# 주간 회의 {week_id}",
+            "",
+            f"- 우승 전략: `{champion or '(없음)'}`",
+            f"- 점수표: `{score_board}`",
+            f"- 승격 버전: `{promoted_versions if promoted_versions else '(없음)'}`",
+        ]
+        if apply_mode:
+            lines.append(f"- 반영 모드: `{apply_mode}`")
+        lines.append(f"- LLM 경고 수: `{len(llm_alerts)}`")
+        lines.extend(
+            [
+                "",
+                "## 사회자 요약",
+                summary,
+            ]
+        )
+
+        backfill = decision.get("backfill", {})
+        if isinstance(backfill, dict):
+            applied_at = str(backfill.get("applied_at", "") or "").strip()
+            if applied_at:
+                lines.extend(
+                    [
+                        "",
+                        f"- 백필 적용: `{applied_at}` (주간회의 즉시반영 패치 이전 결과 1회 적용)",
+                    ]
+                )
+        return "\n".join(lines).rstrip() + "\n"
+
+    @staticmethod
+    def _discussion_has_live_content(discussion: Dict[str, Any]) -> bool:
+        if not isinstance(discussion, dict):
+            return False
+        rounds = discussion.get("rounds", [])
+        if isinstance(rounds, list):
+            for round_row in rounds:
+                if not isinstance(round_row, dict):
+                    continue
+                speeches = round_row.get("speeches", [])
+                if not isinstance(speeches, list):
+                    continue
+                for speech in speeches:
+                    if not isinstance(speech, dict):
+                        continue
+                    if str(speech.get("mode", "")).strip().lower() == "live":
+                        return True
+        moderator = discussion.get("moderator", {})
+        if isinstance(moderator, dict):
+            if str(moderator.get("mode", "")).strip().lower() == "live":
+                return True
+        return False
 
     def weekly_council(self, week_id: str) -> Dict[str, Any]:
         if not self._allow_offschedule_weekly():
@@ -2003,6 +2080,24 @@ class AgentLabOrchestrator:
                     },
                     now_iso(),
                 )
+        if not self._discussion_has_live_content(discussion):
+            skip_payload = {
+                "week_id": week_id,
+                "skipped": True,
+                "reason": "weekly_council_llm_unavailable",
+                "llm_alerts": llm_alerts,
+                "generated_at": now_iso(),
+            }
+            self.storage.log_event("weekly_council_skipped", skip_payload, now_iso())
+            self._append_activity_artifact(f"{week_end.strftime('%Y%m%d')}_weekly", "weekly_council_skipped", skip_payload)
+            self._notify(
+                "[AgentLab] 주간 회의 스킵\n"
+                f"주차={week_id}\n"
+                "사유=LLM 연결 실패(실토론 미생성)\n"
+                "조치=네트워크 복구 후 재실행 필요",
+                event="llm_limit_alert",
+            )
+            return skip_payload
 
         prev_week = (week_start - timedelta(days=1)).isocalendar()
         prev_week_id = f"{prev_week.year}-W{prev_week.week:02d}"
@@ -2032,6 +2127,7 @@ class AgentLabOrchestrator:
 
         forced_conservative_agents: List[str] = []
         promotion_evaluation: Dict[str, Dict[str, Any]] = {}
+        apply_mode = self._weekly_apply_mode()
         for agent in agents:
             aid = str(agent["agent_id"])
             active = active_strategy_map[aid]
@@ -2069,17 +2165,26 @@ class AgentLabOrchestrator:
                 and self._is_high_risk_week(w2)
             )
 
-            promote = bool(force_conservative or normal_promote)
-            mode = "normal_promote" if normal_promote else "hold"
             if force_conservative:
                 params = self._build_forced_conservative_params(params)
-                mode = "forced_conservative_promote"
                 forced_conservative_agents.append(aid)
+
+            legacy_rule_promote = bool(force_conservative or normal_promote)
+            if apply_mode == "immediate":
+                promote = True
+                mode = "forced_conservative_promote" if force_conservative else "immediate_promote"
+            else:
+                promote = legacy_rule_promote
+                mode = "normal_promote" if normal_promote else "hold"
+                if force_conservative:
+                    mode = "forced_conservative_promote"
 
             promotion_evaluation[aid] = {
                 "mode": mode,
                 "normal_promote": bool(normal_promote),
                 "force_conservative": bool(force_conservative),
+                "legacy_rule_promote": bool(legacy_rule_promote),
+                "applied_immediately": bool(apply_mode == "immediate"),
                 "score_current": current_score,
                 "score_prev": prev_score,
                 "risk_violations_current": current_risk,
@@ -2113,15 +2218,18 @@ class AgentLabOrchestrator:
             "rows": week_rows,
             "rows_scored": scored_rows,
             "promoted_versions": promoted_versions,
+            "promotion_apply_mode": apply_mode,
             "promotion_score_threshold": PROMOTION_SCORE_THRESHOLD,
             "promotion_rule": (
                 "normal: score_current>=0.60 && score_prev>=0.60 && "
                 "risk_current<=3 && risk_prev<=3 && rate_current<=0.15 && rate_prev<=0.15 && "
                 "proposal_current>=10 && proposal_prev>=10; "
                 "forced_conservative: 3-week consecutive high-risk "
-                "(violations>=4 OR (proposals>=10 && rate>=0.25))"
+                "(violations>=4 OR (proposals>=10 && rate>=0.25)); "
+                "apply_mode=immediate -> weekly consensus params are activated immediately for all agents"
             ),
             "promotion_policy": {
+                "apply_mode": apply_mode,
                 "score_threshold": PROMOTION_SCORE_THRESHOLD,
                 "max_risk_violations": PROMOTION_MAX_RISK_VIOLATIONS,
                 "max_risk_rate": PROMOTION_MAX_RISK_RATE,
@@ -2136,19 +2244,12 @@ class AgentLabOrchestrator:
             "discussion": discussion,
             "llm_alerts": llm_alerts,
         }
-        markdown = (
-            f"# 주간 회의 {week_id}\n\n"
-            f"- 우승 전략: `{champion}`\n"
-            f"- 점수표: `{scores}`\n"
-            f"- 승격 버전: `{promoted_versions}`\n"
-            f"- LLM 경고 수: `{len(llm_alerts)}`\n\n"
-            "## 사회자 요약\n"
-            f"{str((discussion.get('moderator') or {}).get('summary') or '')}\n"
-        )
+        markdown = self._render_weekly_markdown(decision)
         stamp = week_end.strftime("%Y%m%d")
         weekly_stamp = f"{stamp}_weekly"
         self.storage.upsert_weekly_council(week_id, champion, decision, markdown, now_iso())
         self.identity.save_checkpoint(week_id, decision)
+        self.identity.update_running_lessons(week_id, decision)
         self._write_json_artifact(weekly_stamp, f"weekly_council_{week_id.replace('-', '_')}", decision)
         self._write_text_artifact(weekly_stamp, f"weekly_council_{week_id.replace('-', '_')}", markdown)
         self.storage.log_event("weekly_council", decision, now_iso())

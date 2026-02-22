@@ -201,6 +201,35 @@ def _short_text(text: str, limit: int = 220) -> str:
     return t[:limit] + "..."
 
 
+def _contains_hangul(text: Any) -> bool:
+    t = str(text or "")
+    return any("\uac00" <= ch <= "\ud7a3" for ch in t)
+
+
+def _korean_text_or_fallback(value: Any, fallback: str, limit: int = 220) -> str:
+    text = _short_text(str(value or "").strip(), limit=limit)
+    if _contains_hangul(text):
+        return text
+    return _short_text(str(fallback or "").strip(), limit=limit)
+
+
+def _korean_list_or_fallback(value: Any, fallback: List[str], limit: int = 180) -> List[str]:
+    rows = value if isinstance(value, list) else []
+    out: List[str] = []
+    for row in rows:
+        text = _short_text(str(row or "").strip(), limit=limit)
+        if text and _contains_hangul(text):
+            out.append(text)
+    if out:
+        return out
+    fb: List[str] = []
+    for row in list(fallback or []):
+        text = _short_text(str(row or "").strip(), limit=limit)
+        if text:
+            fb.append(text)
+    return fb
+
+
 class AgentDecisionEngine:
     def __init__(self, llm: LLMClient, strategy_registry: StrategyRegistry):
         self.llm = llm
@@ -551,8 +580,8 @@ class AgentDecisionEngine:
                 "agent_id": aid,
                 "mode": meta["mode"],
                 "reason": meta["reason"],
-                "thesis": _short_text(str(parsed.get("thesis", fallback["thesis"]))),
-                "risk_notes": parsed.get("risk_notes", fallback["risk_notes"]),
+                "thesis": _korean_text_or_fallback(parsed.get("thesis", fallback["thesis"]), fallback["thesis"]),
+                "risk_notes": _korean_list_or_fallback(parsed.get("risk_notes", fallback["risk_notes"]), fallback["risk_notes"]),
                 "param_changes": self._normalize_param_changes(parsed.get("param_changes", {})),
                 "confidence": float(parsed.get("confidence", fallback["confidence"]) or fallback["confidence"]),
             }
@@ -603,8 +632,8 @@ class AgentDecisionEngine:
                 "agent_id": aid,
                 "mode": meta["mode"],
                 "reason": meta["reason"],
-                "rebuttal": _short_text(str(parsed.get("rebuttal", fallback["rebuttal"]))),
-                "counter_points": parsed.get("counter_points", fallback["counter_points"]),
+                "rebuttal": _korean_text_or_fallback(parsed.get("rebuttal", fallback["rebuttal"]), fallback["rebuttal"]),
+                "counter_points": _korean_list_or_fallback(parsed.get("counter_points", fallback["counter_points"]), fallback["counter_points"]),
                 "param_changes": self._normalize_param_changes(parsed.get("param_changes", {})),
             }
             rebuttal_speeches.append(rebuttal)
@@ -645,9 +674,21 @@ class AgentDecisionEngine:
         moderator = {
             "mode": moderator_meta["mode"],
             "reason": moderator_meta["reason"],
-            "summary": _short_text(str(moderator_parsed.get("summary", moderator_fallback["summary"])), limit=400),
-            "consensus_actions": moderator_parsed.get("consensus_actions", moderator_fallback["consensus_actions"]),
-            "risk_watch": moderator_parsed.get("risk_watch", moderator_fallback["risk_watch"]),
+            "summary": _korean_text_or_fallback(
+                moderator_parsed.get("summary", moderator_fallback["summary"]),
+                moderator_fallback["summary"],
+                limit=400,
+            ),
+            "consensus_actions": _korean_list_or_fallback(
+                moderator_parsed.get("consensus_actions", moderator_fallback["consensus_actions"]),
+                moderator_fallback["consensus_actions"],
+                limit=220,
+            ),
+            "risk_watch": _korean_list_or_fallback(
+                moderator_parsed.get("risk_watch", moderator_fallback["risk_watch"]),
+                moderator_fallback["risk_watch"],
+                limit=220,
+            ),
         }
 
         suggested_params: Dict[str, Dict[str, Any]] = {}

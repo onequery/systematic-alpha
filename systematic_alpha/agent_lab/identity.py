@@ -172,6 +172,122 @@ class AgentIdentityStore:
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         return path
 
+    @staticmethod
+    def _clip_text(text: Any, limit: int = 220) -> str:
+        value = str(text or "").strip()
+        if len(value) <= limit:
+            return value
+        return value[:limit] + "..."
+
+    @staticmethod
+    def _replace_running_lessons_section(identity_text: str, lessons: List[str]) -> str:
+        lines = str(identity_text or "").splitlines()
+        marker = "## Running Lessons (last 4 weeks)"
+        start = -1
+        for idx, line in enumerate(lines):
+            if line.strip() == marker:
+                start = idx
+                break
+        if start < 0:
+            if lines and lines[-1].strip():
+                lines.append("")
+            lines.append(marker)
+            lines.append("- (to be appended by weekly council)")
+            start = len(lines) - 2
+
+        end = len(lines)
+        for idx in range(start + 1, len(lines)):
+            if lines[idx].startswith("## "):
+                end = idx
+                break
+
+        block = [marker]
+        if lessons:
+            block.extend(lessons)
+        else:
+            block.append("- (to be appended by weekly council)")
+
+        rebuilt = lines[:start] + block + lines[end:]
+        return "\n".join(rebuilt).rstrip() + "\n"
+
+    def _build_weekly_lesson(self, agent_id: str, week_id: str, decision: Dict[str, Any]) -> str:
+        rows_scored = list(decision.get("rows_scored") or [])
+        row = next((r for r in rows_scored if str(r.get("agent_id", "")) == agent_id), {}) if rows_scored else {}
+        score = float(row.get("score", 0.0) or 0.0)
+        violations = int(row.get("risk_violations", 0) or 0)
+        proposals = int(row.get("proposal_count", 0) or 0)
+
+        discussion = decision.get("discussion") if isinstance(decision.get("discussion"), dict) else {}
+        moderator = discussion.get("moderator") if isinstance(discussion.get("moderator"), dict) else {}
+        consensus_actions = moderator.get("consensus_actions") if isinstance(moderator.get("consensus_actions"), list) else []
+        risk_watch = moderator.get("risk_watch") if isinstance(moderator.get("risk_watch"), list) else []
+        action = self._clip_text(consensus_actions[0], limit=90) if consensus_actions else "리스크 이벤트와 회전율을 우선 점검"
+        watch = self._clip_text(risk_watch[0], limit=90) if risk_watch else "위험 신호 발생 시 즉시 포지션/노출을 점검"
+
+        suggestion_map = discussion.get("agent_param_suggestions") if isinstance(discussion.get("agent_param_suggestions"), dict) else {}
+        params = suggestion_map.get(agent_id) if isinstance(suggestion_map.get(agent_id), dict) else {}
+        pos_cap = params.get("position_cap_ratio")
+        exp_cap = params.get("exposure_cap_ratio")
+
+        cap_note_parts: List[str] = []
+        try:
+            if pos_cap is not None:
+                cap_note_parts.append(f"포지션한도={float(pos_cap):.2f}")
+        except Exception:
+            pass
+        try:
+            if exp_cap is not None:
+                cap_note_parts.append(f"노출한도={float(exp_cap):.2f}")
+        except Exception:
+            pass
+        cap_note = ", ".join(cap_note_parts) if cap_note_parts else "한도 파라미터 유지"
+
+        return (
+            f"- [{week_id}] 점수 {score:.3f}, 리스크위반 {violations}건, 제안 {proposals}건. "
+            f"{cap_note}. 공통합의: {action}. 리스크주시: {watch}."
+        )
+
+    def update_running_lessons(self, week_id: str, decision: Dict[str, Any], max_weeks: int = 4) -> None:
+        if not isinstance(decision, dict):
+            return
+        agents = self.storage.list_agents()
+        for row in agents:
+            agent_id = str(row.get("agent_id", "")).strip()
+            if not agent_id:
+                continue
+            path = self.identity_path(agent_id)
+            if not path.exists():
+                continue
+            try:
+                identity_text = path.read_text(encoding="utf-8")
+            except Exception:
+                continue
+
+            lesson_line = self._build_weekly_lesson(agent_id, week_id, decision)
+            marker = "## Running Lessons (last 4 weeks)"
+            lines = identity_text.splitlines()
+            start = -1
+            for idx, line in enumerate(lines):
+                if line.strip() == marker:
+                    start = idx
+                    break
+            existing_lessons: List[str] = []
+            if start >= 0:
+                for idx in range(start + 1, len(lines)):
+                    line = lines[idx]
+                    if line.startswith("## "):
+                        break
+                    stripped = line.strip()
+                    if not stripped or stripped == "- (to be appended by weekly council)":
+                        continue
+                    if stripped.startswith("- ["):
+                        existing_lessons.append(stripped)
+            existing_lessons = [x for x in existing_lessons if not x.startswith(f"- [{week_id}]")]
+            merged = [lesson_line] + existing_lessons
+            merged = merged[: max(1, int(max_weeks))]
+            updated = self._replace_running_lessons_section(identity_text, merged)
+            path.write_text(updated, encoding="utf-8")
+
     def load_latest_checkpoint(self) -> Optional[Dict[str, Any]]:
         files = sorted(self.checkpoints_dir.glob("checkpoint_*.json"))
         if not files:

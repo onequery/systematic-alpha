@@ -799,6 +799,23 @@ class AgentLabStorage:
         markdown: str,
         created_at: str,
     ) -> None:
+        existing = self.query_one(
+            """
+            SELECT decision_json
+            FROM weekly_councils
+            WHERE week_id = ?
+            LIMIT 1
+            """,
+            (week_id,),
+        )
+        if existing is not None:
+            try:
+                existing_decision = json.loads(str(existing.get("decision_json") or "{}"))
+            except Exception:
+                existing_decision = {}
+            if self._weekly_decision_is_live(existing_decision) and self._weekly_decision_is_fallback(decision):
+                return
+
         with self.tx():
             self.execute(
                 """
@@ -818,6 +835,42 @@ class AgentLabStorage:
                     created_at,
                 ),
             )
+
+    @staticmethod
+    def _weekly_discussion_modes(decision: Dict[str, Any]) -> set[str]:
+        modes: set[str] = set()
+        discussion = decision.get("discussion", {}) if isinstance(decision, dict) else {}
+        if not isinstance(discussion, dict):
+            return modes
+        rounds = discussion.get("rounds", [])
+        if isinstance(rounds, list):
+            for round_row in rounds:
+                if not isinstance(round_row, dict):
+                    continue
+                speeches = round_row.get("speeches", [])
+                if not isinstance(speeches, list):
+                    continue
+                for speech in speeches:
+                    if not isinstance(speech, dict):
+                        continue
+                    mode = str(speech.get("mode", "")).strip().lower()
+                    if mode in {"live", "fallback"}:
+                        modes.add(mode)
+        moderator = discussion.get("moderator", {})
+        if isinstance(moderator, dict):
+            mode = str(moderator.get("mode", "")).strip().lower()
+            if mode in {"live", "fallback"}:
+                modes.add(mode)
+        return modes
+
+    @classmethod
+    def _weekly_decision_is_live(cls, decision: Dict[str, Any]) -> bool:
+        return "live" in cls._weekly_discussion_modes(decision)
+
+    @classmethod
+    def _weekly_decision_is_fallback(cls, decision: Dict[str, Any]) -> bool:
+        modes = cls._weekly_discussion_modes(decision)
+        return "live" not in modes and "fallback" in modes
 
     def insert_agent_memory(
         self, agent_id: str, memory_type: str, content: Dict[str, Any], created_at: str
