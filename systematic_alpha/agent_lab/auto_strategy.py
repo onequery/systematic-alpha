@@ -358,10 +358,16 @@ class AutoStrategyDaemon:
             }
         return out
 
+    def _session_date_for_market(self, market: str, now_kst: datetime) -> str:
+        m = str(market or "").strip().upper()
+        if m == "US":
+            return now_kst.astimezone(self.et).strftime("%Y%m%d")
+        return now_kst.strftime("%Y%m%d")
+
     def _refresh_intraday_signal(self, market: str, now_kst: datetime) -> Dict[str, Any]:
         market = str(market).upper()
         market_lc = market.lower()
-        run_date = now_kst.strftime("%Y%m%d")
+        run_date = self._session_date_for_market(market, now_kst)
         stamp = now_kst.strftime("%Y%m%d_%H%M%S")
 
         out_base = self.project_root / "out" / market_lc / run_date
@@ -591,7 +597,7 @@ class AutoStrategyDaemon:
             if not bool(refresh.get("ok", False)):
                 payload["refresh_error"] = refresh.get("error", "intraday_refresh_failed")
             else:
-                signal_date = now_kst.strftime("%Y%m%d")
+                signal_date = self._session_date_for_market(market, now_kst)
                 try:
                     self.orchestrator.ingest_session(market, signal_date)
                 except Exception as exc:
@@ -707,14 +713,7 @@ class AutoStrategyDaemon:
             result["markets"][mk] = state
         return result
 
-    def _maybe_send_heartbeat_telegram(self, payload: Dict[str, Any]) -> None:
-        latest = self.storage.get_latest_event("auto_strategy_heartbeat_notice")
-        if latest:
-            created = _parse_iso(str(latest.get("created_at", "")))
-            if created is not None:
-                delta = datetime.now() - created
-                if delta < timedelta(minutes=self.heartbeat_minutes):
-                    return
+    def _send_heartbeat_telegram(self, payload: Dict[str, Any]) -> None:
         monitor = payload.get("intraday_monitor", {}) if isinstance(payload, dict) else {}
         mk = monitor.get("markets", {}) if isinstance(monitor, dict) else {}
         kr = mk.get("KR", {}) if isinstance(mk, dict) else {}
@@ -734,6 +733,16 @@ class AutoStrategyDaemon:
         )
         self.storage.log_event("auto_strategy_heartbeat_notice", payload, _now_iso())
 
+    def _heartbeat_due(self, now_kst: datetime) -> bool:
+        latest = self.storage.get_latest_event("auto_strategy_heartbeat")
+        if not latest:
+            return True
+        created = _parse_iso(str(latest.get("created_at", "")))
+        if created is None:
+            return True
+        now_naive = now_kst.replace(tzinfo=None)
+        return (now_naive - created) >= timedelta(minutes=self.heartbeat_minutes)
+
     def _emit_heartbeat(self, latest: Dict[str, Any], daemon_status: str = "ok") -> None:
         now_kst = datetime.now(self.kst)
         next_poll_at = now_kst + timedelta(seconds=self.poll_seconds)
@@ -747,7 +756,7 @@ class AutoStrategyDaemon:
             "updated_at_kst": now_kst.isoformat(),
         }
         self.storage.log_event("auto_strategy_heartbeat", payload, _now_iso())
-        self._maybe_send_heartbeat_telegram(payload)
+        self._send_heartbeat_telegram(payload)
 
     def _within_restricted_window(self, now_kst: datetime) -> bool:
         # Keep strategy mutation away from open/volatile windows.
@@ -1040,14 +1049,18 @@ class AutoStrategyDaemon:
         while True:
             try:
                 latest = self.run_once()
-                self._emit_heartbeat(latest, daemon_status="ok")
+                now_kst = datetime.now(self.kst)
+                if self._heartbeat_due(now_kst):
+                    self._emit_heartbeat(latest, daemon_status="ok")
             except KeyboardInterrupt:
                 break
             except Exception as exc:
                 err = {"action": "error", "error": repr(exc), "at": _now_iso()}
                 latest = err
                 self.storage.log_event("auto_strategy_daemon_error", err, _now_iso())
-                self._emit_heartbeat(err, daemon_status="error")
+                now_kst = datetime.now(self.kst)
+                if self._heartbeat_due(now_kst):
+                    self._emit_heartbeat(err, daemon_status="error")
                 self._send_telegram(
                     "[AgentLab] 오토전략 데몬 오류\n"
                     f"오류={repr(exc)}"
