@@ -1,0 +1,317 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT_DIR"
+
+if [[ -f ".env" ]]; then
+  set -a
+  # BOM/CRLF-safe load for .env.
+  # shellcheck disable=SC1090
+  source <(awk 'NR==1{sub(/^\xef\xbb\xbf/,"")} {sub(/\r$/,"")}1' ".env")
+  set +a
+fi
+
+resolve_python_bin() {
+  local candidate="${PYTHON_BIN:-}"
+  if [[ -n "$candidate" ]]; then
+    if [[ "$candidate" =~ ^[A-Za-z]:\\ ]] || [[ "$candidate" == *"\\"* ]] || [[ "$candidate" == *.exe ]]; then
+      candidate=""
+    fi
+  fi
+  if [[ -n "$candidate" && -x "$candidate" ]]; then
+    echo "$candidate"
+    return 0
+  fi
+  if [[ -x "$HOME/anaconda3/envs/systematic-alpha/bin/python" ]]; then
+    echo "$HOME/anaconda3/envs/systematic-alpha/bin/python"
+    return 0
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    command -v python3
+    return 0
+  fi
+  command -v python
+}
+
+usage() {
+  cat <<'EOF'
+Usage: scripts/monitor_agent_lab_wsl.sh [options]
+
+Options:
+  --mode dashboard|follow   monitor mode (default: dashboard)
+  --interval SEC            dashboard refresh interval in seconds (default: 3)
+  --tail-lines N            tail lines for each log section (default: 20)
+  --event-limit N           number of recent DB events to show (default: 20)
+  --once                    render one dashboard frame and exit
+  -h, --help                show this help
+
+Examples:
+  scripts/monitor_agent_lab_wsl.sh
+  scripts/monitor_agent_lab_wsl.sh --mode follow --tail-lines 80
+  scripts/monitor_agent_lab_wsl.sh --interval 2 --event-limit 30
+EOF
+}
+
+MODE="dashboard"
+INTERVAL=3
+TAIL_LINES=20
+EVENT_LIMIT=20
+ONCE=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --mode)
+      MODE="${2:-dashboard}"
+      shift 2
+      ;;
+    --interval)
+      INTERVAL="${2:-3}"
+      shift 2
+      ;;
+    --tail-lines)
+      TAIL_LINES="${2:-20}"
+      shift 2
+      ;;
+    --event-limit)
+      EVENT_LIMIT="${2:-20}"
+      shift 2
+      ;;
+    --once)
+      ONCE=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown arg: $1" >&2
+      usage
+      exit 2
+      ;;
+  esac
+done
+
+case "$MODE" in
+  dashboard|follow) ;;
+  *)
+    echo "Unsupported --mode: $MODE (expected: dashboard|follow)" >&2
+    exit 2
+    ;;
+esac
+
+PYTHON_BIN="$(resolve_python_bin)"
+DB_PATH="$ROOT_DIR/state/agent_lab/agent_lab.sqlite"
+TODAY_KST="$(TZ=Asia/Seoul date +%Y%m%d)"
+YDAY_KST="$(TZ=Asia/Seoul date -d '-1 day' +%Y%m%d)"
+
+LOG_FILES=(
+  "$ROOT_DIR/logs/cron/agent_auto-strategy-daemon_bootstrap.log"
+  "$ROOT_DIR/logs/cron/agent_telegram-chat_bootstrap.log"
+  "$ROOT_DIR/logs/cron/agent_kr_preopen.log"
+  "$ROOT_DIR/logs/cron/agent_us_preopen.log"
+  "$ROOT_DIR/logs/cron/agent_kr_close.log"
+  "$ROOT_DIR/logs/cron/agent_us_close.log"
+  "$ROOT_DIR/logs/cron/kr_daily.log"
+  "$ROOT_DIR/logs/cron/us_daily.log"
+)
+
+prepare_logs() {
+  local f
+  for f in "${LOG_FILES[@]}"; do
+    mkdir -p "$(dirname "$f")"
+    touch "$f"
+  done
+}
+
+show_processes() {
+  echo "== Processes =="
+  local ps_out out
+  ps_out="$(ps -ef || true)"
+  if command -v rg >/dev/null 2>&1; then
+    out="$(
+      printf '%s\n' "$ps_out" | rg -n \
+        -e 'run_agent_lab_wsl\.sh --action (telegram-chat|auto-strategy-daemon)' \
+        -e 'systematic_alpha\.agent_lab\.cli .* (telegram-chat|auto-strategy-daemon)' \
+      || true
+    )"
+  else
+    out="$(
+      printf '%s\n' "$ps_out" | grep -En \
+        'run_agent_lab_wsl\.sh --action (telegram-chat|auto-strategy-daemon)|systematic_alpha\.agent_lab\.cli .* (telegram-chat|auto-strategy-daemon)' \
+      || true
+    )"
+  fi
+  if [[ -n "$out" ]]; then
+    echo "$out"
+  else
+    echo "(no matching daemon process found)"
+  fi
+}
+
+show_daemon_health() {
+  echo "== Daemon Health (from DB) =="
+  if [[ ! -f "$DB_PATH" ]]; then
+    echo "(db not found: $DB_PATH)"
+    return
+  fi
+  DB_PATH="$DB_PATH" "$PYTHON_BIN" - <<'PY'
+import os
+import sqlite3
+from datetime import datetime
+
+db = os.environ["DB_PATH"]
+con = sqlite3.connect(db)
+cur = con.cursor()
+
+def latest(event_type: str):
+    cur.execute(
+        "SELECT created_at FROM state_events WHERE event_type = ? ORDER BY event_id DESC LIMIT 1",
+        (event_type,),
+    )
+    row = cur.fetchone()
+    return row[0] if row else ""
+
+now = datetime.now()
+hb = latest("auto_strategy_heartbeat")
+st = latest("auto_strategy_daemon_start")
+tc = latest("telegram_chat_worker_start")
+ae = latest("auto_strategy_daemon_error")
+te = latest("telegram_chat_worker_error")
+
+def age_seconds(iso_text: str) -> str:
+    if not iso_text:
+        return "-"
+    try:
+        dt = datetime.fromisoformat(str(iso_text))
+        return str(int(max(0.0, (now - dt).total_seconds())))
+    except Exception:
+        return "?"
+
+print(f"auto_strategy_daemon_start: {st or '-'}")
+print(f"auto_strategy_heartbeat:    {hb or '-'} (age_sec={age_seconds(hb)})")
+print(f"telegram_chat_worker_start: {tc or '-'}")
+print(f"auto_strategy_daemon_error: {ae or '-'}")
+print(f"telegram_chat_worker_error: {te or '-'}")
+con.close()
+PY
+}
+
+show_db_events() {
+  echo "== Recent DB Events (state_events) =="
+  if [[ ! -f "$DB_PATH" ]]; then
+    echo "(db not found: $DB_PATH)"
+    return
+  fi
+  DB_PATH="$DB_PATH" EVENT_LIMIT="$EVENT_LIMIT" "$PYTHON_BIN" - <<'PY'
+import os
+import sqlite3
+from pathlib import Path
+
+db = Path(os.environ["DB_PATH"])
+limit = int(float(os.environ.get("EVENT_LIMIT", "20") or 20))
+con = sqlite3.connect(str(db))
+cur = con.cursor()
+cur.execute(
+    """
+    SELECT created_at, event_type, substr(payload_json, 1, 180)
+    FROM state_events
+    ORDER BY event_id DESC
+    LIMIT ?
+    """,
+    (limit,),
+)
+rows = cur.fetchall()
+if not rows:
+    print("(no rows)")
+else:
+    for created_at, event_type, payload_head in rows:
+        print(f"{created_at} | {event_type} | {payload_head}")
+con.close()
+PY
+}
+
+show_activity_logs() {
+  echo "== Activity Logs (today / yesterday, KST) =="
+  local p1="$ROOT_DIR/out/agent_lab/$TODAY_KST/activity_log.jsonl"
+  local p2="$ROOT_DIR/out/agent_lab/$YDAY_KST/activity_log.jsonl"
+  if [[ -f "$p1" ]]; then
+    echo "-- $p1"
+    tail -n "$TAIL_LINES" "$p1" || true
+  else
+    echo "-- $p1 (missing)"
+  fi
+  if [[ -f "$p2" ]]; then
+    echo "-- $p2"
+    tail -n "$TAIL_LINES" "$p2" || true
+  else
+    echo "-- $p2 (missing)"
+  fi
+}
+
+show_main_logs() {
+  echo "== Main Cron Logs =="
+  local f
+  for f in \
+    "$ROOT_DIR/logs/cron/agent_auto-strategy-daemon_bootstrap.log" \
+    "$ROOT_DIR/logs/cron/agent_telegram-chat_bootstrap.log"; do
+    echo "-- $f"
+    tail -n "$TAIL_LINES" "$f" || true
+  done
+}
+
+clear_screen() {
+  if [[ -t 1 ]] && [[ -n "${TERM:-}" ]]; then
+    clear || true
+  else
+    printf '\n'
+  fi
+}
+
+render_dashboard() {
+  TODAY_KST="$(TZ=Asia/Seoul date +%Y%m%d)"
+  YDAY_KST="$(TZ=Asia/Seoul date -d '-1 day' +%Y%m%d)"
+  clear_screen
+  echo "[monitor_agent_lab_wsl] $(TZ=Asia/Seoul date '+%F %T %Z')"
+  echo "root=$ROOT_DIR"
+  echo "mode=$MODE interval=${INTERVAL}s tail_lines=$TAIL_LINES event_limit=$EVENT_LIMIT"
+  echo
+  show_processes
+  echo
+  show_daemon_health
+  echo
+  show_db_events
+  echo
+  show_activity_logs
+  echo
+  show_main_logs
+  echo
+  echo "Tip: Ctrl+C to stop monitoring."
+}
+
+run_follow_mode() {
+  prepare_logs
+  echo "[monitor_agent_lab_wsl] follow mode"
+  echo "files:"
+  printf '  - %s\n' "${LOG_FILES[@]}"
+  echo "tail_lines=$TAIL_LINES"
+  echo
+  tail -n "$TAIL_LINES" -F "${LOG_FILES[@]}"
+}
+
+run_dashboard_mode() {
+  while true; do
+    render_dashboard
+    if [[ "$ONCE" == "1" ]]; then
+      break
+    fi
+    sleep "$INTERVAL"
+  done
+}
+
+if [[ "$MODE" == "follow" ]]; then
+  run_follow_mode
+else
+  run_dashboard_mode
+fi

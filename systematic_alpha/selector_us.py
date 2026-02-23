@@ -1,6 +1,7 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import csv
+import importlib
 import time
 from datetime import datetime
 from pathlib import Path
@@ -31,29 +32,61 @@ SP500_SOURCE_URL = "https://datahub.io/core/s-and-p-500-companies/r/constituents
 SP500_BUNDLED_SNAPSHOT_PATH = Path(__file__).resolve().parent / "data" / "us_sp500_snapshot.csv"
 
 
+def _normalize_us_exchange_code(raw_exchange: str) -> str:
+    raw = str(raw_exchange or "").strip()
+    upper = raw.upper()
+    return {
+        "NASD": "NASD",
+        "NASDAQ": "NASD",
+        "NYSE": "NYSE",
+        "NYS": "NYSE",
+        "AMEX": "AMEX",
+        "AMS": "AMEX",
+    }.get(upper, upper or "NASD")
+
+
+def _resolve_us_exchange_for_mojito(mojito_module, raw_exchange: str) -> str:
+    # self-heal:us-exchange-resolver-v1
+    raw = str(raw_exchange or "").strip()
+    upper = raw.upper()
+    normalized = {
+        "NASD": "NASD",
+        "NASDAQ": "NASD",
+        "NYSE": "NYSE",
+        "NYS": "NYSE",
+        "AMEX": "AMEX",
+        "AMS": "AMEX",
+    }.get(upper, upper)
+
+    try:
+        ki = importlib.import_module(mojito_module.__name__ + ".koreainvestment")
+        exchange_code3 = getattr(ki, "EXCHANGE_CODE3", {})
+        if isinstance(exchange_code3, dict):
+            for label, code in exchange_code3.items():
+                if str(code).upper() == normalized:
+                    return str(label)
+    except Exception:
+        pass
+
+    fallback = {
+        "NASD": "나스닥",
+        "NYSE": "뉴욕",
+        "AMEX": "아멕스",
+    }
+    return fallback.get(normalized, raw or "나스닥")
+
+
 class USDayTradingSelector:
     def __init__(self, mojito_module, config: StrategyConfig):
         self.mojito = mojito_module
         self.config = config
-        raw_exchange = (config.us_exchange or "").strip()
-        exchange_upper = raw_exchange.upper()
-        exchange_map = {
-            "NASD": "나스닥",
-            "NASDAQ": "나스닥",
-            "NYSE": "뉴욕",
-            "NYS": "뉴욕",
-            "AMEX": "아멕스",
-            "AMS": "아멕스",
-        }
-        broker_exchange = exchange_map.get(exchange_upper, raw_exchange or "나스닥")
-        self.broker = self.mojito.KoreaInvestment(
-            api_key=config.api_key,
-            api_secret=config.api_secret,
-            acc_no=config.acc_no,
-            exchange=broker_exchange,
-            mock=config.mock,
-        )
-        self._broker_exchange = broker_exchange
+        self._preferred_exchange_code = _normalize_us_exchange_code(config.us_exchange or "")
+        self._broker_exchange = _resolve_us_exchange_for_mojito(self.mojito, self._preferred_exchange_code)
+        self._broker_by_exchange: Dict[str, Any] = {}
+        self._symbol_exchange_hint: Dict[str, str] = {}
+        self._api_diag_counts: Dict[str, int] = {}
+        self._api_diag_samples: List[Dict[str, str]] = []
+        self.broker = self._get_broker_for_exchange(self._preferred_exchange_code)
         self.today_us = datetime.now(ZoneInfo("America/New_York")).strftime("%Y%m%d")
         self.today_kst = datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y%m%d")
         self._daily_cache: Dict[str, Optional[PrevDayStats]] = {}
@@ -62,9 +95,52 @@ class USDayTradingSelector:
         self._daily_bars_cache: Dict[str, List[Dict[str, Any]]] = {}
         self._orderbook_available = False
         self.last_stage1_scan: List[Dict[str, Any]] = []
-        self._api_diag_counts: Dict[str, int] = {}
-        self._api_diag_samples: List[Dict[str, str]] = []
         self._load_prev_stats_cache()
+
+    def _get_broker_for_exchange(self, exchange_code: str):
+        code = _normalize_us_exchange_code(exchange_code)
+        if code in self._broker_by_exchange:
+            return self._broker_by_exchange[code]
+        try:
+            broker_exchange = _resolve_us_exchange_for_mojito(self.mojito, code)
+            broker = self.mojito.KoreaInvestment(
+                api_key=self.config.api_key,
+                api_secret=self.config.api_secret,
+                acc_no=self.config.acc_no,
+                exchange=broker_exchange,
+                mock=self.config.mock,
+            )
+            self._broker_by_exchange[code] = broker
+            return broker
+        except Exception as exc:
+            self._record_api_diag("broker_create_exception", code, repr(exc))
+            return None
+
+    def _exchange_attempt_order(self, code: str, preferred_exchange: Optional[str] = None) -> List[str]:
+        symbol = normalize_symbol(code)
+        ordered: List[str] = []
+        if preferred_exchange:
+            ordered.append(_normalize_us_exchange_code(preferred_exchange))
+        hinted = self._symbol_exchange_hint.get(symbol)
+        if hinted:
+            ordered.append(_normalize_us_exchange_code(hinted))
+        ordered.append(self._preferred_exchange_code)
+        ordered.extend(["NASD", "NYSE", "AMEX"])
+        out: List[str] = []
+        seen = set()
+        for ex in ordered:
+            ex_norm = _normalize_us_exchange_code(ex)
+            if not ex_norm or ex_norm in seen:
+                continue
+            seen.add(ex_norm)
+            out.append(ex_norm)
+        return out
+
+    def _remember_symbol_exchange(self, code: str, exchange_code: str) -> None:
+        symbol = normalize_symbol(code)
+        if not symbol:
+            return
+        self._symbol_exchange_hint[symbol] = _normalize_us_exchange_code(exchange_code)
 
     def _record_api_diag(self, key: str, code: str, detail: str = "") -> None:
         self._api_diag_counts[key] = self._api_diag_counts.get(key, 0) + 1
@@ -76,6 +152,39 @@ class USDayTradingSelector:
                     "detail": detail[:500],
                 }
             )
+
+    @staticmethod
+    def _fetch_price_detail_oversea_compatible(broker: Any, code: str) -> Dict[str, Any]:
+        detail_fn = getattr(broker, "fetch_price_detail_oversea", None)
+        if callable(detail_fn):
+            return detail_fn(code)
+        # Older mojito variants expose only fetch_oversea_price.
+        oversea_price_fn = getattr(broker, "fetch_oversea_price", None)
+        if callable(oversea_price_fn):
+            return oversea_price_fn(code)
+        raise AttributeError("KoreaInvestment has no compatible overseas price-detail method")
+
+    @staticmethod
+    def _fetch_ohlcv_oversea_compatible(broker: Any, code: str) -> Dict[str, Any]:
+        for method_name in ("fetch_ohlcv_oversea", "fetch_ohlcv_overesea"):
+            ohlcv_fn = getattr(broker, method_name, None)
+            if not callable(ohlcv_fn):
+                continue
+            type_error: Optional[TypeError] = None
+            for kwargs in (
+                {"timeframe": "D", "adj_price": True},
+                {"timeframe": "D", "adjusted": True},
+                {"timeframe": "D"},
+                {},
+            ):
+                try:
+                    return ohlcv_fn(code, **kwargs)
+                except TypeError as exc:
+                    type_error = exc
+                    continue
+            if type_error is not None:
+                raise type_error
+        raise AttributeError("KoreaInvestment has no compatible overseas OHLCV method")
 
     def get_api_diagnostics(self) -> Dict[str, Any]:
         return {
@@ -516,91 +625,125 @@ class USDayTradingSelector:
         if use_cache and code in self._price_cache:
             return self._price_cache[code]
 
-        try:
-            resp = self.broker.fetch_price(code)
-        except Exception as exc:
-            self._record_api_diag("fetch_price_exception", code, repr(exc))
-            self._price_cache[code] = None
-            return None
+        for exchange_code in self._exchange_attempt_order(code):
+            broker = self._get_broker_for_exchange(exchange_code)
+            if broker is None:
+                continue
+            try:
+                resp = broker.fetch_price(code)
+            except Exception as exc:
+                self._record_api_diag("fetch_price_exception", code, f"{exchange_code}:{repr(exc)}")
+                continue
 
-        payload = first_dict(resp if isinstance(resp, dict) else {})
-        if not payload and isinstance(resp, dict):
-            payload = resp
-        if not payload:
-            detail = ""
-            if isinstance(resp, dict):
-                detail = f"rt_cd={resp.get('rt_cd')} msg_cd={resp.get('msg_cd')} msg1={resp.get('msg1')}"
-            self._record_api_diag("fetch_price_empty_payload", code, detail)
-            self._price_cache[code] = None
-            return None
+            payload = first_dict(resp if isinstance(resp, dict) else {})
+            if not payload and isinstance(resp, dict):
+                payload = resp
+            if not payload:
+                detail = ""
+                if isinstance(resp, dict):
+                    detail = f"{exchange_code}:rt_cd={resp.get('rt_cd')} msg_cd={resp.get('msg_cd')} msg1={resp.get('msg1')}"
+                self._record_api_diag("fetch_price_empty_payload", code, detail)
+                continue
 
-        parsed = self._parse_price_payload(payload)
-        if parsed.get("price") is None:
-            detail = ""
-            if isinstance(resp, dict):
-                detail = f"rt_cd={resp.get('rt_cd')} msg_cd={resp.get('msg_cd')} msg1={resp.get('msg1')}"
-            self._record_api_diag("fetch_price_no_price_field", code, detail)
-            self._price_cache[code] = None
-            return None
+            parsed = self._parse_price_payload(payload)
+            if parsed.get("price") is None:
+                detail = ""
+                if isinstance(resp, dict):
+                    detail = f"{exchange_code}:rt_cd={resp.get('rt_cd')} msg_cd={resp.get('msg_cd')} msg1={resp.get('msg1')}"
+                self._record_api_diag("fetch_price_no_price_field", code, detail)
+                continue
 
-        if parsed.get("open") is None or parsed.get("acml_volume") is None or parsed.get("low_price") is None:
-            detail = self.fetch_price_detail_snapshot(code, use_cache=use_cache)
-            if detail:
-                if parsed.get("open") is None:
-                    parsed["open"] = detail.get("open")
-                if parsed.get("acml_volume") is None:
-                    parsed["acml_volume"] = detail.get("acml_volume")
-                if parsed.get("low_price") is None:
-                    parsed["low_price"] = detail.get("low_price")
-                if not parsed.get("name") and detail.get("name"):
-                    parsed["name"] = detail.get("name")
+            if parsed.get("open") is None or parsed.get("acml_volume") is None or parsed.get("low_price") is None:
+                detail_row = self.fetch_price_detail_snapshot(
+                    code,
+                    use_cache=use_cache,
+                    preferred_exchange=exchange_code,
+                )
+                if detail_row:
+                    if parsed.get("open") is None:
+                        parsed["open"] = detail_row.get("open")
+                    if parsed.get("acml_volume") is None:
+                        parsed["acml_volume"] = detail_row.get("acml_volume")
+                    if parsed.get("low_price") is None:
+                        parsed["low_price"] = detail_row.get("low_price")
+                    if not parsed.get("name") and detail_row.get("name"):
+                        parsed["name"] = detail_row.get("name")
 
-        self._price_cache[code] = parsed
-        return parsed
+            self._remember_symbol_exchange(code, exchange_code)
+            self._price_cache[code] = parsed
+            return parsed
 
-    def fetch_price_detail_snapshot(self, code: str, use_cache: bool = True) -> Optional[Dict[str, Any]]:
+        self._price_cache[code] = None
+        return None
+
+    def fetch_price_detail_snapshot(
+        self,
+        code: str,
+        use_cache: bool = True,
+        preferred_exchange: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
         if use_cache and code in self._detail_cache:
             return self._detail_cache[code]
 
-        try:
-            resp = self.broker.fetch_price_detail_oversea(code)
-        except Exception as exc:
-            self._record_api_diag("fetch_price_detail_exception", code, repr(exc))
-            self._detail_cache[code] = None
-            return None
+        for exchange_code in self._exchange_attempt_order(code, preferred_exchange=preferred_exchange):
+            broker = self._get_broker_for_exchange(exchange_code)
+            if broker is None:
+                continue
+            try:
+                resp = self._fetch_price_detail_oversea_compatible(broker, code)
+            except Exception as exc:
+                self._record_api_diag("fetch_price_detail_exception", code, f"{exchange_code}:{repr(exc)}")
+                continue
 
-        payload = first_dict(resp if isinstance(resp, dict) else {})
-        if not payload and isinstance(resp, dict):
-            payload = resp
-        if not payload:
-            detail = ""
-            if isinstance(resp, dict):
-                detail = f"rt_cd={resp.get('rt_cd')} msg_cd={resp.get('msg_cd')} msg1={resp.get('msg1')}"
-            self._record_api_diag("fetch_price_detail_empty_payload", code, detail)
-            self._detail_cache[code] = None
-            return None
+            payload = first_dict(resp if isinstance(resp, dict) else {})
+            if not payload and isinstance(resp, dict):
+                payload = resp
+            if not payload:
+                detail = ""
+                if isinstance(resp, dict):
+                    detail = f"{exchange_code}:rt_cd={resp.get('rt_cd')} msg_cd={resp.get('msg_cd')} msg1={resp.get('msg1')}"
+                self._record_api_diag("fetch_price_detail_empty_payload", code, detail)
+                continue
 
-        parsed = self._parse_price_payload(payload)
-        self._detail_cache[code] = parsed
-        return parsed
+            parsed = self._parse_price_payload(payload)
+            self._remember_symbol_exchange(code, exchange_code)
+            self._detail_cache[code] = parsed
+            return parsed
+
+        self._detail_cache[code] = None
+        return None
 
     def fetch_prev_day_stats(self, code: str) -> Optional[PrevDayStats]:
         if code in self._daily_cache:
             return self._daily_cache[code]
 
-        try:
-            resp = self.broker.fetch_ohlcv_oversea(code, timeframe="D", adj_price=True)
-        except Exception as exc:
-            self._record_api_diag("fetch_prev_day_exception", code, repr(exc))
+        rows: List[Dict[str, Any]] = []
+        resp: Dict[str, Any] = {}
+        used_exchange = ""
+        for exchange_code in self._exchange_attempt_order(code):
+            broker = self._get_broker_for_exchange(exchange_code)
+            if broker is None:
+                continue
+            try:
+                candidate_resp = self._fetch_ohlcv_oversea_compatible(broker, code)
+            except Exception as exc:
+                self._record_api_diag("fetch_prev_day_exception", code, f"{exchange_code}:{repr(exc)}")
+                continue
+            resp = candidate_resp if isinstance(candidate_resp, dict) else {}
+            rows = latest_list_of_dict(resp)
+            if rows:
+                used_exchange = exchange_code
+                break
+            detail = f"{exchange_code}:rt_cd={resp.get('rt_cd')} msg_cd={resp.get('msg_cd')} msg1={resp.get('msg1')}"
+            self._record_api_diag("fetch_prev_day_empty_rows", code, detail)
+
+        if not rows:
             self._daily_cache[code] = None
             return None
 
-        rows = latest_list_of_dict(resp if isinstance(resp, dict) else {})
-        if not rows:
-            detail = ""
-            if isinstance(resp, dict):
-                detail = f"rt_cd={resp.get('rt_cd')} msg_cd={resp.get('msg_cd')} msg1={resp.get('msg1')}"
-            self._record_api_diag("fetch_prev_day_empty_rows", code, detail)
+        if used_exchange:
+            self._remember_symbol_exchange(code, used_exchange)
+
         parsed_rows: List[Tuple[str, float, float, float, Optional[float]]] = []
         for row in rows:
             date_key = pick_first(
@@ -786,13 +929,27 @@ class USDayTradingSelector:
         if code in self._daily_bars_cache:
             return self._daily_bars_cache[code]
 
-        try:
-            resp = self.broker.fetch_ohlcv_oversea(code, timeframe="D", adj_price=True)
-        except Exception:
+        rows: List[Dict[str, Any]] = []
+        used_exchange = ""
+        for exchange_code in self._exchange_attempt_order(code):
+            broker = self._get_broker_for_exchange(exchange_code)
+            if broker is None:
+                continue
+            try:
+                resp = self._fetch_ohlcv_oversea_compatible(broker, code)
+            except Exception as exc:
+                self._record_api_diag("fetch_daily_bars_exception", code, f"{exchange_code}:{repr(exc)}")
+                continue
+            rows = latest_list_of_dict(resp if isinstance(resp, dict) else {})
+            if rows:
+                used_exchange = exchange_code
+                break
+        if not rows:
             self._daily_bars_cache[code] = []
             return []
+        if used_exchange:
+            self._remember_symbol_exchange(code, used_exchange)
 
-        rows = latest_list_of_dict(resp if isinstance(resp, dict) else {})
         parsed: List[Dict[str, Any]] = []
         for row in rows:
             date = normalize_yyyymmdd(
@@ -1393,3 +1550,4 @@ class USDayTradingSelector:
             reverse=True,
         )
         return results
+

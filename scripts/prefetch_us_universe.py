@@ -79,14 +79,18 @@ def main() -> int:
         description="Prefetch and cache US objective universe (S&P 500 constituents)."
     )
     parser.add_argument("--project-root", type=str, default=".")
+    parser.add_argument("--output-csv", type=str, default=None)
     parser.add_argument("--source-url", type=str, default=DEFAULT_SOURCE_URL)
     parser.add_argument("--min-count", type=int, default=450)
     args = parser.parse_args()
 
     project_root = Path(args.project_root).resolve()
-    out_dir = project_root / "out"
-    today_kst = datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y%m%d")
-    out_path = out_dir / "us" / today_kst / "cache" / "us_sp500_constituents.csv"
+    if args.output_csv:
+        out_path = Path(args.output_csv).expanduser().resolve()
+    else:
+        out_dir = project_root / "out"
+        today_kst = datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y%m%d")
+        out_path = out_dir / "us" / today_kst / "cache" / "us_sp500_constituents.csv"
     min_count = max(1, args.min_count)
 
     print(f"[prefetch] source={args.source_url}", flush=True)
