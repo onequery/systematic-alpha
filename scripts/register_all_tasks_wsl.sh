@@ -13,10 +13,21 @@ MARK_END="# <<< systematic-alpha tasks end <<<"
 
 mkdir -p "$ROOT_DIR/logs/cron"
 
+if [[ -f "$ROOT_DIR/.env" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  source <(awk 'NR==1{sub(/^\xef\xbb\xbf/,"")} {sub(/\r$/,"")}1' "$ROOT_DIR/.env")
+  set +a
+fi
+
+PREFETCH_KR_UNIVERSE_SIZE="${AGENT_LAB_PREFETCH_KR_UNIVERSE_SIZE:-180}"
+PREFETCH_KR_MAX_SYMBOLS_SCAN="${AGENT_LAB_PREFETCH_KR_MAX_SYMBOLS_SCAN:-240}"
+PREFETCH_US_MIN_COUNT="${AGENT_LAB_PREFETCH_US_MIN_COUNT:-450}"
+
 NEW_BLOCK=$(cat <<EOF
 $MARK_START
 CRON_TZ=Asia/Seoul
-30 7 * * 1-5 cd "$ROOT_DIR" && "$PYTHON_BIN" scripts/prefetch_kr_universe.py >> "$ROOT_DIR/logs/cron/kr_prefetch.log" 2>&1
+30 7 * * 1-5 cd "$ROOT_DIR" && "$PYTHON_BIN" scripts/prefetch_kr_universe.py --kr-universe-size "$PREFETCH_KR_UNIVERSE_SIZE" --max-symbols-scan "$PREFETCH_KR_MAX_SYMBOLS_SCAN" >> "$ROOT_DIR/logs/cron/kr_prefetch.log" 2>&1
 50 8 * * 1-5 cd "$ROOT_DIR" && /usr/bin/env bash "$ROOT_DIR/scripts/run_agent_lab_wsl.sh" --action preopen-plan --market KR >> "$ROOT_DIR/logs/cron/agent_kr_preopen.log" 2>&1
 0 9 * * 1-5 cd "$ROOT_DIR" && /usr/bin/env bash "$ROOT_DIR/scripts/run_daily_wsl.sh" --market KR >> "$ROOT_DIR/logs/cron/kr_daily.log" 2>&1
 40 15 * * 1-5 cd "$ROOT_DIR" && /usr/bin/env bash "$ROOT_DIR/scripts/run_agent_lab_wsl.sh" --action close-report --market KR >> "$ROOT_DIR/logs/cron/agent_kr_close.log" 2>&1
@@ -25,7 +36,7 @@ CRON_TZ=Asia/Seoul
 # Ubuntu/WSL cron runs all jobs in system timezone and does not support
 # per-user timezone scheduling. For US jobs, run at both possible KST
 # times (DST/non-DST) and gate execution by current ET wall-clock.
-30 21,22 * * 1-5 cd "$ROOT_DIR" && [ "\$(TZ=America/New_York date +\\%H:\\%M)" = "08:30" ] && "$PYTHON_BIN" scripts/prefetch_us_universe.py --output-csv "$ROOT_DIR/out/us/\$(TZ=Asia/Seoul date +\\%Y\\%m\\%d)/cache/us_sp500_constituents.csv" >> "$ROOT_DIR/logs/cron/us_prefetch.log" 2>&1
+30 21,22 * * 1-5 cd "$ROOT_DIR" && [ "\$(TZ=America/New_York date +\\%H:\\%M)" = "08:30" ] && "$PYTHON_BIN" scripts/prefetch_us_universe.py --output-csv "$ROOT_DIR/out/us/\$(TZ=Asia/Seoul date +\\%Y\\%m\\%d)/cache/us_sp500_constituents.csv" --min-count "$PREFETCH_US_MIN_COUNT" >> "$ROOT_DIR/logs/cron/us_prefetch.log" 2>&1
 20 22,23 * * 1-5 cd "$ROOT_DIR" && [ "\$(TZ=America/New_York date +\\%H:\\%M)" = "09:20" ] && AGENT_LAB_STRICT_REPORT_WINDOWS=1 /usr/bin/env bash "$ROOT_DIR/scripts/run_agent_lab_wsl.sh" --action preopen-plan --market US >> "$ROOT_DIR/logs/cron/agent_us_preopen.log" 2>&1
 30 22,23 * * 1-5 cd "$ROOT_DIR" && [ "\$(TZ=America/New_York date +\\%H:\\%M)" = "09:30" ] && /usr/bin/env bash "$ROOT_DIR/scripts/run_daily_wsl.sh" --market US --exchange NASD >> "$ROOT_DIR/logs/cron/us_daily.log" 2>&1
 10 5,6 * * 2-6 cd "$ROOT_DIR" && [ "\$(TZ=America/New_York date +\\%H:\\%M)" = "16:10" ] && AGENT_LAB_STRICT_REPORT_WINDOWS=1 /usr/bin/env bash "$ROOT_DIR/scripts/run_agent_lab_wsl.sh" --action close-report --market US >> "$ROOT_DIR/logs/cron/agent_us_close.log" 2>&1

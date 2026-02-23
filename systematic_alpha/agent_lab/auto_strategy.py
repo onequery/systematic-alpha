@@ -176,6 +176,58 @@ class AutoStrategyDaemon:
             event="llm_limit_alert",
         )
 
+    def _maybe_send_refresh_timeout_alert(
+        self,
+        *,
+        market: str,
+        run_date: str,
+        elapsed_sec: float,
+        timeout_sec: int,
+        log_path: Path,
+    ) -> None:
+        cooldown_min = max(
+            1,
+            int(float(os.getenv("AGENT_LAB_REFRESH_TIMEOUT_ALERT_COOLDOWN_MINUTES", "30") or 30)),
+        )
+        latest = self.storage.list_events(event_type="auto_intraday_refresh_timeout_alert", limit=120)
+        market_upper = str(market or "").strip().upper()
+        run_date_txt = str(run_date or "")
+        now_kst = datetime.now(self.kst)
+        for row in latest:
+            payload = row.get("payload", {}) if isinstance(row, dict) else {}
+            if not isinstance(payload, dict):
+                continue
+            if str(payload.get("market", "")).strip().upper() != market_upper:
+                continue
+            if str(payload.get("run_date", "")) != run_date_txt:
+                continue
+            created = _parse_iso(str(row.get("created_at", "")))
+            if created is None:
+                continue
+            if (now_kst.replace(tzinfo=None) - created.replace(tzinfo=None)) < timedelta(minutes=cooldown_min):
+                return
+
+        payload = {
+            "market": market_upper,
+            "run_date": run_date_txt,
+            "elapsed_sec": round(float(elapsed_sec or 0.0), 2),
+            "timeout_sec": int(timeout_sec),
+            "log_path": str(log_path),
+            "cooldown_minutes": int(cooldown_min),
+            "at_kst": now_kst.isoformat(),
+        }
+        self.storage.log_event("auto_intraday_refresh_timeout_alert", payload, _now_iso())
+        self._send_telegram(
+            "[AgentLab] 리프레시 타임아웃 경고\n"
+            f"시장={market_upper}\n"
+            f"일자={run_date_txt}\n"
+            f"경과시간={payload['elapsed_sec']}s\n"
+            f"타임아웃_기준={payload['timeout_sec']}s\n"
+            f"로그={payload['log_path']}\n"
+            f"알림_쿨다운={payload['cooldown_minutes']}분",
+            event="daemon_error",
+        )
+
     def _latest_equity_rows(self) -> Dict[str, List[Dict[str, Any]]]:
         rows = self.storage.query_all(
             """
@@ -273,6 +325,7 @@ class AutoStrategyDaemon:
             "MARKET_CLOSED": "장종료",
             "INVALID_SIGNAL": "신호무효",
             "DATA_QUALITY_LOW": "데이터품질저하",
+            "STALE_SIGNAL": "신호기준일불일치",
             "NO_SIGNAL": "신호없음",
         }
         key = str(value or "").strip().upper()
@@ -304,12 +357,265 @@ class AutoStrategyDaemon:
         raw = str(value or "").strip()
         return mapping.get(raw, raw or "-")
 
+    @staticmethod
+    def _env_int(name: str, default: int, *, minimum: Optional[int] = None, maximum: Optional[int] = None) -> int:
+        try:
+            value = int(float(os.getenv(name, str(default)) or default))
+        except Exception:
+            value = int(default)
+        if minimum is not None:
+            value = max(minimum, value)
+        if maximum is not None:
+            value = min(maximum, value)
+        return value
+
+    def _derive_prefetch_limits(
+        self,
+        *,
+        market: str,
+        pre_candidates: int,
+        final_picks: int,
+        max_symbols_scan: int,
+        kr_universe_size: int,
+        us_universe_size: int,
+    ) -> Dict[str, int]:
+        # Rational cap based on decision demand:
+        # - pre_candidates controls stage1 pool demand
+        # - final_picks needs enough fallback headroom
+        demand_base = max(int(pre_candidates * 1.5), int(final_picks * 20), 120)
+        market_upper = str(market).strip().upper()
+        if market_upper == "KR":
+            default_universe = max(120, min(260, demand_base))
+            default_scan = max(default_universe, min(320, default_universe + 60))
+            target_universe = self._env_int(
+                "AGENT_LAB_PREFETCH_KR_UNIVERSE_SIZE",
+                default_universe,
+                minimum=50,
+                maximum=800,
+            )
+            target_scan = self._env_int(
+                "AGENT_LAB_PREFETCH_KR_MAX_SYMBOLS_SCAN",
+                default_scan,
+                minimum=50,
+                maximum=1200,
+            )
+            # Keep prefetch bounded near intraday scan budget to avoid refresh-time stalls.
+            runtime_scan = max(50, int(max_symbols_scan))
+            runtime_headroom = self._env_int(
+                "AGENT_LAB_PREFETCH_KR_SCAN_HEADROOM",
+                40,
+                minimum=0,
+                maximum=400,
+            )
+            runtime_scan_cap = max(runtime_scan, runtime_scan + runtime_headroom)
+            target_scan = min(target_scan, runtime_scan_cap)
+            target_universe = min(target_universe, target_scan, max(50, int(kr_universe_size)))
+            return {
+                "max_symbols_scan": int(target_scan),
+                "kr_universe_size": int(target_universe),
+            }
+
+        # US objective source is S&P500 constituents (not liquidity-ranked),
+        # so keep full constituent cache by default and cap only optional scan size.
+        default_us_universe = max(300, min(500, max(demand_base * 2, 350)))
+        target_us_universe = self._env_int(
+            "AGENT_LAB_PREFETCH_US_UNIVERSE_SIZE",
+            default_us_universe,
+            minimum=100,
+            maximum=1000,
+        )
+        target_us_universe = min(target_us_universe, max(100, int(us_universe_size)))
+        return {"us_universe_size": int(target_us_universe)}
+
+    def _prefetch_cache_targets(self, market: str, run_date: str) -> Dict[str, List[Path]]:
+        market_lc = str(market or "").strip().lower()
+        cache_dir = self.project_root / "out" / market_lc / str(run_date) / "cache"
+        if market_lc == "kr":
+            return {
+                "required": [cache_dir / "kr_universe_liquidity.csv"],
+                "recommended": [cache_dir / "kr_prev_day_stats.csv"],
+            }
+        return {
+            "required": [cache_dir / "us_sp500_constituents.csv"],
+            "recommended": [cache_dir / "us_prev_day_stats.csv"],
+        }
+
+    @staticmethod
+    def _cache_files_ready(paths: List[Path]) -> bool:
+        if not paths:
+            return True
+        for path in paths:
+            try:
+                if (not path.exists()) or path.stat().st_size <= 0:
+                    return False
+            except Exception:
+                return False
+        return True
+
+    def _run_intraday_prefetch(
+        self,
+        *,
+        market: str,
+        run_date: str,
+        now_kst: datetime,
+        pre_candidates: int,
+        final_picks: int,
+        max_symbols_scan: int,
+        kr_universe_size: int,
+        us_universe_size: int,
+    ) -> Dict[str, Any]:
+        market = str(market).strip().upper()
+        cache_targets = self._prefetch_cache_targets(market, run_date)
+        required_paths = cache_targets.get("required", [])
+        recommended_paths = cache_targets.get("recommended", [])
+        required_ready = self._cache_files_ready(required_paths)
+        if required_ready:
+            return {
+                "market": market,
+                "run_date": run_date,
+                "attempted": False,
+                "ok": True,
+                "reason": "cache_ready",
+                "required_files": [str(p) for p in required_paths],
+                "recommended_files": [str(p) for p in recommended_paths],
+            }
+
+        latest = self._latest_event_by_market("auto_intraday_prefetch", market, limit=120)
+        retry_cooldown_sec = self._env_int(
+            "AGENT_LAB_PREFETCH_RETRY_COOLDOWN_SEC",
+            900,
+            minimum=60,
+            maximum=7200,
+        )
+        if latest:
+            payload = latest.get("payload", {}) if isinstance(latest, dict) else {}
+            created = _parse_iso(str(latest.get("created_at", "")))
+            if (
+                isinstance(payload, dict)
+                and str(payload.get("run_date", "")) == str(run_date)
+                and created is not None
+            ):
+                elapsed = (now_kst.replace(tzinfo=None) - created.replace(tzinfo=None)).total_seconds()
+                if elapsed < retry_cooldown_sec and not bool(payload.get("ok", False)):
+                    return {
+                        "market": market,
+                        "run_date": run_date,
+                        "attempted": False,
+                        "ok": False,
+                        "reason": "recent_prefetch_failed_cooldown",
+                        "next_retry_in_sec": int(max(0.0, retry_cooldown_sec - elapsed)),
+                        "required_files": [str(p) for p in required_paths],
+                        "recommended_files": [str(p) for p in recommended_paths],
+                    }
+
+        limits = self._derive_prefetch_limits(
+            market=market,
+            pre_candidates=pre_candidates,
+            final_picks=final_picks,
+            max_symbols_scan=max_symbols_scan,
+            kr_universe_size=kr_universe_size,
+            us_universe_size=us_universe_size,
+        )
+        stamp = now_kst.strftime("%Y%m%d_%H%M%S")
+        log_dir = self.project_root / "logs" / "agent_lab" / run_date
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / f"intraday_prefetch_{market.lower()}_{stamp}.log"
+
+        if market == "KR":
+            cmd = [
+                sys.executable,
+                "-u",
+                "scripts/prefetch_kr_universe.py",
+                "--project-root",
+                str(self.project_root),
+                "--kr-universe-size",
+                str(max(50, int(limits.get("kr_universe_size", 180)))),
+                "--max-symbols-scan",
+                str(max(50, int(limits.get("max_symbols_scan", 240)))),
+            ]
+        else:
+            out_csv = self.project_root / "out" / "us" / run_date / "cache" / "us_sp500_constituents.csv"
+            min_count = self._env_int("AGENT_LAB_PREFETCH_US_MIN_COUNT", 450, minimum=100, maximum=700)
+            cmd = [
+                sys.executable,
+                "-u",
+                "scripts/prefetch_us_universe.py",
+                "--project-root",
+                str(self.project_root),
+                "--output-csv",
+                str(out_csv),
+                "--min-count",
+                str(min_count),
+            ]
+
+        started = time.perf_counter()
+        timeout_sec = self._env_int("AGENT_LAB_PREFETCH_TIMEOUT_SEC", 240, minimum=60, maximum=1800)
+        timed_out = False
+        stdout_text = ""
+        stderr_text = ""
+        returncode = 0
+        try:
+            completed = subprocess.run(
+                cmd,
+                cwd=str(self.project_root),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout_sec,
+            )
+            stdout_text = str(completed.stdout or "")
+            stderr_text = str(completed.stderr or "")
+            returncode = int(completed.returncode)
+        except subprocess.TimeoutExpired as exc:
+            timed_out = True
+            returncode = 124
+            stdout_text = str(exc.stdout or "")
+            stderr_text = str(exc.stderr or "")
+        elapsed = time.perf_counter() - started
+
+        required_ready_after = self._cache_files_ready(required_paths)
+        ok = bool(returncode == 0 and required_ready_after)
+        log_body = (
+            f"[intraday-prefetch] started={now_kst.isoformat()}\n"
+            f"market={market}\n"
+            f"run_date={run_date}\n"
+            f"limits={json.dumps(limits, ensure_ascii=False)}\n"
+            f"command={' '.join(cmd)}\n"
+            f"returncode={returncode}\n"
+            f"elapsed_sec={elapsed:.1f}\n"
+            f"timed_out={timed_out}\n"
+            f"required_ready_after={required_ready_after}\n\n"
+            f"[stdout]\n{stdout_text}\n\n[stderr]\n{stderr_text}\n"
+        )
+        log_path.write_text(log_body, encoding="utf-8")
+
+        payload = {
+            "market": market,
+            "run_date": run_date,
+            "attempted": True,
+            "ok": ok,
+            "returncode": int(returncode),
+            "elapsed_sec": round(elapsed, 2),
+            "timed_out": bool(timed_out),
+            "limits": limits,
+            "required_files": [str(p) for p in required_paths],
+            "recommended_files": [str(p) for p in recommended_paths],
+            "required_ready_after": bool(required_ready_after),
+            "log_path": str(log_path),
+        }
+        if not ok:
+            payload["error"] = f"returncode={returncode}"
+        self.storage.log_event("auto_intraday_prefetch", payload, _now_iso())
+        return payload
+
     def _should_use_uncapped_scan(self, market: str) -> bool:
         if not self._max_freedom_mode():
             return False
-        if not _truthy(os.getenv("AGENT_LAB_INTRADAY_UNCAPPED_WHEN_STABLE", "1")):
+        if not _truthy(os.getenv("AGENT_LAB_INTRADAY_UNCAPPED_WHEN_STABLE", "0")):
             return False
         max_elapsed = float(os.getenv("AGENT_LAB_INTRADAY_UNCAPPED_MAX_ELAPSED_SEC", "180") or 180.0)
+        min_history = self._env_int("AGENT_LAB_INTRADAY_UNCAPPED_MIN_HISTORY", 6, minimum=2, maximum=24)
         rows = self.storage.list_events(event_type="auto_intraday_signal_refresh", limit=24)
         market_rows: List[Dict[str, Any]] = []
         for row in rows:
@@ -319,11 +625,12 @@ class AutoStrategyDaemon:
             if str(payload.get("market", "")).strip().upper() != str(market).strip().upper():
                 continue
             market_rows.append(payload)
-        if not market_rows:
-            return True
+        if len(market_rows) < min_history:
+            return False
         fail_count = 0
         slow_count = 0
-        for payload in market_rows[:8]:
+        window = market_rows[:min_history]
+        for payload in window:
             ok = bool(payload.get("ok", False))
             returncode = int(payload.get("returncode", 0) or 0)
             elapsed = float(payload.get("elapsed_sec", 0.0) or 0.0)
@@ -331,7 +638,7 @@ class AutoStrategyDaemon:
                 fail_count += 1
             if elapsed > max_elapsed:
                 slow_count += 1
-        return fail_count < 2 and slow_count < 3
+        return fail_count == 0 and slow_count <= 1
 
     def _afterhours_risk_snapshot(self, market: str) -> Dict[str, Dict[str, float]]:
         out: Dict[str, Dict[str, float]] = {}
@@ -364,6 +671,65 @@ class AutoStrategyDaemon:
             return now_kst.astimezone(self.et).strftime("%Y%m%d")
         return now_kst.strftime("%Y%m%d")
 
+    def _market_now(self, market: str, now_kst: datetime) -> datetime:
+        m = str(market or "").strip().upper()
+        if m == "US":
+            return now_kst.astimezone(self.et)
+        return now_kst
+
+    def _run_scheduled_reports(self, now_kst: datetime) -> Dict[str, List[Dict[str, Any]]]:
+        # Safety net: generate preopen/close reports from daemon even if cron is down.
+        out: Dict[str, List[Dict[str, Any]]] = {}
+        for market in ("KR", "US"):
+            now_local = self._market_now(market, now_kst)
+            if now_local.weekday() >= 5:
+                continue
+
+            session_date = now_local.strftime("%Y%m%d")
+            if market == "KR":
+                schedule = [
+                    ("preopen_plan", now_local.replace(hour=8, minute=50, second=0, microsecond=0), now_local.replace(hour=9, minute=5, second=0, microsecond=0)),
+                    ("session_close_report", now_local.replace(hour=15, minute=40, second=0, microsecond=0), now_local.replace(hour=16, minute=10, second=0, microsecond=0)),
+                ]
+            else:
+                schedule = [
+                    ("preopen_plan", now_local.replace(hour=9, minute=20, second=0, microsecond=0), now_local.replace(hour=9, minute=30, second=0, microsecond=0)),
+                    ("session_close_report", now_local.replace(hour=16, minute=10, second=0, microsecond=0), now_local.replace(hour=16, minute=40, second=0, microsecond=0)),
+                ]
+
+            rows: List[Dict[str, Any]] = []
+            for event_type, target_at, window_end in schedule:
+                if now_local < target_at or now_local > window_end:
+                    continue
+                if self.orchestrator._event_already_reported(event_type, market, session_date):
+                    continue
+
+                record: Dict[str, Any] = {
+                    "event_type": event_type,
+                    "market": market,
+                    "session_date": session_date,
+                    "target_at": target_at.isoformat(timespec="seconds"),
+                    "executed_at": now_local.isoformat(timespec="seconds"),
+                }
+                try:
+                    if event_type == "preopen_plan":
+                        payload = self.orchestrator.preopen_plan_report(market=market, yyyymmdd=session_date)
+                    else:
+                        payload = self.orchestrator.session_close_report(market=market, yyyymmdd=session_date)
+                    skipped = bool(payload.get("skipped", False))
+                    record["ok"] = not skipped
+                    record["skipped"] = skipped
+                    record["reason"] = str(payload.get("reason", "")) if skipped else ""
+                except Exception as exc:
+                    record["ok"] = False
+                    record["error"] = repr(exc)
+                self.storage.log_event("auto_scheduled_report_cycle", record, _now_iso())
+                rows.append(record)
+
+            if rows:
+                out[market] = rows
+        return out
+
     def _refresh_intraday_signal(self, market: str, now_kst: datetime) -> Dict[str, Any]:
         market = str(market).upper()
         market_lc = market.lower()
@@ -389,6 +755,20 @@ class AutoStrategyDaemon:
         us_universe_size = int(float(os.getenv("AGENT_LAB_INTRADAY_US_UNIVERSE_SIZE", "500") or 500))
         rest_sleep = float(os.getenv("AGENT_LAB_INTRADAY_REST_SLEEP", "0.08") or 0.08)
         us_exchange = str(os.getenv("AGENT_LAB_US_EXCHANGE", "NASD")).strip().upper() or "NASD"
+        prefetch = self._run_intraday_prefetch(
+            market=market,
+            run_date=run_date,
+            now_kst=now_kst,
+            pre_candidates=pre_candidates,
+            final_picks=final_picks,
+            max_symbols_scan=max_symbols_scan,
+            kr_universe_size=kr_universe_size,
+            us_universe_size=us_universe_size,
+        )
+        # Keep KR universe scan bounded to avoid repeated "Loading universe" timeout when cache is missing.
+        if market == "KR":
+            kr_universe_size = min(kr_universe_size, max_symbols_scan)
+
         uncapped_mode = self._should_use_uncapped_scan(market)
         uncapped_limit = int(float(os.getenv("AGENT_LAB_INTRADAY_UNCAPPED_LIMIT", "1000000") or 1000000))
         uncapped_limit = max(1000, uncapped_limit)
@@ -452,6 +832,7 @@ class AutoStrategyDaemon:
         stdout_text = ""
         stderr_text = ""
         returncode = 0
+        refresh_timeout_sec = max(120, collect_seconds + 180)
         try:
             completed = subprocess.run(
                 cmd,
@@ -460,7 +841,7 @@ class AutoStrategyDaemon:
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                timeout=max(120, collect_seconds + 180),
+                timeout=refresh_timeout_sec,
             )
             stdout_text = str(completed.stdout or "")
             stderr_text = str(completed.stderr or "")
@@ -476,6 +857,7 @@ class AutoStrategyDaemon:
             f"command={' '.join(cmd)}\n"
             f"returncode={returncode}\n"
             f"elapsed_sec={elapsed:.1f}\n\n"
+            f"prefetch={json.dumps(prefetch, ensure_ascii=False)}\n"
             f"uncapped_mode={uncapped_mode}\n"
             f"timed_out={timed_out}\n\n"
             f"[stdout]\n{stdout_text}\n\n[stderr]\n{stderr_text}\n"
@@ -492,10 +874,19 @@ class AutoStrategyDaemon:
             "log_path": str(log_path),
             "uncapped_mode": bool(uncapped_mode),
             "timed_out": bool(timed_out),
+            "prefetch": prefetch,
         }
         if returncode != 0:
             payload["error"] = f"returncode={returncode}"
         self.storage.log_event("auto_intraday_signal_refresh", payload, _now_iso())
+        if timed_out:
+            self._maybe_send_refresh_timeout_alert(
+                market=market,
+                run_date=run_date,
+                elapsed_sec=elapsed,
+                timeout_sec=refresh_timeout_sec,
+                log_path=log_path,
+            )
         return payload
 
     def _intraday_monitor_policy(self) -> Dict[str, Any]:
@@ -571,6 +962,7 @@ class AutoStrategyDaemon:
 
     def _run_intraday_monitor_cycle(self, market: str, now_kst: datetime, *, market_open: bool) -> Dict[str, Any]:
         market = str(market).upper()
+        expected_session_date = self._session_date_for_market(market, now_kst)
         refresh_enabled = market_open and (
             self._max_freedom_mode() or _truthy(os.getenv("AGENT_LAB_INTRADAY_SIGNAL_REFRESH", "1"))
         )
@@ -579,6 +971,7 @@ class AutoStrategyDaemon:
             "executed_at_kst": now_kst.isoformat(),
             "mode": "observe" if market_open else "afterhours_observe",
             "market_open": bool(market_open),
+            "expected_session_date": expected_session_date,
             "session_date": "",
             "signal_status": "NO_SIGNAL",
             "proposal_status_counts": {},
@@ -597,9 +990,8 @@ class AutoStrategyDaemon:
             if not bool(refresh.get("ok", False)):
                 payload["refresh_error"] = refresh.get("error", "intraday_refresh_failed")
             else:
-                signal_date = self._session_date_for_market(market, now_kst)
                 try:
-                    self.orchestrator.ingest_session(market, signal_date)
+                    self.orchestrator.ingest_session(market, expected_session_date)
                 except Exception as exc:
                     payload["refresh_ok"] = False
                     payload["refresh_error"] = f"ingest_failed:{repr(exc)}"
@@ -608,22 +1000,43 @@ class AutoStrategyDaemon:
                     payload["refresh_ingest_ok"] = True
 
         signal = self._latest_session_signal_for_market(market)
+        # If latest signal is stale/missing for current session, try one more ingest by session date.
+        if market_open:
+            signal_date_pre = str(signal.get("session_date", "")) if signal else ""
+            signal_stale_pre = (not signal_date_pre) or (signal_date_pre != expected_session_date)
+            if signal_stale_pre:
+                payload["fallback_ingest_attempted"] = True
+                try:
+                    self.orchestrator.ingest_session(market, expected_session_date)
+                except Exception as exc:
+                    payload["fallback_ingest_ok"] = False
+                    payload["fallback_ingest_error"] = repr(exc)
+                else:
+                    payload["fallback_ingest_ok"] = True
+                    signal = self._latest_session_signal_for_market(market)
+
         signal_date = str(signal.get("session_date", "")) if signal else ""
-        signal_status = str(signal.get("status_code", "NO_SIGNAL")) if signal else "NO_SIGNAL"
-        status_counts = self._proposal_status_counts(market, signal_date) if signal_date else {}
+        signal_status_raw = str(signal.get("status_code", "NO_SIGNAL")) if signal else "NO_SIGNAL"
+        signal_is_stale = bool(signal_date) and signal_date != expected_session_date
+        signal_status = "STALE_SIGNAL" if signal_is_stale else signal_status_raw
+        proposal_date = expected_session_date if market_open else signal_date
+        status_counts = self._proposal_status_counts(market, proposal_date) if proposal_date else {}
         payload["session_date"] = signal_date
+        payload["signal_status_raw"] = signal_status_raw
+        payload["signal_is_stale"] = signal_is_stale
         payload["signal_status"] = signal_status
+        payload["proposal_session_date"] = proposal_date
         payload["proposal_status_counts"] = status_counts
 
         # Optional advanced mode: re-run propose cycle during regular sessions only.
         propose_enabled = market_open and (
             self._max_freedom_mode() or _truthy(os.getenv("AGENT_LAB_INTRADAY_MONITOR_PROPOSE", "1"))
         )
-        if propose_enabled and signal and signal_status == "SIGNAL_OK":
+        if propose_enabled and signal and signal_status_raw == "SIGNAL_OK" and not signal_is_stale:
             try:
                 proposed = self.orchestrator.propose_orders(
                     market=market,
-                    yyyymmdd=signal_date,
+                    yyyymmdd=expected_session_date,
                     auto_execute=True,
                 )
                 proposals = list(proposed.get("proposals") or [])
@@ -639,6 +1052,14 @@ class AutoStrategyDaemon:
                 payload["propose_triggered"] = True
                 payload["propose_ok"] = False
                 payload["propose_error"] = repr(exc)
+        elif propose_enabled and market_open:
+            payload["propose_triggered"] = False
+            if signal_is_stale:
+                payload["propose_skip_reason"] = "stale_signal_date_mismatch"
+            elif not signal:
+                payload["propose_skip_reason"] = "missing_signal_for_session"
+            else:
+                payload["propose_skip_reason"] = f"signal_status_not_ok:{signal_status_raw}"
         if not market_open:
             payload["afterhours_risk"] = self._afterhours_risk_snapshot(market)
 
@@ -930,80 +1351,86 @@ class AutoStrategyDaemon:
 
     def run_once(self) -> Dict[str, Any]:
         now_kst = datetime.now(self.kst)
+        scheduled_reports = self._run_scheduled_reports(now_kst)
         intraday_monitor = self._run_intraday_monitor(now_kst)
         triggers = self._detect_triggers(now_kst)
 
+        def _attach_reports(payload: Dict[str, Any]) -> Dict[str, Any]:
+            if scheduled_reports:
+                payload["scheduled_reports"] = scheduled_reports
+            return payload
+
         if not triggers:
-            result = {
+            result = _attach_reports({
                 "action": "monitor_only" if intraday_monitor.get("executed_markets") else "skip",
                 "reason": "no_triggers",
                 "now_kst": now_kst.isoformat(),
                 "trigger_count": 0,
                 "intraday_monitor": intraday_monitor,
-            }
+            })
             return result
 
         if self._within_restricted_window(now_kst):
-            result = {
+            result = _attach_reports({
                 "action": "skip",
                 "reason": "restricted_window",
                 "now_kst": now_kst.isoformat(),
                 "triggers": [t.__dict__ for t in triggers],
                 "intraday_monitor": intraday_monitor,
-            }
+            })
             return result
 
         if not self._cooldown_ok(now_kst):
-            result = {
+            result = _attach_reports({
                 "action": "skip",
                 "reason": "cooldown_or_daily_limit",
                 "now_kst": now_kst.isoformat(),
                 "triggers": [t.__dict__ for t in triggers],
                 "intraday_monitor": intraday_monitor,
-            }
+            })
             return result
 
         if not self._auto_weekly_council_enabled():
-            return {
+            return _attach_reports({
                 "action": "skip",
                 "reason": "auto_weekly_council_disabled",
                 "now_kst": now_kst.isoformat(),
                 "triggers": [t.__dict__ for t in triggers],
                 "intraday_monitor": intraday_monitor,
-            }
+            })
 
         iso_year, iso_week, _ = now_kst.isocalendar()
         week_id = f"{iso_year}-W{iso_week:02d}"
         if not self._within_weekly_council_window(now_kst):
-            return {
+            return _attach_reports({
                 "action": "skip",
                 "reason": "outside_weekly_council_window",
                 "week_id": week_id,
                 "now_kst": now_kst.isoformat(),
                 "triggers": [t.__dict__ for t in triggers],
                 "intraday_monitor": intraday_monitor,
-            }
+            })
         if self._weekly_council_done(week_id):
-            return {
+            return _attach_reports({
                 "action": "skip",
                 "reason": "weekly_council_already_done",
                 "week_id": week_id,
                 "now_kst": now_kst.isoformat(),
                 "triggers": [t.__dict__ for t in triggers],
                 "intraday_monitor": intraday_monitor,
-            }
+            })
 
         vote = self._llm_vote(now_kst, triggers)
         self._maybe_send_llm_limit_alert(vote.get("raw_reason") or vote.get("reason") or "")
         if (not vote["should_update_now"]) or vote["wait_minutes"] > 0:
-            result = {
+            result = _attach_reports({
                 "action": "skip",
                 "reason": "agent_vote_delay",
                 "vote": vote,
                 "now_kst": now_kst.isoformat(),
                 "triggers": [t.__dict__ for t in triggers],
                 "intraday_monitor": intraday_monitor,
-            }
+            })
             return result
 
         updated = self._run_council_update(now_kst, triggers, vote)
@@ -1023,7 +1450,7 @@ class AutoStrategyDaemon:
             ,
             event="auto_strategy_update",
         )
-        return {"action": "updated", "intraday_monitor": intraday_monitor, **updated}
+        return _attach_reports({"action": "updated", "intraday_monitor": intraday_monitor, **updated})
 
     def run(self, *, once: bool = False) -> Dict[str, Any]:
         self.storage.log_event(

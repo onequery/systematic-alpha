@@ -71,6 +71,8 @@ chmod +x scripts/*.sh
 동작 요약:
 - `reset_tasks_preserve_state_wsl.sh`는 내부적으로 `remove_all_tasks_wsl.sh` + `register_all_tasks_wsl.sh`를 실행합니다.
 - `INIT_AGENT_LAB=0`으로 동작하므로 기존 자본/전략/메모리 상태는 유지하고 크론/데몬만 재등록·재기동합니다.
+- 추가로 `cron` 데몬 생존 여부를 점검하고, 죽어 있으면 자동 시작을 시도합니다(필요 시 `sudo` 비밀번호 입력).
+- `cron` 시작 실패 시 reset은 오류로 종료되어, "등록은 됐지만 실행은 안 되는" 상태를 막습니다.
 
 모니터링(실행 중 상태 확인):
 
@@ -117,6 +119,9 @@ ps -ef | grep run_agent_lab_wsl.sh | grep -v grep
 - `auto-strategy-daemon`은 기본값에서 주간회의를 임의 호출하지 않습니다.
 - 주간회의/주간보고는 위 일요일 스케줄 태스크가 담당합니다.
 - WSL(Ubuntu) `cron`은 작업별 타임존 실행을 지원하지 않으므로, US 작업은 KST에서 DST/비DST 후보 시각 2개에 등록하고 ET 시각 일치 조건으로 실제 실행을 게이트합니다.
+- 프리패치는 기본적으로 KR `universe=180`, `scan=240`으로 제한되어 API 부하/타임아웃을 줄입니다.
+- 크론 프리패치가 실패/누락되어도 `auto-strategy-daemon`이 장중 리프레시 직전에 온디맨드 프리패치를 1회 보강 시도합니다.
+- 조정 변수: `AGENT_LAB_PREFETCH_KR_UNIVERSE_SIZE`, `AGENT_LAB_PREFETCH_KR_MAX_SYMBOLS_SCAN`, `AGENT_LAB_PREFETCH_TIMEOUT_SEC`.
 
 전략 승격 규칙(주간회의):
 - 일반 승격: `점수>=0.60` 2주 연속 + `리스크 위반<=3회` + `위반율<=15%` + `주간 제안수>=10`

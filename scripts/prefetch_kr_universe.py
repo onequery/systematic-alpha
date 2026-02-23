@@ -74,8 +74,18 @@ def main() -> int:
     )
     parser.add_argument("--project-root", type=str, default=".")
     parser.add_argument("--key-file", type=str, default=None)
-    parser.add_argument("--kr-universe-size", type=int, default=500)
-    parser.add_argument("--max-symbols-scan", type=int, default=500)
+    parser.add_argument(
+        "--kr-universe-size",
+        type=int,
+        default=180,
+        help="Target KR objective pool size for cache build (bounded for pre-open stability).",
+    )
+    parser.add_argument(
+        "--max-symbols-scan",
+        type=int,
+        default=240,
+        help="KR prefetch scan cap before open (higher = broader but slower).",
+    )
     parser.add_argument("--force-refresh", action="store_true", default=False)
     args = parser.parse_args()
 
