@@ -140,6 +140,171 @@ class PaperBroker:
                 continue
         return {"ok": False, "reason": "all_exchange_attempts_failed", "attempts": attempts}
 
+    @staticmethod
+    def _to_float(value: Any, default: float = 0.0) -> float:
+        try:
+            if value is None:
+                return float(default)
+            text = str(value).strip().replace(",", "")
+            if text == "":
+                return float(default)
+            return float(text)
+        except Exception:
+            return float(default)
+
+    @classmethod
+    def _pick_value(cls, row: Dict[str, Any], keys: List[str], default: float = 0.0) -> float:
+        for key in keys:
+            if key in row:
+                value = cls._to_float(row.get(key), default=default)
+                if value != default:
+                    return value
+        return cls._to_float(row.get(keys[0], default), default=default) if keys else float(default)
+
+    @classmethod
+    def _parse_balance_domestic(cls, payload: Dict[str, Any]) -> Dict[str, Any]:
+        output1 = payload.get("output1", [])
+        output2 = payload.get("output2", [])
+        if not isinstance(output1, list):
+            output1 = []
+        if not isinstance(output2, list):
+            output2 = []
+        summary = output2[0] if output2 else {}
+        if not isinstance(summary, dict):
+            summary = {}
+
+        cash_krw = cls._pick_value(summary, ["dnca_tot_amt", "ord_psbl_cash", "dnca_tot_amt2", "tot_dnca"])
+        equity_krw = cls._pick_value(summary, ["tot_evlu_amt", "scts_evlu_amt", "tot_asst_amt", "tot_eval_amt"], default=cash_krw)
+        positions: List[Dict[str, Any]] = []
+        for row in output1:
+            if not isinstance(row, dict):
+                continue
+            symbol = str(row.get("pdno") or row.get("symbol") or "").strip().upper()
+            qty = cls._pick_value(row, ["hldg_qty", "hold_qty", "ord_psbl_qty", "qty"])
+            if not symbol or qty <= 0:
+                continue
+            avg_price = cls._pick_value(row, ["pchs_avg_pric", "pchs_pric", "avg_pric", "avg_price"])
+            market_value = cls._pick_value(row, ["evlu_amt", "evlu_pfls_amt", "evlu_erng_rt", "market_value"])
+            if market_value <= 0 and avg_price > 0:
+                market_value = avg_price * qty
+            positions.append(
+                {
+                    "market": "KR",
+                    "symbol": symbol,
+                    "quantity": float(qty),
+                    "avg_price": float(avg_price),
+                    "market_value_krw": float(max(0.0, market_value)),
+                    "currency": "KRW",
+                    "fx_rate": 1.0,
+                    "payload": row,
+                }
+            )
+        return {
+            "market": "KR",
+            "cash_krw": float(cash_krw),
+            "equity_krw": float(max(equity_krw, cash_krw)),
+            "positions": positions,
+            "raw": payload,
+        }
+
+    @classmethod
+    def _parse_balance_oversea(cls, payload: Dict[str, Any]) -> Dict[str, Any]:
+        output1 = payload.get("output1", [])
+        output2 = payload.get("output2", [])
+        if not isinstance(output1, list):
+            output1 = []
+        if not isinstance(output2, list):
+            output2 = []
+        summary = output2[0] if output2 else {}
+        if not isinstance(summary, dict):
+            summary = {}
+
+        # Overseas API may return local-currency values. Prefer KRW fields if present.
+        cash_krw = cls._pick_value(summary, ["frcr_evlu_pfls_amt", "tot_evlu_pfls_amt", "ovrs_ord_psbl_amt", "cash_amt"])
+        equity_krw = cls._pick_value(summary, ["tot_evlu_amt", "frcr_buy_amt_smtl", "ovrs_tot_pfls", "tot_asst_amt"], default=cash_krw)
+        positions: List[Dict[str, Any]] = []
+        for row in output1:
+            if not isinstance(row, dict):
+                continue
+            symbol = str(
+                row.get("ovrs_pdno")
+                or row.get("pdno")
+                or row.get("symb")
+                or row.get("symbol")
+                or ""
+            ).strip().upper()
+            qty = cls._pick_value(row, ["ovrs_cblc_qty", "hldg_qty", "ord_psbl_qty", "qty"])
+            if not symbol or qty <= 0:
+                continue
+            avg_price = cls._pick_value(row, ["pchs_avg_pric", "avg_pric", "avg_price"])
+            fx_rate = cls._pick_value(row, ["bass_exrt", "frcr_exrt", "fx_rate"], default=1.0)
+            if fx_rate <= 0:
+                fx_rate = 1.0
+            market_value_krw = cls._pick_value(
+                row,
+                ["frcr_evlu_amt2", "evlu_pfls_amt", "evlu_amt", "market_value_krw"],
+            )
+            if market_value_krw <= 0:
+                local_px = cls._pick_value(row, ["now_pric2", "ovrs_now_pric1", "last", "close"])
+                if local_px <= 0:
+                    local_px = avg_price
+                market_value_krw = qty * local_px * fx_rate
+            positions.append(
+                {
+                    "market": "US",
+                    "symbol": symbol,
+                    "quantity": float(qty),
+                    "avg_price": float(avg_price * fx_rate),
+                    "market_value_krw": float(max(0.0, market_value_krw)),
+                    "currency": str(row.get("tr_crcy_cd") or row.get("crcy_cd") or "USD").upper(),
+                    "fx_rate": float(fx_rate),
+                    "payload": row,
+                }
+            )
+        return {
+            "market": "US",
+            "cash_krw": float(cash_krw),
+            "equity_krw": float(max(equity_krw, cash_krw)),
+            "positions": positions,
+            "raw": payload,
+        }
+
+    def fetch_account_snapshot(self, market: str = "ALL") -> Dict[str, Any]:
+        market_upper = str(market or "ALL").strip().upper()
+        targets = ["KR", "US"] if market_upper in {"ALL", "*"} else [market_upper]
+        out: Dict[str, Any] = {
+            "ok": False,
+            "market_scope": "ALL" if len(targets) > 1 else targets[0],
+            "cash_krw": 0.0,
+            "equity_krw": 0.0,
+            "positions": [],
+            "markets": {},
+            "errors": [],
+            "fetched_at": datetime.now().isoformat(timespec="seconds"),
+            "source": self.execution_mode,
+        }
+
+        for mk in targets:
+            broker = self._get_broker(mk)
+            if broker is None:
+                out["errors"].append(f"{mk}:broker_unavailable")
+                continue
+            try:
+                payload = broker.fetch_balance()
+                if mk == "KR":
+                    parsed = self._parse_balance_domestic(payload if isinstance(payload, dict) else {})
+                else:
+                    parsed = self._parse_balance_oversea(payload if isinstance(payload, dict) else {})
+                out["markets"][mk] = parsed
+                out["cash_krw"] += float(parsed.get("cash_krw", 0.0) or 0.0)
+                out["equity_krw"] += float(parsed.get("equity_krw", 0.0) or 0.0)
+                out["positions"].extend(list(parsed.get("positions", []) or []))
+            except Exception as exc:
+                out["errors"].append(f"{mk}:{repr(exc)}")
+
+        out["ok"] = len(out["errors"]) == 0 and len(out["markets"]) == len(targets)
+        return out
+
     def execute_orders(
         self,
         *,

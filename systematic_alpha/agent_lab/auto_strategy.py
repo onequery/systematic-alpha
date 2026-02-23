@@ -96,9 +96,30 @@ class AutoStrategyDaemon:
         self.http = requests.Session()
         self.http.trust_env = False
         default_events = "trade_executed,preopen_plan,session_close_report,weekly_council"
-        mandatory = {"trade_executed", "preopen_plan", "session_close_report", "weekly_council"}
+        mandatory = {
+            "trade_executed",
+            "preopen_plan",
+            "session_close_report",
+            "weekly_council",
+            "sync_mismatch",
+            "refresh_timeout",
+            "daemon_error",
+            "llm_limit_alert",
+            "broker_api_error",
+        }
         parsed = _parse_csv_set(os.getenv("AGENT_LAB_NOTIFY_EVENTS", default_events))
         self.allowed_notify_events = parsed.union(mandatory)
+        self.event_batch_enabled = _truthy(os.getenv("AGENT_LAB_EVENT_BATCH_ENABLED", "1"))
+        self.event_batch_minutes = max(1, int(float(os.getenv("AGENT_LAB_EVENT_BATCH_MINUTES", "30") or 30)))
+        self.event_batch_max_items = max(1, int(float(os.getenv("AGENT_LAB_EVENT_BATCH_MAX_ITEMS", "30") or 30)))
+        self.runtime_retention_days = max(
+            1,
+            int(float(os.getenv("AGENT_LAB_RUNTIME_RETENTION_DAYS", "30") or 30)),
+        )
+        self.shadow_retention_days = max(
+            1,
+            int(float(os.getenv("AGENT_LAB_SHADOW_RETENTION_DAYS", "90") or 90)),
+        )
 
     def close(self) -> None:
         self.orchestrator.close()
@@ -135,6 +156,27 @@ class AutoStrategyDaemon:
         if not self.telegram_enabled:
             return
         if not self._allow_event(event):
+            return
+        key = str(event or "").strip().lower()
+        immediate_events = {
+            "trade_executed",
+            "preopen_plan",
+            "session_close_report",
+            "weekly_council",
+            "sync_mismatch",
+            "refresh_timeout",
+            "daemon_error",
+            "llm_limit_alert",
+            "broker_api_error",
+        }
+        if self.event_batch_enabled and key not in immediate_events:
+            self.storage.insert_event_batch(
+                batch_key="pending",
+                events={"event": key, "text": str(text or ""), "queued_at": _now_iso()},
+                sent=False,
+                created_at=_now_iso(),
+                sent_at=None,
+            )
             return
         rendered = event_prefixed_text(text, event)
         payload: Dict[str, Any] = {
@@ -225,8 +267,118 @@ class AutoStrategyDaemon:
             f"타임아웃_기준={payload['timeout_sec']}s\n"
             f"로그={payload['log_path']}\n"
             f"알림_쿨다운={payload['cooldown_minutes']}분",
-            event="daemon_error",
+            event="refresh_timeout",
         )
+
+    def _flush_event_batch_if_due(self, now_kst: datetime) -> None:
+        if not self.event_batch_enabled:
+            return
+        latest = self.storage.get_latest_event_batch("summary")
+        if latest:
+            created = _parse_iso(str(latest.get("created_at", "")))
+            if created is not None:
+                now_naive = now_kst.replace(tzinfo=None)
+                if (now_naive - created.replace(tzinfo=None)) < timedelta(minutes=self.event_batch_minutes):
+                    return
+        pending = self.storage.list_unsent_event_batches(batch_key="pending", limit=max(50, self.event_batch_max_items * 4))
+        if not pending:
+            return
+        counts: Dict[str, int] = {}
+        samples: List[str] = []
+        batch_ids: List[int] = []
+        for row in pending[: max(1, self.event_batch_max_items)]:
+            batch_ids.append(int(row.get("event_batch_id", 0) or 0))
+            evt = row.get("events", {}) if isinstance(row, dict) else {}
+            if not isinstance(evt, dict):
+                evt = {}
+            key = str(evt.get("event", "misc")).strip().lower() or "misc"
+            counts[key] = counts.get(key, 0) + 1
+            if len(samples) < 3:
+                txt = str(evt.get("text", "")).strip().replace("\n", " ")
+                if len(txt) > 80:
+                    txt = txt[:80] + "..."
+                if txt:
+                    samples.append(txt)
+        total = int(sum(counts.values()))
+        if total <= 0:
+            return
+        top = sorted(counts.items(), key=lambda x: x[1], reverse=True)[:5]
+        lines = [
+            "[AgentLab] 이벤트 요약 배치",
+            f"구간={self.event_batch_minutes}분",
+            f"이벤트수={total}",
+            f"상위={', '.join([f'{k}:{v}' for k, v in top])}",
+        ]
+        if samples:
+            lines.append(f"샘플={samples[0]}")
+        text = "\n".join(lines)
+        try:
+            rendered = event_prefixed_text(text, "session_monitor")
+            payload: Dict[str, Any] = {
+                "chat_id": self.telegram_chat_id,
+                "text": _truncate(rendered),
+                "disable_web_page_preview": True,
+            }
+            if self.telegram_disable_notification:
+                payload["disable_notification"] = True
+            if self.telegram_thread_id:
+                payload["message_thread_id"] = self.telegram_thread_id
+            self.http.post(
+                f"https://api.telegram.org/bot{self.telegram_token}/sendMessage",
+                data=payload,
+                timeout=15,
+            )
+            sent = True
+        except Exception:
+            sent = False
+        sent_at = _now_iso()
+        self.storage.insert_event_batch(
+            batch_key="summary",
+            events={"counts": counts, "total": total, "samples": samples, "window_minutes": self.event_batch_minutes},
+            sent=sent,
+            created_at=sent_at,
+            sent_at=sent_at if sent else None,
+        )
+        if sent:
+            self.storage.mark_event_batches_sent(batch_ids, sent_at=sent_at)
+
+    def _sync_gate(self) -> Dict[str, Any]:
+        if not self.orchestrator._unified_shadow_mode():
+            return {
+                "ok": True,
+                "matched": True,
+                "blocked": False,
+                "reason": "legacy_execution_mode",
+            }
+        strict = _truthy(os.getenv("AGENT_LAB_SYNC_STRICT", "1"))
+        return self.orchestrator.sync_account(market="ALL", strict=strict)
+
+    def _maybe_run_retention_cleanup(self, now_kst: datetime) -> None:
+        key = "runtime_cleanup_last_kst_date"
+        today = now_kst.strftime("%Y%m%d")
+        last_done = str(self.storage.get_system_meta(key, "") or "")
+        if last_done == today:
+            return
+        try:
+            removed = self.storage.cleanup_legacy_runtime_state(
+                retain_days=self.runtime_retention_days,
+                shadow_retain_days=self.shadow_retention_days,
+                keep_agent_memories=int(float(os.getenv("AGENT_LAB_KEEP_AGENT_MEMORIES", "300") or 300)),
+            )
+            payload = {
+                "date_kst": today,
+                "runtime_retention_days": self.runtime_retention_days,
+                "shadow_retention_days": self.shadow_retention_days,
+                "removed": removed,
+            }
+            self.storage.log_event("runtime_retention_cleanup", payload, _now_iso())
+            self.storage.upsert_system_meta(key, today, _now_iso())
+        except Exception as exc:
+            self.storage.log_event(
+                "runtime_retention_cleanup_error",
+                {"date_kst": today, "error": repr(exc)},
+                _now_iso(),
+            )
 
     def _latest_equity_rows(self) -> Dict[str, List[Dict[str, Any]]]:
         rows = self.storage.query_all(
@@ -960,7 +1112,14 @@ class AutoStrategyDaemon:
             out[str(row.get("status", "UNKNOWN"))] = int(row.get("c", 0) or 0)
         return out
 
-    def _run_intraday_monitor_cycle(self, market: str, now_kst: datetime, *, market_open: bool) -> Dict[str, Any]:
+    def _run_intraday_monitor_cycle(
+        self,
+        market: str,
+        now_kst: datetime,
+        *,
+        market_open: bool,
+        sync_blocked: bool = False,
+    ) -> Dict[str, Any]:
         market = str(market).upper()
         expected_session_date = self._session_date_for_market(market, now_kst)
         refresh_enabled = market_open and (
@@ -980,6 +1139,7 @@ class AutoStrategyDaemon:
             "refresh_ok": False,
             "propose_triggered": False,
             "propose_ok": False,
+            "sync_blocked": bool(sync_blocked),
         }
         if refresh_enabled:
             payload["refresh_triggered"] = True
@@ -1030,7 +1190,7 @@ class AutoStrategyDaemon:
         payload["proposal_status_counts"] = status_counts
 
         # Optional advanced mode: re-run propose cycle during regular sessions only.
-        propose_enabled = market_open and (
+        propose_enabled = (not sync_blocked) and market_open and (
             self._max_freedom_mode() or _truthy(os.getenv("AGENT_LAB_INTRADAY_MONITOR_PROPOSE", "1"))
         )
         if propose_enabled and signal and signal_status_raw == "SIGNAL_OK" and not signal_is_stale:
@@ -1061,6 +1221,9 @@ class AutoStrategyDaemon:
                 payload["propose_skip_reason"] = "missing_signal_for_session"
             else:
                 payload["propose_skip_reason"] = f"signal_status_not_ok:{signal_status_raw}"
+        elif sync_blocked and market_open:
+            payload["propose_triggered"] = False
+            payload["propose_skip_reason"] = "sync_blocked"
         if not market_open:
             payload["afterhours_risk"] = self._afterhours_risk_snapshot(market)
 
@@ -1083,7 +1246,7 @@ class AutoStrategyDaemon:
             )
         return payload
 
-    def _run_intraday_monitor(self, now_kst: datetime) -> Dict[str, Any]:
+    def _run_intraday_monitor(self, now_kst: datetime, *, sync_blocked: bool = False) -> Dict[str, Any]:
         policy = self._intraday_monitor_policy()
         result: Dict[str, Any] = {
             "enabled": bool(policy.get("enabled", False)),
@@ -1091,6 +1254,7 @@ class AutoStrategyDaemon:
             "enabled_agents": list(policy.get("enabled_agents", [])),
             "markets": {},
             "executed_markets": [],
+            "sync_blocked": bool(sync_blocked),
         }
         if not result["enabled"]:
             for mk in ["KR", "US"]:
@@ -1123,7 +1287,7 @@ class AutoStrategyDaemon:
                 result["markets"][mk] = state
                 continue
 
-            cycle = self._run_intraday_monitor_cycle(mk, now_kst, market_open=open_now)
+            cycle = self._run_intraday_monitor_cycle(mk, now_kst, market_open=open_now, sync_blocked=sync_blocked)
             state["state"] = "executed" if open_now else "outside_window"
             state["session_date"] = str(cycle.get("session_date", ""))
             state["signal_status"] = str(cycle.get("signal_status", ""))
@@ -1352,23 +1516,28 @@ class AutoStrategyDaemon:
 
     def run_once(self) -> Dict[str, Any]:
         now_kst = datetime.now(self.kst)
+        self._maybe_run_retention_cleanup(now_kst)
+        sync_status = self._sync_gate()
+        sync_blocked = bool(sync_status.get("blocked", False))
         scheduled_reports = self._run_scheduled_reports(now_kst)
-        intraday_monitor = self._run_intraday_monitor(now_kst)
+        intraday_monitor = self._run_intraday_monitor(now_kst, sync_blocked=sync_blocked)
         triggers = self._detect_triggers(now_kst)
 
         def _attach_reports(payload: Dict[str, Any]) -> Dict[str, Any]:
             if scheduled_reports:
                 payload["scheduled_reports"] = scheduled_reports
+            payload["sync_status"] = sync_status
             return payload
 
         if not triggers:
             result = _attach_reports({
                 "action": "monitor_only" if intraday_monitor.get("executed_markets") else "skip",
-                "reason": "no_triggers",
+                "reason": "sync_blocked" if sync_blocked else "no_triggers",
                 "now_kst": now_kst.isoformat(),
                 "trigger_count": 0,
                 "intraday_monitor": intraday_monitor,
             })
+            self._flush_event_batch_if_due(now_kst)
             return result
 
         if self._within_restricted_window(now_kst):
@@ -1379,6 +1548,7 @@ class AutoStrategyDaemon:
                 "triggers": [t.__dict__ for t in triggers],
                 "intraday_monitor": intraday_monitor,
             })
+            self._flush_event_batch_if_due(now_kst)
             return result
 
         if not self._cooldown_ok(now_kst):
@@ -1389,21 +1559,24 @@ class AutoStrategyDaemon:
                 "triggers": [t.__dict__ for t in triggers],
                 "intraday_monitor": intraday_monitor,
             })
+            self._flush_event_batch_if_due(now_kst)
             return result
 
         if not self._auto_weekly_council_enabled():
-            return _attach_reports({
+            out = _attach_reports({
                 "action": "skip",
                 "reason": "auto_weekly_council_disabled",
                 "now_kst": now_kst.isoformat(),
                 "triggers": [t.__dict__ for t in triggers],
                 "intraday_monitor": intraday_monitor,
             })
+            self._flush_event_batch_if_due(now_kst)
+            return out
 
         iso_year, iso_week, _ = now_kst.isocalendar()
         week_id = f"{iso_year}-W{iso_week:02d}"
         if not self._within_weekly_council_window(now_kst):
-            return _attach_reports({
+            out = _attach_reports({
                 "action": "skip",
                 "reason": "outside_weekly_council_window",
                 "week_id": week_id,
@@ -1411,8 +1584,10 @@ class AutoStrategyDaemon:
                 "triggers": [t.__dict__ for t in triggers],
                 "intraday_monitor": intraday_monitor,
             })
+            self._flush_event_batch_if_due(now_kst)
+            return out
         if self._weekly_council_done(week_id):
-            return _attach_reports({
+            out = _attach_reports({
                 "action": "skip",
                 "reason": "weekly_council_already_done",
                 "week_id": week_id,
@@ -1420,6 +1595,8 @@ class AutoStrategyDaemon:
                 "triggers": [t.__dict__ for t in triggers],
                 "intraday_monitor": intraday_monitor,
             })
+            self._flush_event_batch_if_due(now_kst)
+            return out
 
         vote = self._llm_vote(now_kst, triggers)
         self._maybe_send_llm_limit_alert(vote.get("raw_reason") or vote.get("reason") or "")
@@ -1432,6 +1609,7 @@ class AutoStrategyDaemon:
                 "triggers": [t.__dict__ for t in triggers],
                 "intraday_monitor": intraday_monitor,
             })
+            self._flush_event_batch_if_due(now_kst)
             return result
 
         updated = self._run_council_update(now_kst, triggers, vote)
@@ -1451,7 +1629,9 @@ class AutoStrategyDaemon:
             ,
             event="auto_strategy_update",
         )
-        return _attach_reports({"action": "updated", "intraday_monitor": intraday_monitor, **updated})
+        out = _attach_reports({"action": "updated", "intraday_monitor": intraday_monitor, **updated})
+        self._flush_event_batch_if_due(now_kst)
+        return out
 
     def run(self, *, once: bool = False) -> Dict[str, Any]:
         self.storage.log_event(

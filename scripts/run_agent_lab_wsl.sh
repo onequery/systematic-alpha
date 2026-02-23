@@ -128,6 +128,21 @@ case "$ACTION" in
   close-report)
     run_cli close-report --market "$MARKET" --date "$RUN_DATE"
     ;;
+  sync-account)
+    if [[ "${AGENT_LAB_SYNC_STRICT:-1}" == "1" ]]; then
+      run_cli sync-account --market "$MARKET" --strict
+    else
+      run_cli sync-account --market "$MARKET"
+    fi
+    ;;
+  shadow-report)
+    if [[ -z "$DATE_FROM" ]]; then DATE_FROM="$RUN_DATE"; fi
+    if [[ -z "$DATE_TO" ]]; then DATE_TO="$RUN_DATE"; fi
+    run_cli shadow-report --from "$DATE_FROM" --to "$DATE_TO"
+    ;;
+  cutover-reset)
+    run_cli cutover-reset --require-flat --archive --reinit --restart-tasks
+    ;;
   telegram-chat)
     if [[ "$CHAT_ONCE" == "1" ]]; then
       run_cli telegram-chat --poll-timeout "$CHAT_POLL_TIMEOUT" --idle-sleep "$CHAT_IDLE_SLEEP" --memory-limit "$CHAT_MEMORY_LIMIT" --once

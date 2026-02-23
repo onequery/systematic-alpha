@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import os
+import shutil
+import subprocess
 import uuid
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -68,6 +71,8 @@ def _valid_usdkrw(rate: float) -> bool:
 
 
 class AgentLabOrchestrator:
+    UNIFIED_EXECUTOR_AGENT_ID = "__unified_portfolio__"
+
     def __init__(self, project_root: str | Path):
         self.project_root = Path(project_root).resolve()
         self.state_root = self.project_root / "state" / "agent_lab"
@@ -84,6 +89,27 @@ class AgentLabOrchestrator:
         self.notifier = TelegramNotifier()
         self.kst = ZoneInfo("Asia/Seoul")
         self.et = ZoneInfo("America/New_York")
+        self._ensure_epoch_id()
+
+    @staticmethod
+    def _execution_model() -> str:
+        return str(os.getenv("AGENT_LAB_EXECUTION_MODEL", "legacy_multi_agent") or "legacy_multi_agent").strip().lower()
+
+    @classmethod
+    def _unified_shadow_mode(cls) -> bool:
+        return cls._execution_model() == "unified_shadow"
+
+    @staticmethod
+    def _event_batch_enabled() -> bool:
+        return _truthy(os.getenv("AGENT_LAB_EVENT_BATCH_ENABLED", "1"))
+
+    @staticmethod
+    def _sync_max_staleness_sec() -> int:
+        try:
+            raw = float(os.getenv("AGENT_LAB_SYNC_MAX_STALENESS_SEC", "30") or 30)
+        except Exception:
+            raw = 30.0
+        return max(5, int(raw))
 
     @staticmethod
     def _strict_report_windows_enabled() -> bool:
@@ -184,6 +210,36 @@ class AgentLabOrchestrator:
         end = now.replace(hour=8, minute=30, second=0, microsecond=0)
         return (start <= now <= end), f"now_kst={now.isoformat(timespec='seconds')}, window=07:50~08:30"
 
+    def _ensure_epoch_id(self) -> str:
+        existing = self.storage.get_system_meta("epoch_id", "")
+        epoch = str(existing or "").strip()
+        if epoch:
+            return epoch
+        epoch = datetime.now(self.kst).strftime("epoch_%Y%m%d_%H%M%S")
+        ts = now_iso()
+        self.storage.upsert_system_meta("epoch_id", epoch, ts)
+        self.storage.upsert_system_meta("execution_model", self._execution_model(), ts)
+        return epoch
+
+    def _epoch_id(self) -> str:
+        return str(self.storage.get_system_meta("epoch_id", "")) or self._ensure_epoch_id()
+
+    def _reload_components(self) -> None:
+        try:
+            self.storage.close()
+        except Exception:
+            pass
+        self.storage = AgentLabStorage(self.db_path)
+        self.registry = StrategyRegistry(self.storage)
+        self.identity = AgentIdentityStore(self.state_root, self.storage)
+        self.llm = LLMClient(self.storage)
+        self.agent_engine = AgentDecisionEngine(self.llm, self.registry)
+        self.accounting = AccountingEngine(self.storage)
+        self.risk = RiskEngine()
+        self.paper_broker = PaperBroker(self.storage)
+        self.notifier = TelegramNotifier()
+        self._ensure_epoch_id()
+
     def close(self) -> None:
         self.storage.close()
 
@@ -213,6 +269,27 @@ class AgentLabOrchestrator:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
     def _notify(self, text: str, *, event: str = "misc") -> None:
+        key = str(event or "").strip().lower()
+        immediate_events = {
+            "trade_executed",
+            "preopen_plan",
+            "session_close_report",
+            "weekly_council",
+            "sync_mismatch",
+            "refresh_timeout",
+            "daemon_error",
+            "llm_limit_alert",
+            "broker_api_error",
+        }
+        if self._event_batch_enabled() and key not in immediate_events:
+            self.storage.insert_event_batch(
+                batch_key="pending",
+                events={"event": key, "text": str(text or ""), "queued_at": now_iso()},
+                sent=False,
+                created_at=now_iso(),
+                sent_at=None,
+            )
+            return
         self.notifier.send(text, event=event)
 
     def _llm_explain(
@@ -852,6 +929,408 @@ class AgentLabOrchestrator:
                 continue
         return None
 
+    def _ensure_unified_executor_agent(self) -> None:
+        if not self._unified_shadow_mode():
+            return
+        aid = self.UNIFIED_EXECUTOR_AGENT_ID
+        row = self.storage.query_one("SELECT agent_id FROM agents WHERE agent_id = ? LIMIT 1", (aid,))
+        if row is None:
+            self.storage.upsert_agent(
+                agent_id=aid,
+                name="Unified Portfolio Executor",
+                role="system_executor",
+                philosophy="Single account execution rail for unified shadow mode.",
+                allocated_capital_krw=0.0,
+                risk_style="system",
+                constraints={},
+                created_at=now_iso(),
+                is_active=0,
+            )
+        active = self.storage.get_active_strategy(aid)
+        if active is None:
+            self.storage.insert_strategy_version(
+                agent_id=aid,
+                version_tag="v1.0.0",
+                params=copy.deepcopy(DEFAULT_STRATEGY_PARAMS),
+                promoted=True,
+                notes="bootstrap unified executor strategy",
+                created_at=now_iso(),
+            )
+
+    @staticmethod
+    def _position_map(rows: List[Dict[str, Any]]) -> Dict[Tuple[str, str], float]:
+        out: Dict[Tuple[str, str], float] = {}
+        for row in rows:
+            market = str(row.get("market", "")).strip().upper()
+            symbol = str(row.get("symbol", "")).strip().upper()
+            qty = float(row.get("quantity", 0.0) or 0.0)
+            if not market or not symbol:
+                continue
+            out[(market, symbol)] = out.get((market, symbol), 0.0) + qty
+        return out
+
+    def _local_positions_from_fills(self, market_scope: str = "ALL") -> List[Dict[str, Any]]:
+        where_market = ""
+        params: List[Any] = []
+        if str(market_scope).upper() in {"KR", "US"}:
+            where_market = " AND po.market = ? "
+            params.append(str(market_scope).upper())
+        if self._unified_shadow_mode():
+            where_agent = " AND po.agent_id = ? "
+            params.append(self.UNIFIED_EXECUTOR_AGENT_ID)
+        else:
+            where_agent = ""
+        rows = self.storage.query_all(
+            f"""
+            SELECT po.market, po.symbol, po.side, pf.fill_quantity, pf.fill_price, pf.fx_rate
+            FROM paper_fills pf
+            JOIN paper_orders po ON po.paper_order_id = pf.paper_order_id
+            WHERE 1=1
+            {where_market}
+            {where_agent}
+            ORDER BY pf.filled_at ASC, pf.paper_fill_id ASC
+            """,
+            tuple(params),
+        )
+        positions: Dict[Tuple[str, str], Dict[str, float]] = {}
+        for row in rows:
+            market = str(row.get("market", "")).strip().upper()
+            symbol = str(row.get("symbol", "")).strip().upper()
+            side = str(row.get("side", "")).strip().upper()
+            qty = float(row.get("fill_quantity", 0.0) or 0.0)
+            fx = float(row.get("fx_rate", 1.0) or 1.0)
+            price = float(row.get("fill_price", 0.0) or 0.0) * fx
+            if not market or not symbol or qty <= 0:
+                continue
+            key = (market, symbol)
+            st = positions.get(key, {"quantity": 0.0, "avg_price": 0.0})
+            if side == "BUY":
+                total = (st["quantity"] * st["avg_price"]) + (qty * price)
+                new_qty = st["quantity"] + qty
+                st["quantity"] = new_qty
+                st["avg_price"] = (total / new_qty) if new_qty > 0 else st["avg_price"]
+            elif side == "SELL":
+                st["quantity"] = max(0.0, st["quantity"] - qty)
+            positions[key] = st
+        out: List[Dict[str, Any]] = []
+        for (market, symbol), st in positions.items():
+            qty = float(st.get("quantity", 0.0) or 0.0)
+            if qty <= 0:
+                continue
+            avg = float(st.get("avg_price", 0.0) or 0.0)
+            out.append(
+                {
+                    "market": market,
+                    "symbol": symbol,
+                    "quantity": qty,
+                    "avg_price": avg,
+                    "market_value_krw": qty * avg,
+                }
+            )
+        return out
+
+    @staticmethod
+    def _age_seconds_from_iso(value: str) -> Optional[float]:
+        try:
+            parsed = datetime.fromisoformat(str(value))
+        except Exception:
+            return None
+        now = datetime.now(parsed.tzinfo) if parsed.tzinfo else datetime.now()
+        return max(0.0, float((now - parsed).total_seconds()))
+
+    def _reconcile_positions(
+        self,
+        *,
+        server_positions: List[Dict[str, Any]],
+        local_positions: List[Dict[str, Any]],
+        epsilon: float = 1e-6,
+    ) -> Tuple[bool, Dict[str, Any]]:
+        smap = self._position_map(server_positions)
+        lmap = self._position_map(local_positions)
+        keys = sorted(set(smap.keys()).union(set(lmap.keys())))
+        mismatches: List[Dict[str, Any]] = []
+        for key in keys:
+            sq = float(smap.get(key, 0.0))
+            lq = float(lmap.get(key, 0.0))
+            if abs(sq - lq) <= epsilon:
+                continue
+            mismatches.append(
+                {
+                    "market": key[0],
+                    "symbol": key[1],
+                    "server_qty": sq,
+                    "local_qty": lq,
+                    "delta_qty": sq - lq,
+                }
+            )
+        return len(mismatches) == 0, {"mismatches": mismatches, "mismatch_count": len(mismatches)}
+
+    def sync_account(self, market: str = "ALL", strict: bool = False) -> Dict[str, Any]:
+        market_scope = str(market or "ALL").strip().upper()
+        strict_flag = bool(strict)
+        if not strict and _truthy(os.getenv("AGENT_LAB_SYNC_STRICT", "1")):
+            strict_flag = True
+        max_staleness_sec = self._sync_max_staleness_sec()
+        self._ensure_unified_executor_agent()
+        epoch_id = self._epoch_id()
+        fetched = self.paper_broker.fetch_account_snapshot(market_scope)
+        payload: Dict[str, Any] = {
+            "market_scope": market_scope,
+            "strict": strict_flag,
+            "epoch_id": epoch_id,
+            "fetched_at": fetched.get("fetched_at", now_iso()),
+            "source": fetched.get("source", ""),
+            "max_staleness_sec": max_staleness_sec,
+            "ok": bool(fetched.get("ok", False)),
+            "matched": False,
+            "blocked": False,
+            "errors": list(fetched.get("errors", []) or []),
+        }
+        fetched_age = self._age_seconds_from_iso(str(payload.get("fetched_at", "")))
+        if fetched_age is not None:
+            payload["fetched_age_sec"] = round(float(fetched_age), 3)
+        if not payload["ok"]:
+            payload["reason"] = "broker_fetch_failed"
+            payload["blocked"] = strict_flag
+            self.storage.log_event("sync_mismatch", payload, now_iso())
+            if payload["blocked"]:
+                self._notify(
+                    "[AgentLab] 계좌 동기화 실패\n"
+                    f"시장범위={market_scope}\n"
+                    f"사유={payload['reason']}\n"
+                    f"오류={payload['errors'][:2]}",
+                    event="sync_mismatch",
+                )
+            return payload
+
+        snapshot_id = self.storage.insert_account_snapshot(
+            epoch_id=epoch_id,
+            market_scope=str(fetched.get("market_scope", market_scope)).upper(),
+            source=str(fetched.get("source", "")),
+            cash_krw=float(fetched.get("cash_krw", 0.0) or 0.0),
+            equity_krw=float(fetched.get("equity_krw", 0.0) or 0.0),
+            payload=fetched if isinstance(fetched, dict) else {},
+            created_at=now_iso(),
+        )
+        server_positions = list(fetched.get("positions", []) or [])
+        self.storage.replace_account_positions(snapshot_id, server_positions)
+        local_positions = self._local_positions_from_fills(market_scope)
+        matched, detail = self._reconcile_positions(server_positions=server_positions, local_positions=local_positions)
+        payload["matched"] = bool(matched)
+        payload["snapshot_id"] = int(snapshot_id)
+        payload["cash_krw"] = float(fetched.get("cash_krw", 0.0) or 0.0)
+        payload["equity_krw"] = float(fetched.get("equity_krw", 0.0) or 0.0)
+        payload["mismatch_count"] = int(detail.get("mismatch_count", 0) or 0)
+        payload["detail"] = detail
+        payload["blocked"] = bool(strict_flag and not matched and _truthy(os.getenv("AGENT_LAB_SYNC_MISMATCH_BLOCK", "1")))
+
+        self.storage.insert_reconcile_event(
+            check_type="portfolio_positions",
+            market_scope=market_scope,
+            matched=matched,
+            detail=f"strict={strict_flag}",
+            expected={"server_positions": server_positions},
+            actual={"local_positions": local_positions},
+            created_at=now_iso(),
+        )
+        event_type = "account_synced" if matched else "sync_mismatch"
+        self.storage.log_event(event_type, payload, now_iso())
+        if payload["blocked"]:
+            self._notify(
+                "[AgentLab] 계좌 동기화 불일치\n"
+                f"시장범위={market_scope}\n"
+                f"불일치_건수={payload['mismatch_count']}\n"
+                "조치=불일치 해소 전 주문 차단",
+                event="sync_mismatch",
+            )
+        return payload
+
+    def _latest_account_context(self, market_scope: str = "ALL") -> Dict[str, Any]:
+        latest = self.storage.get_latest_account_snapshot(str(market_scope).upper())
+        if latest is None:
+            synced = self.sync_account(market=str(market_scope).upper(), strict=False)
+            if not synced.get("ok", False):
+                return {"cash_krw": 0.0, "equity_krw": 0.0, "positions": [], "snapshot_id": None}
+            latest = self.storage.get_latest_account_snapshot(str(market_scope).upper())
+        max_staleness_sec = self._sync_max_staleness_sec()
+        latest_age = self._age_seconds_from_iso(str((latest or {}).get("created_at", ""))) if latest else None
+        if latest is not None and latest_age is not None and latest_age > float(max_staleness_sec):
+            synced = self.sync_account(
+                market=str(market_scope).upper(),
+                strict=_truthy(os.getenv("AGENT_LAB_SYNC_STRICT", "1")),
+            )
+            if synced.get("ok", False):
+                latest = self.storage.get_latest_account_snapshot(str(market_scope).upper())
+        if latest is None:
+            return {"cash_krw": 0.0, "equity_krw": 0.0, "positions": [], "snapshot_id": None}
+        snapshot_id = int(latest.get("snapshot_id"))
+        positions = self.storage.list_account_positions_by_snapshot(snapshot_id)
+        out_positions: List[Dict[str, Any]] = []
+        for row in positions:
+            out_positions.append(
+                {
+                    "market": str(row.get("market", "")),
+                    "symbol": str(row.get("symbol", "")),
+                    "quantity": float(row.get("quantity", 0.0) or 0.0),
+                    "avg_price": float(row.get("avg_price", 0.0) or 0.0),
+                    "market_value_krw": float(row.get("market_value_krw", 0.0) or 0.0),
+                    "unrealized_pnl_krw": 0.0,
+                }
+            )
+        return {
+            "cash_krw": float(latest.get("cash_krw", 0.0) or 0.0),
+            "equity_krw": float(latest.get("equity_krw", 0.0) or 0.0),
+            "positions": out_positions,
+            "snapshot_id": snapshot_id,
+        }
+
+    def _load_shadow_weights(self, agent_ids: List[str]) -> Dict[str, float]:
+        if not agent_ids:
+            return {}
+        latest = self.storage.get_latest_shadow_scores()
+        raw: Dict[str, float] = {}
+        for aid in agent_ids:
+            row = latest.get(aid, {})
+            if row:
+                raw[aid] = max(0.0, float(row.get("score", 0.0) or 0.0))
+            else:
+                raw[aid] = 0.0
+        total = sum(raw.values())
+        if total <= 1e-12:
+            w = 1.0 / float(len(agent_ids))
+            return {aid: w for aid in agent_ids}
+        return {aid: (raw[aid] / total) for aid in agent_ids}
+
+    def _aggregate_shadow_orders(
+        self,
+        *,
+        market: str,
+        intents: List[Dict[str, Any]],
+        shared_cash_krw: float,
+        shared_positions: List[Dict[str, Any]],
+        usdkrw: float,
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        by_symbol_side: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        total_weight = sum(float(x.get("weight", 0.0) or 0.0) for x in intents)
+        if total_weight <= 1e-12:
+            total_weight = float(len(intents) or 1)
+        for intent in intents:
+            aid = str(intent.get("agent_id", ""))
+            weight = float(intent.get("weight", 0.0) or 0.0)
+            orders = list(intent.get("orders", []) or [])
+            for row in orders:
+                symbol = str(row.get("symbol", "")).strip().upper()
+                side = str(row.get("side", "")).strip().upper()
+                qty = float(row.get("quantity", 0.0) or 0.0)
+                px = float(row.get("reference_price", 0.0) or 0.0)
+                if not symbol or side not in {"BUY", "SELL"} or qty <= 0 or px <= 0:
+                    continue
+                score = float(row.get("recommendation_score", 50.0) or 50.0)
+                vote = max(0.0, weight * max(0.05, score / 100.0))
+                key = (symbol, side)
+                agg = by_symbol_side.setdefault(
+                    key,
+                    {
+                        "symbol": symbol,
+                        "side": side,
+                        "order_type": "MARKET",
+                        "vote_weight": 0.0,
+                        "weighted_qty": 0.0,
+                        "weighted_price": 0.0,
+                        "contributors": [],
+                    },
+                )
+                agg["vote_weight"] += vote
+                agg["weighted_qty"] += (weight * qty)
+                agg["weighted_price"] += (weight * qty * px)
+                agg["contributors"].append({"agent_id": aid, "weight": weight, "qty": qty, "score": score})
+
+        # Resolve buy/sell conflict on same symbol: keep the higher vote side.
+        chosen: Dict[str, Dict[str, Any]] = {}
+        for (_symbol, _side), agg in by_symbol_side.items():
+            prev = chosen.get(agg["symbol"])
+            if prev is None or float(agg["vote_weight"]) > float(prev.get("vote_weight", 0.0)):
+                chosen[agg["symbol"]] = agg
+
+        min_ratio = float(os.getenv("AGENT_LAB_AGG_MIN_VOTE_RATIO", "0.34") or 0.34)
+        min_ratio = max(0.05, min(0.95, min_ratio))
+        held_map = self._position_map(shared_positions)
+        out_orders: List[Dict[str, Any]] = []
+        dropped: List[Dict[str, Any]] = []
+        est_sell_proceeds = 0.0
+        for agg in chosen.values():
+            vote_ratio = float(agg.get("vote_weight", 0.0) or 0.0) / total_weight
+            if vote_ratio < min_ratio:
+                dropped.append({"symbol": agg["symbol"], "side": agg["side"], "reason": "vote_ratio_low", "vote_ratio": vote_ratio})
+                continue
+            qty = int(max(1, round(float(agg.get("weighted_qty", 0.0) or 0.0))))
+            price = 0.0
+            denom = float(agg.get("weighted_qty", 0.0) or 0.0)
+            if denom > 0:
+                price = float(agg.get("weighted_price", 0.0) or 0.0) / denom
+            if price <= 0:
+                dropped.append({"symbol": agg["symbol"], "side": agg["side"], "reason": "invalid_price"})
+                continue
+            if agg["side"] == "SELL":
+                hold_qty = float(held_map.get((market, agg["symbol"]), 0.0) or 0.0)
+                if hold_qty <= 0:
+                    dropped.append({"symbol": agg["symbol"], "side": "SELL", "reason": "no_position"})
+                    continue
+                qty = int(max(0, min(float(qty), hold_qty)))
+                if qty <= 0:
+                    dropped.append({"symbol": agg["symbol"], "side": "SELL", "reason": "sell_qty_zero"})
+                    continue
+                est_sell_proceeds += float(qty) * float(price) * (float(usdkrw) if market == "US" else 1.0)
+            out_orders.append(
+                {
+                    "market": market,
+                    "symbol": agg["symbol"],
+                    "side": agg["side"],
+                    "order_type": "MARKET",
+                    "quantity": float(qty),
+                    "limit_price": None,
+                    "reference_price": float(price),
+                    "signal_rank": 0,
+                    "recommendation_score": float(min(100.0, max(0.0, vote_ratio * 100.0))),
+                    "rationale": f"unified_consensus vote_ratio={vote_ratio:.3f}",
+                }
+            )
+
+        # Cash cap for BUY legs
+        budget_krw = max(0.0, float(shared_cash_krw) + est_sell_proceeds)
+        buys = [row for row in out_orders if str(row.get("side", "")).upper() == "BUY"]
+        sells = [row for row in out_orders if str(row.get("side", "")).upper() == "SELL"]
+        buys.sort(key=lambda x: float(x.get("recommendation_score", 0.0) or 0.0), reverse=True)
+        buy_final: List[Dict[str, Any]] = []
+        for row in buys:
+            fx = float(usdkrw) if market == "US" else 1.0
+            px_krw = float(row.get("reference_price", 0.0) or 0.0) * fx
+            if px_krw <= 0:
+                continue
+            qty = int(float(row.get("quantity", 0.0) or 0.0))
+            max_qty = int(math.floor(budget_krw / px_krw))
+            qty = min(qty, max_qty)
+            if qty <= 0:
+                continue
+            row = dict(row)
+            row["quantity"] = float(qty)
+            buy_final.append(row)
+            budget_krw -= float(qty) * px_krw
+            if budget_krw <= 0:
+                break
+
+        merged = sells + buy_final
+        detail = {
+            "intent_count": len(intents),
+            "total_weight": total_weight,
+            "min_vote_ratio": min_ratio,
+            "kept_orders": len(merged),
+            "dropped": dropped,
+            "est_sell_proceeds_krw": est_sell_proceeds,
+            "remaining_buy_budget_krw": budget_krw,
+        }
+        return merged, detail
+
     def init_lab(self, capital_krw: float, agents: int) -> Dict[str, Any]:
         profiles = build_default_agent_profiles(total_capital_krw=capital_krw, count=agents)
         for p in profiles:
@@ -874,6 +1353,8 @@ class AgentLabOrchestrator:
             )
 
         self.registry.initialize_default_versions([p.agent_id for p in profiles])
+        self._ensure_unified_executor_agent()
+        self.storage.upsert_system_meta("execution_model", self._execution_model(), now_iso())
         self.storage.log_event(
             event_type="lab_initialized",
             payload={"capital_krw": capital_krw, "agents": len(profiles), "date": self._today_str()},
@@ -1048,6 +1529,296 @@ class AgentLabOrchestrator:
         )
         return out
 
+    def _propose_orders_unified(
+        self,
+        *,
+        market: str,
+        effective_session_date: str,
+        signal: Dict[str, Any],
+        auto_execute: bool,
+    ) -> Dict[str, Any]:
+        self._ensure_unified_executor_agent()
+        sync_pre = self.sync_account(market="ALL", strict=True)
+        if bool(sync_pre.get("blocked", False)):
+            payload = {
+                "market": market,
+                "date": effective_session_date,
+                "auto_execute": bool(auto_execute),
+                "execution_model": "unified_shadow",
+                "skipped": True,
+                "reason": "sync_mismatch",
+                "sync": sync_pre,
+                "proposals": [],
+                "execution_results": [],
+            }
+            self.storage.log_event("orders_proposed_skipped", payload, now_iso())
+            self._append_activity_artifact(effective_session_date, "orders_proposed_skipped", payload)
+            return payload
+
+        account_ctx = self._latest_account_context("ALL")
+        shared_cash = float(account_ctx.get("cash_krw", 0.0) or 0.0)
+        shared_equity = float(account_ctx.get("equity_krw", 0.0) or 0.0)
+        shared_positions = list(account_ctx.get("positions", []) or [])
+        shared_ledger = {
+            "cash_krw": shared_cash,
+            "equity_krw": shared_equity,
+            "positions": shared_positions,
+        }
+        market_exposure = 0.0
+        pos_qty_by_symbol: Dict[str, float] = {}
+        for pos in shared_positions:
+            if str(pos.get("market", "")).strip().upper() != market:
+                continue
+            market_exposure += float(pos.get("market_value_krw", 0.0) or 0.0)
+            symbol = str(pos.get("symbol", "")).strip().upper()
+            qty = float(pos.get("quantity", 0.0) or 0.0)
+            if symbol and qty > 0:
+                pos_qty_by_symbol[symbol] = qty
+
+        agents = self.storage.list_agents()
+        if not agents:
+            raise RuntimeError("no agents registered. run `init` first.")
+        agent_ids = [str(x.get("agent_id", "")) for x in agents]
+        weights = self._load_shadow_weights(agent_ids)
+        usdkrw = self._usdkrw_rate(effective_session_date) if market == "US" else 1.0
+        base_payload = signal.get("payload", {})
+        if not isinstance(base_payload, dict):
+            base_payload = {}
+        symbol_name_map = self._build_symbol_name_map_from_payload(base_payload)
+
+        shadow_rows: List[Dict[str, Any]] = []
+        intents_for_agg: List[Dict[str, Any]] = []
+        for agent in agents:
+            agent_id = str(agent["agent_id"])
+            profile = profile_from_agent_row(agent)
+            active = self.registry.get_active_strategy(agent_id)
+            active_params = dict(active.get("params", {}) or {})
+            cross_market_plan = self._build_cross_market_plan(
+                profile=profile,
+                active_params=active_params,
+                market=market,
+                yyyymmdd=effective_session_date,
+                ledger=shared_ledger,
+            )
+            agent_signal_payload = self._build_agent_specific_payload(
+                base_payload=base_payload,
+                agent_id=agent_id,
+                market=market,
+                session_date=effective_session_date,
+            )
+            proposed_orders, rationale = self.agent_engine.propose_orders(
+                agent=profile,
+                market=market,
+                session_payload=agent_signal_payload,
+                params=active_params,
+                available_cash_krw=shared_cash,
+                current_positions=shared_positions,
+                usdkrw_rate=usdkrw,
+                market_budget_cap_krw=float(cross_market_plan.get("buy_budget_cap_krw", 0.0) or 0.0),
+                max_picks_override=int(cross_market_plan.get("max_picks_override", 1) or 1),
+                min_recommendation_score=(
+                    None
+                    if float(cross_market_plan.get("min_recommendation_score", 0.0) or 0.0) <= 0
+                    else float(cross_market_plan.get("min_recommendation_score", 0.0) or 0.0)
+                ),
+            )
+            decision = self.risk.evaluate(
+                status_code=str(signal["status_code"]),
+                allocated_capital_krw=max(1.0, shared_equity),
+                available_cash_krw=shared_cash,
+                day_return_pct=0.0,
+                week_return_pct=0.0,
+                current_exposure_krw=float(market_exposure),
+                orders=[o.__dict__ for o in proposed_orders],
+                usdkrw_rate=usdkrw,
+                position_cap_ratio=float(
+                    active_params.get("position_cap_ratio", self.risk.position_cap_ratio) or self.risk.position_cap_ratio
+                ),
+                exposure_cap_ratio=float(
+                    active_params.get("exposure_cap_ratio", self.risk.exposure_cap_ratio) or self.risk.exposure_cap_ratio
+                ),
+                day_loss_limit=float(active_params.get("day_loss_limit", self.risk.day_loss_limit) or self.risk.day_loss_limit),
+                week_loss_limit=float(active_params.get("week_loss_limit", self.risk.week_loss_limit) or self.risk.week_loss_limit),
+                position_qty_by_symbol=pos_qty_by_symbol,
+            )
+            status = "SHADOW_READY" if decision.allowed else "SHADOW_BLOCKED"
+            proposal_uuid = str(uuid.uuid4())
+            proposal_id = self.storage.insert_order_proposal(
+                proposal_uuid=proposal_uuid,
+                agent_id=agent_id,
+                market=market,
+                session_date=effective_session_date,
+                strategy_version_id=int(active["strategy_version_id"]),
+                status=status,
+                blocked_reason=decision.blocked_reason,
+                orders=decision.accepted_orders,
+                rationale=rationale,
+                created_at=now_iso(),
+                updated_at=now_iso(),
+            )
+            weight = float(weights.get(agent_id, 0.0) or 0.0)
+            intent_score = float(sum(float(x.get("recommendation_score", 0.0) or 0.0) for x in decision.accepted_orders))
+            self.storage.insert_shadow_intent(
+                proposal_id=proposal_id,
+                agent_id=agent_id,
+                market=market,
+                session_date=effective_session_date,
+                weight=weight,
+                score=intent_score,
+                orders=list(decision.accepted_orders),
+                rationale=rationale,
+                created_at=now_iso(),
+            )
+            if decision.allowed and decision.accepted_orders:
+                intents_for_agg.append(
+                    {
+                        "agent_id": agent_id,
+                        "weight": weight,
+                        "orders": list(decision.accepted_orders),
+                    }
+                )
+            shadow_rows.append(
+                {
+                    "proposal_id": proposal_id,
+                    "proposal_uuid": proposal_uuid,
+                    "agent_id": agent_id,
+                    "status": status,
+                    "blocked_reason": decision.blocked_reason,
+                    "orders": list(decision.accepted_orders),
+                    "weight": weight,
+                    "intent_score": intent_score,
+                    "agent_signal_view": agent_signal_payload.get("agent_signal_view", {}),
+                    "cross_market_plan": cross_market_plan,
+                }
+            )
+
+        sync_pre_aggregate = self.sync_account(market="ALL", strict=True)
+        if bool(sync_pre_aggregate.get("blocked", False)):
+            payload = {
+                "market": market,
+                "date": effective_session_date,
+                "auto_execute": bool(auto_execute),
+                "execution_model": "unified_shadow",
+                "skipped": True,
+                "reason": "sync_mismatch_before_aggregate",
+                "sync_pre": sync_pre,
+                "sync_pre_aggregate": sync_pre_aggregate,
+                "shadow_proposals": shadow_rows,
+                "proposals": shadow_rows,
+                "execution_results": [],
+            }
+            self.storage.log_event("orders_proposed_skipped", payload, now_iso())
+            self._append_activity_artifact(effective_session_date, "orders_proposed_skipped", payload)
+            return payload
+        merged_orders, agg_detail = self._aggregate_shadow_orders(
+            market=market,
+            intents=intents_for_agg,
+            shared_cash_krw=shared_cash,
+            shared_positions=shared_positions,
+            usdkrw=usdkrw,
+        )
+        unified_active = self.registry.get_active_strategy(self.UNIFIED_EXECUTOR_AGENT_ID)
+        unified_status = PROPOSAL_STATUS_APPROVED if merged_orders else PROPOSAL_STATUS_BLOCKED
+        unified_block = "" if merged_orders else "no_consensus_order"
+        unified_proposal_uuid = str(uuid.uuid4())
+        unified_proposal_id = self.storage.insert_order_proposal(
+            proposal_uuid=unified_proposal_uuid,
+            agent_id=self.UNIFIED_EXECUTOR_AGENT_ID,
+            market=market,
+            session_date=effective_session_date,
+            strategy_version_id=int(unified_active["strategy_version_id"]),
+            status=unified_status,
+            blocked_reason=unified_block,
+            orders=merged_orders,
+            rationale=f"unified_shadow_consensus detail={json.dumps(agg_detail, ensure_ascii=False)}",
+            created_at=now_iso(),
+            updated_at=now_iso(),
+        )
+
+        execution_results: List[Dict[str, Any]] = []
+        unified_row = {
+            "proposal_id": unified_proposal_id,
+            "proposal_uuid": unified_proposal_uuid,
+            "agent_id": self.UNIFIED_EXECUTOR_AGENT_ID,
+            "status": unified_status,
+            "blocked_reason": unified_block,
+            "orders": merged_orders,
+            "aggregation_detail": agg_detail,
+            "execution_model": "unified_shadow",
+        }
+        if bool(auto_execute) and unified_status == PROPOSAL_STATUS_APPROVED:
+            try:
+                executed = self._execute_proposal(
+                    proposal_identifier=str(unified_proposal_id),
+                    approved_by="unified_auto_executor",
+                    note=f"unified auto-approved market={market} date={effective_session_date}",
+                    allowed_statuses=[PROPOSAL_STATUS_APPROVED],
+                )
+                unified_row["status"] = str(executed.get("status", unified_status))
+                execution_results.append(
+                    {
+                        "proposal_id": unified_proposal_id,
+                        "agent_id": self.UNIFIED_EXECUTOR_AGENT_ID,
+                        "ok": True,
+                        "status": unified_row["status"],
+                        "fills": executed.get("fills", []),
+                    }
+                )
+            except Exception as exc:
+                self.storage.update_order_proposal_status(
+                    proposal_id=unified_proposal_id,
+                    status=PROPOSAL_STATUS_BLOCKED,
+                    blocked_reason=f"auto_execute_error:{repr(exc)}",
+                    updated_at=now_iso(),
+                )
+                unified_row["status"] = PROPOSAL_STATUS_BLOCKED
+                unified_row["blocked_reason"] = f"auto_execute_error:{repr(exc)}"
+                execution_results.append(
+                    {
+                        "proposal_id": unified_proposal_id,
+                        "agent_id": self.UNIFIED_EXECUTOR_AGENT_ID,
+                        "ok": False,
+                        "error": repr(exc),
+                    }
+                )
+
+        sync_post = self.sync_account(market="ALL", strict=False)
+        payload = {
+            "market": market,
+            "date": effective_session_date,
+            "auto_execute": bool(auto_execute),
+            "execution_model": "unified_shadow",
+            "sync_pre": sync_pre,
+            "sync_pre_aggregate": sync_pre_aggregate,
+            "sync_post": sync_post,
+            "shadow_proposals": shadow_rows,
+            "unified_execution": unified_row,
+            "proposals": shadow_rows + [unified_row],
+            "execution_results": execution_results,
+        }
+        self._write_json_artifact(
+            effective_session_date,
+            f"proposals_{market.lower()}_{effective_session_date}",
+            payload,
+        )
+        self.storage.log_event("orders_proposed", payload, now_iso())
+        self._append_activity_artifact(effective_session_date, "orders_proposed", payload)
+        lines = [
+            "[AgentLab] 주문 제안",
+            f"시장={market}",
+            f"일자={effective_session_date}",
+            "실행모델=통합포트폴리오+섀도우",
+            f"자동실행={bool(auto_execute)}",
+            f"통합집행={self._orders_to_text(list(unified_row.get('orders') or []), limit=5, symbol_name_map=symbol_name_map)}",
+        ]
+        for row in shadow_rows:
+            lines.append(
+                f"{row.get('agent_id')}: {row.get('status')} | "
+                f"{self._orders_to_text(list(row.get('orders') or []), limit=2, symbol_name_map=symbol_name_map)}"
+            )
+        self._notify("\n".join(lines), event="propose")
+        return payload
+
     def propose_orders(
         self,
         market: str,
@@ -1109,6 +1880,14 @@ class AgentLabOrchestrator:
                     "forced_auto_execute": True,
                 },
                 now_iso(),
+            )
+
+        if self._unified_shadow_mode():
+            return self._propose_orders_unified(
+                market=market,
+                effective_session_date=effective_session_date,
+                signal=signal,
+                auto_execute=bool(auto_execute),
             )
 
         agents = self.storage.list_agents()
@@ -1420,6 +2199,26 @@ class AgentLabOrchestrator:
             orders=list(proposal["orders"]),
             fx_rate=fx_rate,
         )
+        rejected_count = sum(1 for row in fills if str((row or {}).get("status", "")).upper() == "REJECTED")
+        if rejected_count > 0:
+            self.storage.log_event(
+                "broker_api_error",
+                {
+                    "proposal_id": proposal_id,
+                    "agent_id": agent_id,
+                    "market": market,
+                    "session_date": yyyymmdd,
+                    "rejected_count": rejected_count,
+                },
+                now_iso(),
+            )
+            self._notify(
+                "[AgentLab] 주문 실행 오류\n"
+                f"시장={market}\n"
+                f"제안ID={proposal_id}\n"
+                f"거부_주문수={rejected_count}",
+                event="broker_api_error",
+            )
         symbol_name_map = self._load_symbol_name_map(market, yyyymmdd)
         self.storage.update_order_proposal_status(
             proposal_id=proposal_id,
@@ -1436,6 +2235,8 @@ class AgentLabOrchestrator:
             "fills": fills,
             "equity": ledger,
         }
+        if self._unified_shadow_mode():
+            out["sync_post_execution"] = self.sync_account(market="ALL", strict=False)
         self._write_json_artifact(yyyymmdd, f"approval_{proposal_id}", out)
         self.storage.log_event("orders_approved", out, now_iso())
         self._append_activity_artifact(yyyymmdd, "orders_approved", out)
@@ -1653,26 +2454,98 @@ class AgentLabOrchestrator:
         day_rows: List[Dict[str, Any]] = []
         active_strategy_map: Dict[str, Dict[str, Any]] = {}
         agent_profiles: List[Any] = []
-        for agent in agents:
-            aid = str(agent["agent_id"])
-            ledger = self.accounting.upsert_daily_snapshot(agent_id=aid, as_of_date=yyyymmdd)
-            day_ret, _week_ret = self.accounting.daily_and_weekly_return(aid, yyyymmdd)
-            day_rows.append(
-                {
-                    "agent_id": aid,
-                    "equity_krw": float(ledger["equity_krw"]),
-                    "cash_krw": float(ledger["cash_krw"]),
-                    "return_pct": float(day_ret),
-                    "drawdown": float(ledger["drawdown"]),
-                    "volatility": float(ledger["volatility"]),
-                    "win_rate": float(ledger["win_rate"]),
-                    "profit_factor": float(ledger["profit_factor"]),
-                    "turnover": float(ledger["turnover"]),
-                    "max_consecutive_loss": int(ledger["max_consecutive_loss"]),
-                }
-            )
-            active_strategy_map[aid] = self.registry.get_active_strategy(aid)
-            agent_profiles.append(profile_from_agent_row(agent))
+        if self._unified_shadow_mode():
+            signal = self.storage.get_latest_session_signal(market, yyyymmdd) or {}
+            payload_signal = signal.get("payload", {}) if isinstance(signal, dict) else {}
+            ranked = list(payload_signal.get("all_ranked", []) or payload_signal.get("final", []) or [])
+            symbol_change: Dict[str, float] = {}
+            for row in ranked:
+                if not isinstance(row, dict):
+                    continue
+                code = str(row.get("code", "")).strip().upper()
+                metrics = row.get("metrics", {}) if isinstance(row.get("metrics"), dict) else {}
+                change_pct = float(metrics.get("current_change_pct", row.get("change_pct", 0.0)) or 0.0)
+                if code:
+                    symbol_change[code] = change_pct / 100.0
+            shadow_rows = self.storage.list_shadow_intents(market=market, session_date=yyyymmdd, limit=20000)
+            by_agent_shadow: Dict[str, List[Dict[str, Any]]] = {}
+            for row in shadow_rows:
+                aid = str(row.get("agent_id", ""))
+                if aid:
+                    by_agent_shadow.setdefault(aid, []).append(row)
+            account_ctx = self._latest_account_context("ALL")
+            shared_equity = float(account_ctx.get("equity_krw", 0.0) or 0.0)
+            shared_cash = float(account_ctx.get("cash_krw", 0.0) or 0.0)
+            for agent in agents:
+                aid = str(agent["agent_id"])
+                intents = list(by_agent_shadow.get(aid, []) or [])
+                pnl_proxy = 0.0
+                sample = 0
+                for intent in intents:
+                    for order in list(intent.get("orders", []) or []):
+                        symbol = str(order.get("symbol", "")).strip().upper()
+                        side = str(order.get("side", "")).strip().upper()
+                        qty = float(order.get("quantity", 0.0) or 0.0)
+                        px = float(order.get("reference_price", 0.0) or 0.0)
+                        if not symbol or qty <= 0 or px <= 0:
+                            continue
+                        direction = 1.0 if side == "BUY" else -1.0
+                        pnl_proxy += direction * qty * px * float(symbol_change.get(symbol, 0.0))
+                        sample += 1
+                base_notional = max(1.0, sum(
+                    float(order.get("quantity", 0.0) or 0.0) * float(order.get("reference_price", 0.0) or 0.0)
+                    for intent in intents
+                    for order in list(intent.get("orders", []) or [])
+                ))
+                ret_proxy = float(pnl_proxy / base_notional)
+                risk_penalty = max(0.0, 0.05 if sample == 0 else 0.0)
+                score = max(0.05, min(1.0, 0.5 + (ret_proxy * 2.0) - risk_penalty))
+                self.storage.upsert_shadow_score(
+                    agent_id=aid,
+                    as_of_date=yyyymmdd,
+                    score=score,
+                    return_pct=ret_proxy,
+                    risk_penalty=risk_penalty,
+                    sample_count=sample,
+                    created_at=now_iso(),
+                )
+                day_rows.append(
+                    {
+                        "agent_id": aid,
+                        "equity_krw": float(shared_equity),
+                        "cash_krw": float(shared_cash),
+                        "return_pct": ret_proxy,
+                        "drawdown": -risk_penalty,
+                        "volatility": abs(ret_proxy) * 0.35,
+                        "win_rate": max(0.0, min(1.0, 0.5 + ret_proxy * 4.0)),
+                        "profit_factor": max(0.1, 1.0 + ret_proxy * 8.0),
+                        "turnover": float(max(0, sample)),
+                        "max_consecutive_loss": int(1 if ret_proxy < 0 else 0),
+                    }
+                )
+                active_strategy_map[aid] = self.registry.get_active_strategy(aid)
+                agent_profiles.append(profile_from_agent_row(agent))
+        else:
+            for agent in agents:
+                aid = str(agent["agent_id"])
+                ledger = self.accounting.upsert_daily_snapshot(agent_id=aid, as_of_date=yyyymmdd)
+                day_ret, _week_ret = self.accounting.daily_and_weekly_return(aid, yyyymmdd)
+                day_rows.append(
+                    {
+                        "agent_id": aid,
+                        "equity_krw": float(ledger["equity_krw"]),
+                        "cash_krw": float(ledger["cash_krw"]),
+                        "return_pct": float(day_ret),
+                        "drawdown": float(ledger["drawdown"]),
+                        "volatility": float(ledger["volatility"]),
+                        "win_rate": float(ledger["win_rate"]),
+                        "profit_factor": float(ledger["profit_factor"]),
+                        "turnover": float(ledger["turnover"]),
+                        "max_consecutive_loss": int(ledger["max_consecutive_loss"]),
+                    }
+                )
+                active_strategy_map[aid] = self.registry.get_active_strategy(aid)
+                agent_profiles.append(profile_from_agent_row(agent))
 
         score_board = self._weekly_score_board(day_rows)
         try:
@@ -2004,30 +2877,62 @@ class AgentLabOrchestrator:
         if not agents:
             raise RuntimeError("no agents registered. run `init` first.")
         week_rows: List[Dict[str, Any]] = []
-        for agent in agents:
-            aid = str(agent["agent_id"])
-            curve = self.storage.list_equity_curve(
-                agent_id=aid,
+        if self._unified_shadow_mode():
+            score_rows = self.storage.list_shadow_scores(
                 date_from=week_start.strftime("%Y%m%d"),
                 date_to=week_end.strftime("%Y%m%d"),
+                limit=50000,
             )
-            if not curve:
-                continue
-            curve = sorted(curve, key=lambda x: str(x["as_of_date"]))
-            first_eq = float(curve[0]["equity_krw"])
-            last_eq = float(curve[-1]["equity_krw"])
-            ret = ((last_eq / first_eq) - 1.0) if first_eq > 0 else 0.0
-            row = {
-                "agent_id": aid,
-                "return_pct": ret,
-                "drawdown": float(min(float(x["drawdown"]) for x in curve)),
-                "volatility": float(curve[-1]["volatility"]),
-                "win_rate": float(curve[-1]["win_rate"]),
-                "profit_factor": float(curve[-1]["profit_factor"]),
-                "turnover": float(curve[-1]["turnover"]),
-                "max_consecutive_loss": int(curve[-1]["max_consecutive_loss"]),
-            }
-            week_rows.append(row)
+            by_agent_scores: Dict[str, List[Dict[str, Any]]] = {}
+            for row in score_rows:
+                aid = str(row.get("agent_id", ""))
+                if aid:
+                    by_agent_scores.setdefault(aid, []).append(dict(row))
+            for agent in agents:
+                aid = str(agent["agent_id"])
+                entries = sorted(by_agent_scores.get(aid, []), key=lambda x: str(x.get("as_of_date", "")))
+                if not entries:
+                    continue
+                avg_ret = sum(float(x.get("return_pct", 0.0) or 0.0) for x in entries) / float(len(entries))
+                avg_penalty = sum(float(x.get("risk_penalty", 0.0) or 0.0) for x in entries) / float(len(entries))
+                avg_score = sum(float(x.get("score", 0.0) or 0.0) for x in entries) / float(len(entries))
+                row = {
+                    "agent_id": aid,
+                    "return_pct": float(avg_ret),
+                    "drawdown": float(-max(0.0, avg_penalty)),
+                    "volatility": float(abs(avg_ret) * 0.35),
+                    "win_rate": float(min(1.0, max(0.0, 0.5 + avg_ret * 4.0))),
+                    "profit_factor": float(max(0.1, 1.0 + avg_ret * 8.0)),
+                    "turnover": float(max(0.01, len(entries))),
+                    "max_consecutive_loss": int(max(0.0, avg_penalty * 10.0)),
+                    "shadow_avg_score": float(avg_score),
+                }
+                week_rows.append(row)
+        else:
+            for agent in agents:
+                aid = str(agent["agent_id"])
+                curve = self.storage.list_equity_curve(
+                    agent_id=aid,
+                    date_from=week_start.strftime("%Y%m%d"),
+                    date_to=week_end.strftime("%Y%m%d"),
+                )
+                if not curve:
+                    continue
+                curve = sorted(curve, key=lambda x: str(x["as_of_date"]))
+                first_eq = float(curve[0]["equity_krw"])
+                last_eq = float(curve[-1]["equity_krw"])
+                ret = ((last_eq / first_eq) - 1.0) if first_eq > 0 else 0.0
+                row = {
+                    "agent_id": aid,
+                    "return_pct": ret,
+                    "drawdown": float(min(float(x["drawdown"]) for x in curve)),
+                    "volatility": float(curve[-1]["volatility"]),
+                    "win_rate": float(curve[-1]["win_rate"]),
+                    "profit_factor": float(curve[-1]["profit_factor"]),
+                    "turnover": float(curve[-1]["turnover"]),
+                    "max_consecutive_loss": int(curve[-1]["max_consecutive_loss"]),
+                }
+                week_rows.append(row)
 
         scores = self._weekly_score_board(week_rows)
         scored_rows: List[Dict[str, Any]] = []
@@ -2353,6 +3258,175 @@ class AgentLabOrchestrator:
             f"종료일={date_to}\n"
             f"행수={len(rows)}"
             ,
+            event="report",
+        )
+        return payload
+
+    def shadow_report(self, date_from: str, date_to: str) -> Dict[str, Any]:
+        rows = self.storage.list_shadow_scores(date_from=date_from, date_to=date_to, limit=20000)
+        by_agent: Dict[str, List[Dict[str, Any]]] = {}
+        for row in rows:
+            aid = str(row.get("agent_id", ""))
+            if not aid:
+                continue
+            by_agent.setdefault(aid, []).append(dict(row))
+        summary_rows: List[Dict[str, Any]] = []
+        for aid, items in by_agent.items():
+            items = sorted(items, key=lambda x: str(x.get("as_of_date", "")))
+            n = float(len(items))
+            avg_score = sum(float(x.get("score", 0.0) or 0.0) for x in items) / n
+            avg_ret = sum(float(x.get("return_pct", 0.0) or 0.0) for x in items) / n
+            avg_penalty = sum(float(x.get("risk_penalty", 0.0) or 0.0) for x in items) / n
+            summary_rows.append(
+                {
+                    "agent_id": aid,
+                    "samples": int(len(items)),
+                    "avg_score": float(avg_score),
+                    "avg_return_pct": float(avg_ret),
+                    "avg_risk_penalty": float(avg_penalty),
+                    "latest_date": str(items[-1].get("as_of_date", "")) if items else "",
+                }
+            )
+        summary_rows.sort(key=lambda x: float(x.get("avg_score", 0.0) or 0.0), reverse=True)
+        payload = {
+            "from": date_from,
+            "to": date_to,
+            "execution_model": self._execution_model(),
+            "rows": summary_rows,
+        }
+        out_day = self._today_str()
+        self._write_json_artifact(out_day, f"shadow_report_{date_from}_{date_to}", payload)
+        lines = [
+            f"# Shadow Report {date_from}~{date_to}",
+            "",
+            "|Agent|Samples|AvgScore|AvgRet|AvgRiskPenalty|Latest|",
+            "|---|---:|---:|---:|---:|---:|",
+        ]
+        for row in summary_rows:
+            lines.append(
+                f"|{row['agent_id']}|{int(row['samples'])}|{float(row['avg_score']):.4f}|"
+                f"{float(row['avg_return_pct']):.4f}|{float(row['avg_risk_penalty']):.4f}|{row['latest_date']}|"
+            )
+        self._write_text_artifact(out_day, f"shadow_report_{date_from}_{date_to}", "\n".join(lines))
+        self.storage.log_event("shadow_report_generated", payload, now_iso())
+        self._append_activity_artifact(out_day, "shadow_report_generated", payload)
+        return payload
+
+    def cutover_reset(
+        self,
+        *,
+        require_flat: bool = True,
+        archive: bool = True,
+        reinit: bool = True,
+        restart_tasks: bool = False,
+    ) -> Dict[str, Any]:
+        sync = self.sync_account(market="ALL", strict=False)
+        ctx = self._latest_account_context("ALL")
+        open_positions = [
+            row for row in list(ctx.get("positions", []) or [])
+            if float(row.get("quantity", 0.0) or 0.0) > 0
+        ]
+        if require_flat and open_positions:
+            payload = {
+                "skipped": True,
+                "reason": "positions_not_flat",
+                "require_flat": True,
+                "open_positions": open_positions[:20],
+                "open_positions_count": len(open_positions),
+                "sync": sync,
+                "generated_at": now_iso(),
+            }
+            self.storage.log_event("cutover_reset_skipped", payload, now_iso())
+            self._notify(
+                "[AgentLab] 컷오버 중단\n"
+                "사유=서버 계좌에 잔여 포지션 존재\n"
+                f"잔여_종목수={len(open_positions)}",
+                event="sync_mismatch",
+            )
+            return payload
+
+        active_agents = self.storage.list_agents()
+        init_capital = float(sum(float(x.get("allocated_capital_krw", 0.0) or 0.0) for x in active_agents))
+        init_agents = int(len(active_agents))
+        ts = datetime.now(self.kst).strftime("%Y%m%d_%H%M%S")
+        archive_root = self.project_root / "archive" / "agent_lab" / ts
+        moved: List[Dict[str, str]] = []
+
+        def _safe_move(src: Path, dst: Path) -> None:
+            if not src.exists():
+                return
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(src), str(dst))
+            moved.append({"from": str(src), "to": str(dst)})
+
+        if archive:
+            self.close()
+            _safe_move(self.db_path, archive_root / "state" / "agent_lab.sqlite")
+            _safe_move(self.out_root, archive_root / "out" / "agent_lab")
+            _safe_move(self.project_root / "logs" / "agent_lab", archive_root / "logs" / "agent_lab")
+            _safe_move(self.state_root / "agents", archive_root / "state" / "agents")
+            _safe_move(self.state_root / "checkpoints", archive_root / "state" / "checkpoints")
+
+            self.state_root.mkdir(parents=True, exist_ok=True)
+            self.out_root.mkdir(parents=True, exist_ok=True)
+            (self.project_root / "logs" / "agent_lab").mkdir(parents=True, exist_ok=True)
+            self._reload_components()
+        else:
+            # Even in non-archive mode, create a new epoch and clear latest memories.
+            for row in active_agents:
+                aid = str(row.get("agent_id", ""))
+                if not aid:
+                    continue
+                mem_path = self.identity.memory_path(aid)
+                if mem_path.exists():
+                    mem_path.unlink(missing_ok=True)
+
+        new_epoch = f"epoch_{ts}"
+        self.storage.upsert_system_meta("epoch_id", new_epoch, now_iso())
+        self.storage.upsert_system_meta("execution_model", self._execution_model(), now_iso())
+        reinit_payload: Dict[str, Any] = {}
+        if reinit and init_agents > 0:
+            reinit_payload = self.init_lab(capital_krw=max(0.0, init_capital), agents=init_agents)
+
+        restart_result: Dict[str, Any] = {}
+        if restart_tasks:
+            script_path = self.project_root / "scripts" / "reset_tasks_preserve_state_wsl.sh"
+            try:
+                proc = subprocess.run(
+                    ["/usr/bin/env", "bash", str(script_path)],
+                    cwd=str(self.project_root),
+                    capture_output=True,
+                    text=True,
+                    timeout=180,
+                )
+                restart_result = {
+                    "ok": int(proc.returncode) == 0,
+                    "returncode": int(proc.returncode),
+                    "stdout_tail": str(proc.stdout or "")[-500:],
+                    "stderr_tail": str(proc.stderr or "")[-500:],
+                }
+            except Exception as exc:
+                restart_result = {"ok": False, "error": repr(exc)}
+
+        payload = {
+            "cutover_at": now_iso(),
+            "archive": bool(archive),
+            "reinit": bool(reinit),
+            "restart_tasks": bool(restart_tasks),
+            "archive_root": str(archive_root) if archive else "",
+            "moved": moved,
+            "new_epoch_id": new_epoch,
+            "reinit_payload": reinit_payload,
+            "restart_result": restart_result,
+        }
+        self.storage.log_event("cutover_reset", payload, now_iso())
+        self._append_activity_artifact(self._today_str(), "cutover_reset", payload)
+        self._notify(
+            "[AgentLab] 컷오버 리셋 완료\n"
+            f"신규_epoch={new_epoch}\n"
+            f"아카이브={bool(archive)}\n"
+            f"재초기화={bool(reinit)}\n"
+            f"태스크재시작={bool(restart_tasks)}",
             event="report",
         )
         return payload

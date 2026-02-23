@@ -10,12 +10,14 @@ REPORT_EVENTS = {
     "preopen_plan",
     "session_close_report",
     "weekly_council",
-    "auto_strategy_update",
 }
 
 ACTION_REQUIRED_EVENTS = {
     "llm_limit_alert",
     "daemon_error",
+    "sync_mismatch",
+    "refresh_timeout",
+    "broker_api_error",
 }
 
 
@@ -89,7 +91,17 @@ class TelegramNotifier:
             self.session.trust_env = False
         default_events = "trade_executed,preopen_plan,session_close_report,weekly_council"
         raw_events = os.getenv("AGENT_LAB_NOTIFY_EVENTS", default_events)
-        mandatory = {"trade_executed", "preopen_plan", "session_close_report", "weekly_council"}
+        mandatory = {
+            "trade_executed",
+            "preopen_plan",
+            "session_close_report",
+            "weekly_council",
+            "sync_mismatch",
+            "refresh_timeout",
+            "daemon_error",
+            "llm_limit_alert",
+            "broker_api_error",
+        }
         parsed = _parse_csv_set(raw_events)
         self.allowed_events = parsed.union(mandatory)
 

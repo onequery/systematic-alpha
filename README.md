@@ -46,6 +46,18 @@ pip install -r requirements.txt
   - 기본값: `trade_executed,preopen_plan,session_close_report,weekly_council`
   - 이 목록에 없는 이벤트는 텔레그램 푸시를 보내지 않습니다.
 
+통합 포트폴리오 + 서버 동기화:
+- `AGENT_LAB_EXECUTION_MODEL=unified_shadow`
+  - 단일 통합 포트폴리오로 실제 주문을 집행하고, 에이전트별 제안은 섀도우 의사결정으로 기록합니다.
+- `AGENT_LAB_SYNC_STRICT=1`
+  - 데몬/주문 경로에서 서버 계좌와 로컬 상태 불일치 시 주문을 차단합니다.
+- `AGENT_LAB_SYNC_MISMATCH_BLOCK=1`
+  - 불일치 시 즉시 차단 + Action required 알림을 보냅니다.
+- `AGENT_LAB_EVENT_BATCH_ENABLED=1`
+  - 일반 이벤트는 30분 배치 요약으로 전송합니다.
+- `AGENT_LAB_EVENT_BATCH_MINUTES=30`
+- `AGENT_LAB_EVENT_BATCH_MAX_ITEMS=30`
+
 정규장 시간 강제(거래 안전장치):
 - `AGENT_LAB_ENFORCE_MARKET_HOURS=1`이면 KR(09:00~15:35 KST), US(09:30~16:05 ET) 외 시간에는 주문 제안/실행을 차단합니다.
 
@@ -147,7 +159,7 @@ ps -ef | grep run_agent_lab_wsl.sh | grep -v grep
 4. US 개장/마감도 2~3과 동일
 5. 주간 에이전트 토의 보고
 
-그 외 이벤트(하트비트, 데몬 시작, 장중 모니터링 등)는 기본적으로 텔레그램 푸시를 보내지 않습니다.
+그 외 이벤트(하트비트, 데몬 시작, 장중 모니터링 등)는 즉시 푸시하지 않고 배치 요약으로 전송합니다.
 설명이 필요한 보고(개장 전 플랜, 장 종료 후 결과/토의, 주간 토의 요약)는 OpenAI LLM이 활성화된 경우 LLM 설명문을 함께 생성합니다.
 
 ## 7. 텔레그램 명령어
@@ -189,6 +201,15 @@ ps -ef | grep run_agent_lab_wsl.sh | grep -v grep
 # 데몬
 ./scripts/run_agent_lab_wsl.sh --action telegram-chat
 ./scripts/run_agent_lab_wsl.sh --action auto-strategy-daemon
+
+# 서버 계좌 동기화(강제 모드)
+./scripts/run_agent_lab_wsl.sh --action sync-account --market ALL
+
+# 섀도우 성과 리포트
+./scripts/run_agent_lab_wsl.sh --action shadow-report --from YYYYMMDD --to YYYYMMDD
+
+# 컷오버 리셋(평탄화 완료 후 수동 실행)
+/home/heesu/anaconda3/envs/systematic-alpha/bin/python -m systematic_alpha.agent_lab.cli --project-root . cutover-reset --require-flat --archive --reinit --restart-tasks
 ```
 
 ## 9. 경로
@@ -199,6 +220,7 @@ ps -ef | grep run_agent_lab_wsl.sh | grep -v grep
 - 산출물: `out/agent_lab/YYYYMMDD/`
 - 주간 산출물: `out/agent_lab/YYYYMMDD_weekly/`
 - 로그: `logs/agent_lab/YYYYMMDD/`, `logs/cron/`
+- 컷오버 아카이브: `archive/agent_lab/<timestamp>/`
 
 ## 10. 트러블슈팅
 

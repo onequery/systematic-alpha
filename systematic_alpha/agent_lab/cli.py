@@ -61,6 +61,20 @@ def parse_args() -> argparse.Namespace:
     p_sanitize.add_argument("--retain-days", type=int, default=30)
     p_sanitize.add_argument("--keep-agent-memories", type=int, default=300)
 
+    p_sync = sub.add_parser("sync-account")
+    p_sync.add_argument("--market", type=str, choices=["KR", "US", "ALL", "kr", "us", "all"], default="ALL")
+    p_sync.add_argument("--strict", action="store_true")
+
+    p_cutover = sub.add_parser("cutover-reset")
+    p_cutover.add_argument("--require-flat", action="store_true")
+    p_cutover.add_argument("--archive", action="store_true")
+    p_cutover.add_argument("--reinit", action="store_true")
+    p_cutover.add_argument("--restart-tasks", action="store_true")
+
+    p_shadow = sub.add_parser("shadow-report")
+    p_shadow.add_argument("--from", dest="date_from", type=str, required=True)
+    p_shadow.add_argument("--to", dest="date_to", type=str, required=True)
+
     p_chat = sub.add_parser("telegram-chat")
     p_chat.add_argument("--poll-timeout", type=int, default=25)
     p_chat.add_argument("--idle-sleep", type=float, default=1.0)
@@ -156,6 +170,23 @@ def main() -> None:
                 cleanup_runtime_state=not bool(args.skip_runtime_cleanup),
                 retain_days=int(args.retain_days),
                 keep_agent_memories=int(args.keep_agent_memories),
+            )
+        elif cmd == "sync-account":
+            payload = orchestrator.sync_account(
+                market=str(args.market).upper(),
+                strict=bool(args.strict),
+            )
+        elif cmd == "cutover-reset":
+            payload = orchestrator.cutover_reset(
+                require_flat=bool(args.require_flat),
+                archive=bool(args.archive),
+                reinit=bool(args.reinit),
+                restart_tasks=bool(args.restart_tasks),
+            )
+        elif cmd == "shadow-report":
+            payload = orchestrator.shadow_report(
+                date_from=args.date_from,
+                date_to=args.date_to,
             )
         else:
             raise RuntimeError(f"unsupported command: {cmd}")
