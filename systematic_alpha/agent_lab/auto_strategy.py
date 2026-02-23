@@ -1021,7 +1021,8 @@ class AutoStrategyDaemon:
         signal_status = "STALE_SIGNAL" if signal_is_stale else signal_status_raw
         proposal_date = expected_session_date if market_open else signal_date
         status_counts = self._proposal_status_counts(market, proposal_date) if proposal_date else {}
-        payload["session_date"] = signal_date
+        payload["session_date"] = expected_session_date
+        payload["signal_session_date"] = signal_date
         payload["signal_status_raw"] = signal_status_raw
         payload["signal_is_stale"] = signal_is_stale
         payload["signal_status"] = signal_status

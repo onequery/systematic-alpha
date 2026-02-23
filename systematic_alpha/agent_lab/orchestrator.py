@@ -123,6 +123,14 @@ class AgentLabOrchestrator:
         end = now.replace(hour=16, minute=5, second=0, microsecond=0)
         return (start <= now <= end), f"now_et={now.isoformat(timespec='seconds')}, window=09:30~16:05"
 
+    def _session_date_now(self, market: str, now_utc: Optional[datetime] = None) -> str:
+        market_upper = str(market).strip().upper()
+        if market_upper == "US":
+            now = now_utc.astimezone(self.et) if now_utc else datetime.now(self.et)
+            return now.strftime("%Y%m%d")
+        now = now_utc.astimezone(self.kst) if now_utc else datetime.now(self.kst)
+        return now.strftime("%Y%m%d")
+
     def _event_already_reported(self, event_type: str, market: str, yyyymmdd: str, *, limit: int = 500) -> bool:
         market_upper = str(market).strip().upper()
         date_str = str(yyyymmdd).strip()
@@ -1048,27 +1056,43 @@ class AgentLabOrchestrator:
         auto_execute: Optional[bool] = None,
     ) -> Dict[str, Any]:
         market = market.strip().upper()
-        if self._enforce_market_hours():
-            market_open, market_window_detail = self._is_market_open_now(market)
-            if not market_open:
-                payload = {
-                    "market": market,
-                    "date": yyyymmdd,
-                    "auto_execute": False,
-                    "proposals": [],
-                    "execution_results": [],
-                    "skipped": True,
-                    "reason": "outside_market_hours",
-                    "detail": market_window_detail,
-                }
-                self.storage.log_event("orders_proposed_skipped", payload, now_iso())
-                self._append_activity_artifact(yyyymmdd, "orders_proposed_skipped", payload)
-                return payload
+        requested_session_date = str(yyyymmdd).strip()
+        market_open, market_window_detail = self._is_market_open_now(market)
+        if self._enforce_market_hours() and not market_open:
+            payload = {
+                "market": market,
+                "date": requested_session_date,
+                "auto_execute": False,
+                "proposals": [],
+                "execution_results": [],
+                "skipped": True,
+                "reason": "outside_market_hours",
+                "detail": market_window_detail,
+            }
+            self.storage.log_event("orders_proposed_skipped", payload, now_iso())
+            self._append_activity_artifact(requested_session_date, "orders_proposed_skipped", payload)
+            return payload
 
-        signal = self.storage.get_latest_session_signal(market, yyyymmdd)
+        effective_session_date = requested_session_date
+        if market_open:
+            live_session_date = self._session_date_now(market)
+            if live_session_date and live_session_date != requested_session_date:
+                self.storage.log_event(
+                    "proposal_session_date_corrected",
+                    {
+                        "market": market,
+                        "requested_session_date": requested_session_date,
+                        "effective_session_date": live_session_date,
+                        "reason": "market_open_force_current_session_date",
+                    },
+                    now_iso(),
+                )
+                effective_session_date = live_session_date
+
+        signal = self.storage.get_latest_session_signal(market, effective_session_date)
         if signal is None:
-            self.ingest_session(market, yyyymmdd)
-            signal = self.storage.get_latest_session_signal(market, yyyymmdd)
+            self.ingest_session(market, effective_session_date)
+            signal = self.storage.get_latest_session_signal(market, effective_session_date)
         if signal is None:
             raise RuntimeError("failed to load session signal")
 
@@ -1080,7 +1104,7 @@ class AgentLabOrchestrator:
                 "auto_execute_forced",
                 {
                     "market": market,
-                    "date": yyyymmdd,
+                    "date": effective_session_date,
                     "requested_auto_execute": bool(requested_auto_execute),
                     "forced_auto_execute": True,
                 },
@@ -1091,7 +1115,7 @@ class AgentLabOrchestrator:
         if not agents:
             raise RuntimeError("no agents registered. run `init` first.")
         output_rows: List[Dict[str, Any]] = []
-        usdkrw = self._usdkrw_rate(yyyymmdd) if market == "US" else 1.0
+        usdkrw = self._usdkrw_rate(effective_session_date) if market == "US" else 1.0
         base_payload = signal.get("payload", {})
         if not isinstance(base_payload, dict):
             base_payload = {}
@@ -1106,10 +1130,10 @@ class AgentLabOrchestrator:
                 profile=profile,
                 active_params=active_params,
                 market=market,
-                yyyymmdd=yyyymmdd,
+                yyyymmdd=effective_session_date,
                 ledger=ledger,
             )
-            day_ret, week_ret = self.accounting.daily_and_weekly_return(agent_id, yyyymmdd)
+            day_ret, week_ret = self.accounting.daily_and_weekly_return(agent_id, effective_session_date)
             position_qty_by_symbol: Dict[str, float] = {}
             for pos in list(ledger.get("positions") or []):
                 pos_market = str(pos.get("market", "")).strip().upper()
@@ -1124,7 +1148,7 @@ class AgentLabOrchestrator:
                 base_payload=base_payload,
                 agent_id=agent_id,
                 market=market,
-                session_date=yyyymmdd,
+                session_date=effective_session_date,
             )
             proposed_orders, rationale = self.agent_engine.propose_orders(
                 agent=profile,
@@ -1178,7 +1202,7 @@ class AgentLabOrchestrator:
                 proposal_uuid=proposal_uuid,
                 agent_id=agent_id,
                 market=market,
-                session_date=yyyymmdd,
+                session_date=effective_session_date,
                 strategy_version_id=int(active["strategy_version_id"]),
                 status=status,
                 blocked_reason=decision.blocked_reason,
@@ -1193,7 +1217,7 @@ class AgentLabOrchestrator:
                     {
                         "agent_id": agent_id,
                         "market": market,
-                        "session_date": yyyymmdd,
+                        "session_date": effective_session_date,
                         "status_code": signal["status_code"],
                         "blocked_reason": decision.blocked_reason,
                     },
@@ -1206,7 +1230,7 @@ class AgentLabOrchestrator:
                     "proposal_id": proposal_id,
                     "proposal_uuid": proposal_uuid,
                     "market": market,
-                    "session_date": yyyymmdd,
+                    "session_date": effective_session_date,
                     "status": status,
                     "blocked_reason": decision.blocked_reason,
                     "accepted_orders": decision.accepted_orders,
@@ -1240,7 +1264,7 @@ class AgentLabOrchestrator:
                     executed = self._execute_proposal(
                         proposal_identifier=str(proposal_id),
                         approved_by="auto_executor",
-                        note=f"auto-approved market={market} date={yyyymmdd}",
+                        note=f"auto-approved market={market} date={effective_session_date}",
                         allowed_statuses=[PROPOSAL_STATUS_APPROVED],
                     )
                     row["status"] = str(executed.get("status", row["status"]))
@@ -1274,19 +1298,23 @@ class AgentLabOrchestrator:
 
         payload = {
             "market": market,
-            "date": yyyymmdd,
+            "date": effective_session_date,
             "auto_execute": bool(auto_execute),
             "proposals": output_rows,
             "execution_results": execution_results,
         }
-        self._write_json_artifact(yyyymmdd, f"proposals_{market.lower()}_{yyyymmdd}", payload)
+        self._write_json_artifact(
+            effective_session_date,
+            f"proposals_{market.lower()}_{effective_session_date}",
+            payload,
+        )
         self.storage.log_event("orders_proposed", payload, now_iso())
-        self._append_activity_artifact(yyyymmdd, "orders_proposed", payload)
+        self._append_activity_artifact(effective_session_date, "orders_proposed", payload)
 
         lines = [
             "[AgentLab] 주문 제안",
             f"시장={market}",
-            f"일자={yyyymmdd}",
+            f"일자={effective_session_date}",
             f"자동실행={bool(auto_execute)}",
         ]
         status_ko = {
