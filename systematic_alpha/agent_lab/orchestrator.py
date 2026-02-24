@@ -145,6 +145,34 @@ class AgentLabOrchestrator:
         return max(0.1, min(10.0, float(raw)))
 
     @staticmethod
+    def _sync_precheck_retries() -> int:
+        try:
+            raw = float(os.getenv("AGENT_LAB_SYNC_PRECHECK_RETRIES", "2") or 2)
+        except Exception:
+            raw = 2.0
+        return max(0, min(8, int(raw)))
+
+    @staticmethod
+    def _sync_precheck_retry_delay_sec() -> float:
+        try:
+            raw = float(os.getenv("AGENT_LAB_SYNC_PRECHECK_RETRY_DELAY_SEC", "1.0") or 1.0)
+        except Exception:
+            raw = 1.0
+        return max(0.0, min(10.0, float(raw)))
+
+    @staticmethod
+    def _sync_fail_open_on_transient() -> bool:
+        return _truthy(os.getenv("AGENT_LAB_SYNC_FAIL_OPEN_ON_TRANSIENT", "1"))
+
+    @staticmethod
+    def _sync_fail_open_grace_sec() -> int:
+        try:
+            raw = float(os.getenv("AGENT_LAB_SYNC_FAIL_OPEN_GRACE_SEC", "20") or 20)
+        except Exception:
+            raw = 20.0
+        return max(1, min(120, int(raw)))
+
+    @staticmethod
     def _strict_report_windows_enabled() -> bool:
         return _truthy(os.getenv("AGENT_LAB_STRICT_REPORT_WINDOWS", "1"))
 
@@ -1455,6 +1483,104 @@ class AgentLabOrchestrator:
         return final_fail
 
     @staticmethod
+    def _is_transient_sync_error_text(text: str) -> bool:
+        raw = str(text or "")
+        norm = raw.lower()
+        keys = (
+            "keyerror('tr_cont')",
+            'keyerror("tr_cont")',
+            "remote end closed connection without response",
+            "remotedisconnected",
+            "connection aborted",
+            "max retries exceeded",
+            "failed to resolve",
+            "name or service not known",
+            "temporary failure in name resolution",
+            "read timed out",
+            "connect timeout",
+            "connection reset by peer",
+            "sslerror",
+            "protocolerror",
+        )
+        return any(k in norm for k in keys)
+
+    def _is_transient_sync_failure(self, payload: Dict[str, Any]) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        if str(payload.get("reason", "")).strip().lower() != "broker_fetch_failed":
+            return False
+        errors = payload.get("errors")
+        if not isinstance(errors, list):
+            return False
+        return any(self._is_transient_sync_error_text(str(x)) for x in errors)
+
+    def _recent_strict_sync_success(self, market_scope: str = "ALL", *, max_age_sec: int = 20) -> bool:
+        scope = str(market_scope or "ALL").strip().upper() or "ALL"
+        rows = self.storage.list_events(event_type="account_synced", limit=50)
+        for row in rows:
+            payload = row.get("payload", {}) if isinstance(row, dict) else {}
+            if not isinstance(payload, dict):
+                continue
+            row_scope = str(payload.get("market_scope", "")).strip().upper()
+            if row_scope and row_scope != scope:
+                continue
+            if not bool(payload.get("strict", False)):
+                continue
+            if bool(payload.get("blocked", False)):
+                continue
+            if not bool(payload.get("ok", False)):
+                continue
+            if not bool(payload.get("matched", False)):
+                continue
+            age = self._age_seconds_from_iso(str(row.get("created_at", "")))
+            if age is None:
+                age = self._age_seconds_from_iso(str(payload.get("fetched_at", "")))
+            if age is not None and float(age) <= float(max_age_sec):
+                return True
+        return False
+
+    def _sync_account_strict_with_retry(
+        self,
+        *,
+        market_scope: str = "ALL",
+        notify_on_fail: bool = True,
+        track_streak_on_fail: bool = True,
+    ) -> Dict[str, Any]:
+        retries = self._sync_precheck_retries()
+        delay_sec = self._sync_precheck_retry_delay_sec()
+        attempts = retries + 1
+        last: Dict[str, Any] = {}
+        for idx in range(attempts):
+            last = self.sync_account(
+                market=market_scope,
+                strict=True,
+                notify=False,
+                track_streak=False,
+            )
+            blocked = bool(last.get("blocked", False))
+            if not blocked:
+                self._set_sync_mismatch_streak(market_scope, 0)
+                out = dict(last)
+                out["sync_retry_attempts"] = int(idx + 1)
+                out["sync_retry_used"] = bool(idx > 0)
+                return out
+            if idx < (attempts - 1) and self._is_transient_sync_failure(last):
+                if delay_sec > 0:
+                    time.sleep(delay_sec)
+                continue
+            break
+        final_fail = self.sync_account(
+            market=market_scope,
+            strict=True,
+            notify=bool(notify_on_fail),
+            track_streak=bool(track_streak_on_fail),
+        )
+        final_fail["sync_retry_attempts"] = int(attempts)
+        final_fail["sync_retry_used"] = bool(retries > 0)
+        final_fail["sync_retry_failed"] = True
+        return final_fail
+
+    @staticmethod
     def _has_rate_limit_error(errors: List[Any]) -> bool:
         text = " ".join(str(x) for x in (errors or []))
         norm = text.lower()
@@ -2019,7 +2145,11 @@ class AgentLabOrchestrator:
         auto_execute: bool,
     ) -> Dict[str, Any]:
         self._ensure_unified_executor_agent()
-        sync_pre = self.sync_account(market="ALL", strict=True)
+        sync_pre = self._sync_account_strict_with_retry(
+            market_scope="ALL",
+            notify_on_fail=True,
+            track_streak_on_fail=True,
+        )
         if bool(sync_pre.get("blocked", False)):
             payload = {
                 "market": market,
@@ -2173,24 +2303,64 @@ class AgentLabOrchestrator:
                 }
             )
 
-        sync_pre_aggregate = self.sync_account(market="ALL", strict=True)
+        sync_pre_aggregate = self._sync_account_strict_with_retry(
+            market_scope="ALL",
+            notify_on_fail=True,
+            track_streak_on_fail=True,
+        )
+        fail_open_used = False
+        fail_open_reason = ""
+        if bool(sync_pre_aggregate.get("blocked", False)) and self._sync_fail_open_on_transient():
+            if self._is_transient_sync_failure(sync_pre_aggregate):
+                grace_sec = self._sync_fail_open_grace_sec()
+                if self._recent_strict_sync_success("ALL", max_age_sec=grace_sec):
+                    fail_open_used = True
+                    fail_open_reason = "transient_sync_failure_with_recent_strict_sync_success"
+                    self.storage.log_event(
+                        "sync_fail_open_used",
+                        {
+                            "market": market,
+                            "date": effective_session_date,
+                            "phase": "pre_aggregate",
+                            "grace_sec": int(grace_sec),
+                            "reason": fail_open_reason,
+                            "sync_pre_aggregate": sync_pre_aggregate,
+                        },
+                        now_iso(),
+                    )
         if bool(sync_pre_aggregate.get("blocked", False)):
-            payload = {
-                "market": market,
-                "date": effective_session_date,
-                "auto_execute": bool(auto_execute),
-                "execution_model": "unified_shadow",
-                "skipped": True,
-                "reason": "sync_mismatch_before_aggregate",
-                "sync_pre": sync_pre,
-                "sync_pre_aggregate": sync_pre_aggregate,
-                "shadow_proposals": shadow_rows,
-                "proposals": shadow_rows,
-                "execution_results": [],
-            }
-            self.storage.log_event("orders_proposed_skipped", payload, now_iso())
-            self._append_activity_artifact(effective_session_date, "orders_proposed_skipped", payload)
-            return payload
+            if fail_open_used:
+                sync_pre_aggregate = dict(sync_pre_aggregate)
+                sync_pre_aggregate["fail_open_used"] = True
+                sync_pre_aggregate["fail_open_reason"] = fail_open_reason
+            else:
+                payload = {
+                    "market": market,
+                    "date": effective_session_date,
+                    "auto_execute": bool(auto_execute),
+                    "execution_model": "unified_shadow",
+                    "skipped": True,
+                    "reason": "sync_mismatch_before_aggregate",
+                    "sync_pre": sync_pre,
+                    "sync_pre_aggregate": sync_pre_aggregate,
+                    "shadow_proposals": shadow_rows,
+                    "proposals": shadow_rows,
+                    "execution_results": [],
+                }
+                self.storage.log_event("orders_proposed_skipped", payload, now_iso())
+                self._append_activity_artifact(effective_session_date, "orders_proposed_skipped", payload)
+                return payload
+        if bool(sync_pre_aggregate.get("blocked", False)) and fail_open_used:
+            self.storage.log_event(
+                "sync_pre_aggregate_soft_bypass",
+                {
+                    "market": market,
+                    "date": effective_session_date,
+                    "reason": fail_open_reason,
+                    "sync_pre_aggregate": sync_pre_aggregate,
+                },
+                now_iso(),
+            )
         merged_orders, agg_detail = self._aggregate_shadow_orders(
             market=market,
             intents=intents_for_agg,

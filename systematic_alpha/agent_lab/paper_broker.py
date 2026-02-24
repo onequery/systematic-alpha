@@ -391,6 +391,28 @@ class PaperBroker:
             or ("rate limit" in norm)
         )
 
+    @staticmethod
+    def _is_transient_error_text(text: str) -> bool:
+        raw = str(text or "")
+        norm = raw.lower()
+        keys = (
+            "keyerror('tr_cont')",
+            'keyerror("tr_cont")',
+            "remote end closed connection without response",
+            "remotedisconnected",
+            "connection aborted",
+            "max retries exceeded",
+            "failed to resolve",
+            "name or service not known",
+            "temporary failure in name resolution",
+            "read timed out",
+            "connect timeout",
+            "connection reset by peer",
+            "sslerror",
+            "protocolerror",
+        )
+        return any(k in norm for k in keys)
+
     @classmethod
     def _is_rate_limited_payload(cls, payload: Any) -> bool:
         return cls._is_rate_limit_text(cls._api_error_text(payload))
@@ -416,14 +438,19 @@ class PaperBroker:
         return value
 
     def _call_with_rate_limit_retry(self, fn: Any, *, op_name: str) -> Any:
-        retries = self._env_int("AGENT_LAB_BROKER_RATE_LIMIT_RETRIES", 2, 0, 10)
-        base_delay = self._env_float("AGENT_LAB_BROKER_RATE_LIMIT_BACKOFF_SEC", 1.2, 0.0, 60.0)
-        mult = self._env_float("AGENT_LAB_BROKER_RATE_LIMIT_BACKOFF_MULT", 1.7, 1.0, 5.0)
-        max_delay = self._env_float("AGENT_LAB_BROKER_RATE_LIMIT_BACKOFF_MAX_SEC", 8.0, 0.1, 120.0)
-        max_attempts = retries + 1
+        rate_retries = self._env_int("AGENT_LAB_BROKER_RATE_LIMIT_RETRIES", 2, 0, 10)
+        rate_base_delay = self._env_float("AGENT_LAB_BROKER_RATE_LIMIT_BACKOFF_SEC", 1.2, 0.0, 60.0)
+        rate_mult = self._env_float("AGENT_LAB_BROKER_RATE_LIMIT_BACKOFF_MULT", 1.7, 1.0, 5.0)
+        rate_max_delay = self._env_float("AGENT_LAB_BROKER_RATE_LIMIT_BACKOFF_MAX_SEC", 8.0, 0.1, 120.0)
+        transient_retries = self._env_int("AGENT_LAB_BROKER_TRANSIENT_RETRIES", 2, 0, 10)
+        transient_base_delay = self._env_float("AGENT_LAB_BROKER_TRANSIENT_BACKOFF_SEC", 0.8, 0.0, 60.0)
+        transient_mult = self._env_float("AGENT_LAB_BROKER_TRANSIENT_BACKOFF_MULT", 1.8, 1.0, 5.0)
+        transient_max_delay = self._env_float("AGENT_LAB_BROKER_TRANSIENT_BACKOFF_MAX_SEC", 6.0, 0.1, 120.0)
 
+        rate_attempt = 0
+        transient_attempt = 0
         last_exc: Exception | None = None
-        for attempt in range(max_attempts):
+        while True:
             try:
                 payload = fn()
                 if self._is_rate_limited_payload(payload):
@@ -433,24 +460,62 @@ class PaperBroker:
                 last_exc = exc
                 err_text = repr(exc)
                 is_rate = self._is_rate_limit_text(err_text)
-                if (not is_rate) or attempt >= (max_attempts - 1):
-                    raise
-                delay = min(max_delay, base_delay * (mult ** attempt))
+                is_transient = self._is_transient_error_text(err_text)
+                if is_rate and rate_attempt < rate_retries:
+                    rate_attempt += 1
+                    delay = min(rate_max_delay, rate_base_delay * (rate_mult ** max(0, rate_attempt - 1)))
+                    try:
+                        self.storage.log_event(
+                            "broker_rate_limit_retry",
+                            {
+                                "op": str(op_name),
+                                "attempt": int(rate_attempt),
+                                "max_attempts": int(rate_retries + 1),
+                                "delay_sec": round(float(delay), 3),
+                                "error": err_text[:240],
+                            },
+                            datetime.now().isoformat(timespec="seconds"),
+                        )
+                    except Exception:
+                        pass
+                    time.sleep(delay)
+                    continue
+                if is_transient and transient_attempt < transient_retries:
+                    transient_attempt += 1
+                    delay = min(
+                        transient_max_delay,
+                        transient_base_delay * (transient_mult ** max(0, transient_attempt - 1)),
+                    )
+                    try:
+                        self.storage.log_event(
+                            "broker_transient_retry",
+                            {
+                                "op": str(op_name),
+                                "attempt": int(transient_attempt),
+                                "max_attempts": int(transient_retries + 1),
+                                "delay_sec": round(float(delay), 3),
+                                "error": err_text[:240],
+                            },
+                            datetime.now().isoformat(timespec="seconds"),
+                        )
+                    except Exception:
+                        pass
+                    time.sleep(delay)
+                    continue
                 try:
                     self.storage.log_event(
-                        "broker_rate_limit_retry",
+                        "broker_retry_exhausted",
                         {
                             "op": str(op_name),
-                            "attempt": int(attempt + 1),
-                            "max_attempts": int(max_attempts),
-                            "delay_sec": round(float(delay), 3),
+                            "rate_attempts": int(rate_attempt),
+                            "transient_attempts": int(transient_attempt),
                             "error": err_text[:240],
                         },
                         datetime.now().isoformat(timespec="seconds"),
                     )
                 except Exception:
                     pass
-                time.sleep(delay)
+                raise
 
         if last_exc is not None:
             raise last_exc
