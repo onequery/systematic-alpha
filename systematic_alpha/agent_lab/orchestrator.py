@@ -3322,6 +3322,8 @@ class AgentLabOrchestrator:
     ) -> Dict[str, Any]:
         sync = self.sync_account(market="ALL", strict=False)
         ctx = self._latest_account_context("ALL")
+        server_equity_krw = float(ctx.get("equity_krw", 0.0) or 0.0)
+        server_cash_krw = float(ctx.get("cash_krw", 0.0) or 0.0)
         open_positions = [
             row for row in list(ctx.get("positions", []) or [])
             if float(row.get("quantity", 0.0) or 0.0) > 0
@@ -3346,7 +3348,16 @@ class AgentLabOrchestrator:
             return payload
 
         active_agents = self.storage.list_agents()
-        init_capital = float(sum(float(x.get("allocated_capital_krw", 0.0) or 0.0) for x in active_agents))
+        legacy_allocated_sum = float(sum(float(x.get("allocated_capital_krw", 0.0) or 0.0) for x in active_agents))
+        if server_equity_krw > 0.0:
+            init_capital = server_equity_krw
+            init_capital_source = "server_equity_krw"
+        elif server_cash_krw > 0.0:
+            init_capital = server_cash_krw
+            init_capital_source = "server_cash_krw"
+        else:
+            init_capital = legacy_allocated_sum
+            init_capital_source = "legacy_allocated_sum"
         init_agents = int(len(active_agents))
         ts = datetime.now(self.kst).strftime("%Y%m%d_%H%M%S")
         archive_root = self.project_root / "archive" / "agent_lab" / ts
@@ -3416,6 +3427,9 @@ class AgentLabOrchestrator:
             "archive_root": str(archive_root) if archive else "",
             "moved": moved,
             "new_epoch_id": new_epoch,
+            "server_equity_krw": server_equity_krw,
+            "server_cash_krw": server_cash_krw,
+            "init_capital_source": init_capital_source,
             "reinit_payload": reinit_payload,
             "restart_result": restart_result,
         }

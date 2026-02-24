@@ -162,6 +162,24 @@ class PaperBroker:
         return cls._to_float(row.get(keys[0], default), default=default) if keys else float(default)
 
     @classmethod
+    def _pick_present_value(cls, row: Dict[str, Any], keys: List[str], default: float = 0.0) -> float:
+        """
+        Return the first *present* field value, even if it is 0.
+        This avoids treating valid zero-values as "missing".
+        """
+        for key in keys:
+            if key not in row:
+                continue
+            raw = row.get(key)
+            if raw is None:
+                continue
+            text = str(raw).strip()
+            if text == "":
+                continue
+            return cls._to_float(raw, default=default)
+        return float(default)
+
+    @classmethod
     def _parse_balance_domestic(cls, payload: Dict[str, Any]) -> Dict[str, Any]:
         output1 = payload.get("output1", [])
         output2 = payload.get("output2", [])
@@ -173,8 +191,16 @@ class PaperBroker:
         if not isinstance(summary, dict):
             summary = {}
 
-        cash_krw = cls._pick_value(summary, ["dnca_tot_amt", "ord_psbl_cash", "dnca_tot_amt2", "tot_dnca"])
-        equity_krw = cls._pick_value(summary, ["tot_evlu_amt", "scts_evlu_amt", "tot_asst_amt", "tot_eval_amt"], default=cash_krw)
+        cash_krw = cls._pick_present_value(
+            summary,
+            ["ord_psbl_cash", "wdrw_psbl_amt", "wdrw_psbl_tot_amt", "dnca_tot_amt", "dnca_tot_amt2", "tot_dnca"],
+            default=0.0,
+        )
+        equity_krw = cls._pick_present_value(
+            summary,
+            ["tot_evlu_amt", "nass_amt", "tot_asst_amt", "tot_eval_amt", "scts_evlu_amt"],
+            default=cash_krw,
+        )
         positions: List[Dict[str, Any]] = []
         for row in output1:
             if not isinstance(row, dict):
@@ -199,6 +225,10 @@ class PaperBroker:
                     "payload": row,
                 }
             )
+        # Keep account figures API-authoritative.
+        # If there are no holdings and equity is positive, prefer total equity as cash proxy.
+        if len(positions) == 0 and float(equity_krw) > 0.0 and float(cash_krw) <= 0.0:
+            cash_krw = float(equity_krw)
         return {
             "market": "KR",
             "cash_krw": float(cash_krw),
@@ -209,8 +239,7 @@ class PaperBroker:
 
     @classmethod
     def _parse_balance_oversea(cls, payload: Dict[str, Any]) -> Dict[str, Any]:
-        output1 = payload.get("output1", [])
-        output2 = payload.get("output2", [])
+        output1, output2 = cls._normalize_oversea_payload(payload)
         if not isinstance(output1, list):
             output1 = []
         if not isinstance(output2, list):
@@ -269,6 +298,94 @@ class PaperBroker:
             "raw": payload,
         }
 
+    @staticmethod
+    def _normalize_oversea_payload(payload: Dict[str, Any]) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        if not isinstance(payload, dict):
+            return [], []
+        output1 = payload.get("output1", [])
+        output2 = payload.get("output2", [])
+
+        # Some APIs return a single "output" body instead of output1/output2.
+        if not output1 and not output2 and "output" in payload:
+            output = payload.get("output")
+            if isinstance(output, list):
+                output1 = output
+            elif isinstance(output, dict):
+                output2 = [output]
+
+        # Some variants expose summary on output3.
+        if not output2 and "output3" in payload:
+            output3 = payload.get("output3")
+            if isinstance(output3, list):
+                output2 = output3
+            elif isinstance(output3, dict):
+                output2 = [output3]
+
+        # Normalize dict -> list.
+        if isinstance(output1, dict):
+            output1 = [output1]
+        if isinstance(output2, dict):
+            output2 = [output2]
+
+        out1: List[Dict[str, Any]] = []
+        out2: List[Dict[str, Any]] = []
+        for row in output1 if isinstance(output1, list) else []:
+            if isinstance(row, dict):
+                out1.append(row)
+        for row in output2 if isinstance(output2, list) else []:
+            if isinstance(row, dict):
+                out2.append(row)
+        return out1, out2
+
+    @staticmethod
+    def _api_error_text(payload: Any) -> str:
+        if not isinstance(payload, dict):
+            return ""
+        rt_cd = str(payload.get("rt_cd", "")).strip()
+        msg_cd = str(payload.get("msg_cd", "")).strip()
+        msg1 = str(payload.get("msg1", "")).strip()
+        if rt_cd and rt_cd != "0":
+            return f"rt_cd={rt_cd}, msg_cd={msg_cd}, msg1={msg1}"
+        return ""
+
+    def _fetch_us_balance_with_fallback(self, broker: Any) -> Dict[str, Any]:
+        """
+        Primary: fetch_balance()
+        Fallback: fetch_present_balance() variants for environments where
+        oversea day/night endpoint payload differs (e.g. missing 'output').
+        """
+        try:
+            payload = broker.fetch_balance()
+            if isinstance(payload, dict):
+                return payload
+            return {}
+        except Exception as exc:
+            last_error = repr(exc)
+
+        fallback_errors: List[str] = [f"fetch_balance:{last_error}"]
+        candidates: List[Dict[str, Any]] = []
+        for foreign_currency in (False, True):
+            try:
+                payload = broker.fetch_present_balance(foreign_currency=foreign_currency)
+                if isinstance(payload, dict):
+                    api_err = self._api_error_text(payload)
+                    if api_err:
+                        fallback_errors.append(f"fetch_present_balance({foreign_currency}):{api_err}")
+                        continue
+                    norm1, norm2 = self._normalize_oversea_payload(payload)
+                    if norm1 or norm2:
+                        candidates.append(payload)
+            except Exception as exc:
+                fallback_errors.append(f"fetch_present_balance({foreign_currency}):{repr(exc)}")
+
+        if candidates:
+            picked = candidates[0]
+            picked["_fallback_source"] = "fetch_present_balance"
+            picked["_fallback_errors"] = fallback_errors
+            return picked
+
+        raise RuntimeError("; ".join(fallback_errors))
+
     def fetch_account_snapshot(self, market: str = "ALL") -> Dict[str, Any]:
         market_upper = str(market or "ALL").strip().upper()
         targets = ["KR", "US"] if market_upper in {"ALL", "*"} else [market_upper]
@@ -290,7 +407,10 @@ class PaperBroker:
                 out["errors"].append(f"{mk}:broker_unavailable")
                 continue
             try:
-                payload = broker.fetch_balance()
+                if mk == "US":
+                    payload = self._fetch_us_balance_with_fallback(broker)
+                else:
+                    payload = broker.fetch_balance()
                 if mk == "KR":
                     parsed = self._parse_balance_domestic(payload if isinstance(payload, dict) else {})
                 else:

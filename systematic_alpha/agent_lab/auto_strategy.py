@@ -139,6 +139,11 @@ class AutoStrategyDaemon:
         )
         return any(key in text for key in keys)
 
+    @staticmethod
+    def _use_mock_market_data() -> bool:
+        mode = str(os.getenv("AGENT_LAB_EXECUTION_MODE", "mojito_mock") or "mojito_mock").strip().lower()
+        return "mock" in mode
+
     def _allow_event(self, event: str) -> bool:
         if "*" in self.allowed_notify_events:
             return True
@@ -268,6 +273,53 @@ class AutoStrategyDaemon:
             f"로그={payload['log_path']}\n"
             f"알림_쿨다운={payload['cooldown_minutes']}분",
             event="refresh_timeout",
+        )
+
+    def _maybe_send_price_api_unavailable_alert(
+        self,
+        *,
+        market: str,
+        run_date: str,
+        log_path: Path,
+    ) -> None:
+        cooldown_min = max(
+            1,
+            int(float(os.getenv("AGENT_LAB_PRICE_API_ALERT_COOLDOWN_MINUTES", "30") or 30)),
+        )
+        latest = self.storage.list_events(event_type="auto_intraday_price_api_unavailable_alert", limit=120)
+        market_upper = str(market or "").strip().upper()
+        run_date_txt = str(run_date or "")
+        now_kst = datetime.now(self.kst)
+        for row in latest:
+            payload = row.get("payload", {}) if isinstance(row, dict) else {}
+            if not isinstance(payload, dict):
+                continue
+            if str(payload.get("market", "")).strip().upper() != market_upper:
+                continue
+            if str(payload.get("run_date", "")) != run_date_txt:
+                continue
+            created = _parse_iso(str(row.get("created_at", "")))
+            if created is None:
+                continue
+            if (now_kst.replace(tzinfo=None) - created.replace(tzinfo=None)) < timedelta(minutes=cooldown_min):
+                return
+
+        payload = {
+            "market": market_upper,
+            "run_date": run_date_txt,
+            "log_path": str(log_path),
+            "cooldown_minutes": int(cooldown_min),
+            "at_kst": now_kst.isoformat(),
+        }
+        self.storage.log_event("auto_intraday_price_api_unavailable_alert", payload, _now_iso())
+        self._send_telegram(
+            "[AgentLab] 시세 API 경고\n"
+            f"시장={market_upper}\n"
+            f"일자={run_date_txt}\n"
+            "사유=stage1 no_price_snapshot 급증으로 fail-fast\n"
+            f"로그={payload['log_path']}\n"
+            f"알림_쿨다운={payload['cooldown_minutes']}분",
+            event="broker_api_error",
         )
 
     def _flush_event_batch_if_due(self, now_kst: datetime) -> None:
@@ -973,6 +1025,8 @@ class AutoStrategyDaemon:
             str(overnight_path),
             "--allow-short-bias",
         ]
+        if self._use_mock_market_data():
+            cmd.append("--mock")
         allow_low_cov = _truthy(os.getenv("AGENT_LAB_INTRADAY_ALLOW_LOW_COVERAGE", "1"))
         cmd.append("--allow-low-coverage" if allow_low_cov else "--invalidate-on-low-coverage")
         if market == "US":
@@ -1028,8 +1082,19 @@ class AutoStrategyDaemon:
             "timed_out": bool(timed_out),
             "prefetch": prefetch,
         }
+        invalid_reason = ""
+        if output_json.exists():
+            try:
+                result_payload = json.loads(output_json.read_text(encoding="utf-8"))
+                invalid_reason = str(result_payload.get("invalid_reason", "") or "")
+                payload["signal_valid"] = bool(result_payload.get("signal_valid", False))
+                payload["invalid_reason"] = invalid_reason
+            except Exception as exc:
+                payload["result_parse_error"] = repr(exc)
         if returncode != 0:
             payload["error"] = f"returncode={returncode}"
+        if invalid_reason == "price_snapshot_unavailable":
+            payload["price_api_unavailable"] = True
         self.storage.log_event("auto_intraday_signal_refresh", payload, _now_iso())
         if timed_out:
             self._maybe_send_refresh_timeout_alert(
@@ -1037,6 +1102,12 @@ class AutoStrategyDaemon:
                 run_date=run_date,
                 elapsed_sec=elapsed,
                 timeout_sec=refresh_timeout_sec,
+                log_path=log_path,
+            )
+        if invalid_reason == "price_snapshot_unavailable":
+            self._maybe_send_price_api_unavailable_alert(
+                market=market,
+                run_date=run_date,
                 log_path=log_path,
             )
         return payload

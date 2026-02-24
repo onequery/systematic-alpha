@@ -24,6 +24,7 @@ def build_prefetch_config(
     user_id: str | None,
     kr_universe_size: int,
     max_symbols_scan: int,
+    mock: bool,
 ) -> StrategyConfig:
     return StrategyConfig(
         market="KR",
@@ -31,7 +32,7 @@ def build_prefetch_config(
         api_secret=api_secret,
         acc_no=acc_no,
         user_id=user_id,
-        mock=False,
+        mock=bool(mock),
         us_exchange="NASD",
         us_poll_interval=2.0,
         kr_universe_size=max(50, kr_universe_size),
@@ -96,6 +97,8 @@ def main() -> int:
 
     os.chdir(project_root)
     load_dotenv(".env", override=False)
+    execution_mode = str(os.getenv("AGENT_LAB_EXECUTION_MODE", "mojito_mock") or "mojito_mock").strip().lower()
+    use_mock = "mock" in execution_mode
 
     api_key, api_secret, acc_no, user_id = load_credentials(args.key_file)
     config = build_prefetch_config(
@@ -105,6 +108,7 @@ def main() -> int:
         user_id=user_id,
         kr_universe_size=args.kr_universe_size,
         max_symbols_scan=args.max_symbols_scan,
+        mock=use_mock,
     )
     mojito_module = import_mojito_module()
     selector = DayTradingSelector(mojito_module, config)
@@ -116,7 +120,7 @@ def main() -> int:
 
     print(
         f"[prefetch-kr] start: kr_universe_size={config.kr_universe_size}, "
-        f"max_symbols_scan={config.max_symbols_scan}, cache={cache_path}",
+        f"max_symbols_scan={config.max_symbols_scan}, mock={config.mock}, cache={cache_path}",
         flush=True,
     )
     codes, _ = selector.load_universe()

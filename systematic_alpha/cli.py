@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
@@ -112,6 +113,31 @@ def selector_api_diagnostics(selector: Any) -> Dict[str, Any]:
     except Exception:
         pass
     return {}
+
+
+def _stage1_no_price_failfast_enabled() -> bool:
+    raw = str(os.getenv("AGENT_LAB_STAGE1_NO_PRICE_FAILFAST", "1") or "1").strip().lower()
+    return raw in {"1", "true", "yes", "y", "on"}
+
+
+def _detect_no_price_snapshot_burst(stage1_scan_summary: Dict[str, Any]) -> Dict[str, Any]:
+    if not stage1_scan_summary:
+        return {"burst": False, "ratio": 0.0, "scanned": 0, "no_price_snapshot": 0}
+    scanned = int(stage1_scan_summary.get("scanned", 0) or 0)
+    reasons = stage1_scan_summary.get("skip_reason_counts", {}) or {}
+    no_price = int(reasons.get("no_price_snapshot", 0) or 0) if isinstance(reasons, dict) else 0
+    ratio = (float(no_price) / float(scanned)) if scanned > 0 else 0.0
+    min_scanned = max(10, int(float(os.getenv("AGENT_LAB_STAGE1_NO_PRICE_FAILFAST_MIN_SCANNED", "40") or 40)))
+    min_ratio = float(os.getenv("AGENT_LAB_STAGE1_NO_PRICE_FAILFAST_RATIO", "0.8") or 0.8)
+    burst = _stage1_no_price_failfast_enabled() and scanned >= min_scanned and ratio >= min_ratio
+    return {
+        "burst": bool(burst),
+        "ratio": float(ratio),
+        "scanned": int(scanned),
+        "no_price_snapshot": int(no_price),
+        "min_scanned": int(min_scanned),
+        "min_ratio": float(min_ratio),
+    }
 
 
 def save_json_output(
@@ -623,26 +649,39 @@ def run(config: StrategyConfig) -> None:
             f"passed={stage1_scan_summary.get('passed', 0)}, "
             f"top_skips={top_skip_text}"
         )
+    no_price_burst = _detect_no_price_snapshot_burst(stage1_scan_summary)
+    if no_price_burst.get("burst", False):
+        log(
+            "[stage1] fail-fast trigger: "
+            f"no_price_snapshot={no_price_burst['no_price_snapshot']}/{no_price_burst['scanned']} "
+            f"({no_price_burst['ratio']:.1%}) >= threshold({no_price_burst['min_ratio']:.1%})"
+        )
 
     if len(stage1) < config.final_picks:
-        fallback_started = perf_counter()
-        needed = config.final_picks - len(stage1)
-        log(
-            f"[fallback] stage1 candidates ({len(stage1)}) < final picks ({config.final_picks}). applying relaxed fallback rules...",
-        )
-        fallback_candidates = selector.build_fallback_candidates(
-            codes=codes,
-            names=names,
-            exclude_codes={item.code for item in stage1},
-            needed=needed,
-        )
-        if fallback_candidates:
-            fallback_added_count = len(fallback_candidates)
-            stage1.extend(fallback_candidates)
-            log(f"[fallback] added {len(fallback_candidates)} candidates. total stage1={len(stage1)}")
+        if no_price_burst.get("burst", False):
+            log(
+                "[fallback] skipped due to stage1 no_price_snapshot burst "
+                "(price API unavailable suspected)."
+            )
         else:
-            log("[fallback] no additional candidates found.")
-        timings_sec["fallback_sec"] = perf_counter() - fallback_started
+            fallback_started = perf_counter()
+            needed = config.final_picks - len(stage1)
+            log(
+                f"[fallback] stage1 candidates ({len(stage1)}) < final picks ({config.final_picks}). applying relaxed fallback rules...",
+            )
+            fallback_candidates = selector.build_fallback_candidates(
+                codes=codes,
+                names=names,
+                exclude_codes={item.code for item in stage1},
+                needed=needed,
+            )
+            if fallback_candidates:
+                fallback_added_count = len(fallback_candidates)
+                stage1.extend(fallback_candidates)
+                log(f"[fallback] added {len(fallback_candidates)} candidates. total stage1={len(stage1)}")
+            else:
+                log("[fallback] no additional candidates found.")
+            timings_sec["fallback_sec"] = perf_counter() - fallback_started
 
     if not stage1 and config.test_assume_open:
         force_limit = max(config.pre_candidates, config.final_picks * 2)
@@ -662,6 +701,7 @@ def run(config: StrategyConfig) -> None:
         api_diag = selector_api_diagnostics(selector)
         if api_diag:
             log(f"[api-diag] {api_diag}")
+        invalid_reason = "price_snapshot_unavailable" if no_price_burst.get("burst", False) else "no_stage1_candidates"
         now = datetime.now(ZoneInfo("Asia/Seoul"))
         no_realtime = RealtimeQuality(
             realtime_ready=False,
@@ -679,10 +719,10 @@ def run(config: StrategyConfig) -> None:
             realtime_quality=no_realtime,
             final=[],
             ranked=[],
-            invalid_reason="no_stage1_candidates",
+            invalid_reason=invalid_reason,
             debug=build_debug_payload(),
         )
-        persist_analytics_snapshot(decision_at=now, invalid_reason="no_stage1_candidates")
+        persist_analytics_snapshot(decision_at=now, invalid_reason=invalid_reason)
         log(f"Run finished (total elapsed {perf_counter() - total_started:.1f}s)")
         return
 
