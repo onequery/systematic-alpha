@@ -322,6 +322,74 @@ class AutoStrategyDaemon:
             event="broker_api_error",
         )
 
+    @staticmethod
+    def _event_batch_label(key: str) -> str:
+        norm = str(key or "").strip().lower()
+        labels = {
+            "ingest_session": "세션 인제스트",
+            "propose": "주문 제안",
+            "session_monitor": "세션 모니터링",
+            "heartbeat": "하트비트",
+            "daemon_start": "데몬 시작",
+            "auto_strategy_update": "오토전략 업데이트",
+            "trade_blocked": "거래 차단",
+            "sync_mismatch": "계좌 동기화 불일치",
+            "refresh_timeout": "리프레시 타임아웃",
+            "broker_api_error": "브로커 API 오류",
+            "llm_limit_alert": "LLM 제한 경고",
+            "init": "초기화",
+            "sanitize": "정리",
+            "daily_review": "일일 리뷰",
+            "report": "리포트",
+            "misc": "기타 이벤트",
+        }
+        if norm in labels:
+            return labels[norm]
+        if not norm:
+            return "기타 이벤트"
+        return norm.replace("_", " ")
+
+    @staticmethod
+    def _format_batch_window_ts(value: str) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return "-"
+        dt = _parse_iso(text)
+        if dt is not None:
+            return dt.strftime("%Y-%m-%d %H:%M:%S")
+        return text.replace("T", " ")
+
+    def _event_batch_sample_text(self, evt: Dict[str, Any]) -> str:
+        key = str(evt.get("event", "misc")).strip().lower() or "misc"
+        label = self._event_batch_label(key)
+        raw = str(evt.get("text", "")).strip()
+        if not raw:
+            return label
+        rows = [line.strip() for line in raw.splitlines() if line and line.strip()]
+        if rows:
+            head = rows[0].replace("[AgentLab]", "").strip()
+            if head:
+                label = head
+        pairs: List[str] = []
+        for line in rows[1:]:
+            if "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            kk = k.strip()
+            vv = v.strip()
+            if not kk:
+                continue
+            if len(vv) > 30:
+                vv = vv[:30] + "..."
+            pairs.append(f"{kk}={vv}")
+            if len(pairs) >= 3:
+                break
+        if pairs:
+            return f"{label} | {', '.join(pairs)}"
+        if len(raw) > 80:
+            raw = raw[:80] + "..."
+        return f"{label} | {raw.replace(chr(10), ' ')}"
+
     def _flush_event_batch_if_due(self, now_kst: datetime) -> None:
         if not self.event_batch_enabled:
             return
@@ -352,11 +420,9 @@ class AutoStrategyDaemon:
             evt = row.get("events", {}) if isinstance(row, dict) else {}
             if not isinstance(evt, dict):
                 evt = {}
-            txt = str(evt.get("text", "")).strip().replace("\n", " ")
-            if len(txt) > 80:
-                txt = txt[:80] + "..."
-            if txt:
-                latest_samples.append(txt)
+            sample = self._event_batch_sample_text(evt)
+            if sample:
+                latest_samples.append(sample)
         total = int(sum(counts.values()))
         if total <= 0:
             return
@@ -366,13 +432,23 @@ class AutoStrategyDaemon:
         lines = [
             "[AgentLab] 이벤트 요약 배치",
             f"구간={self.event_batch_minutes}분",
-            f"이벤트수={total}",
-            f"상위={', '.join([f'{k}:{v}' for k, v in top])}",
+            f"총이벤트={total}",
         ]
         if window_start and window_end:
-            lines.append(f"집계범위={window_start} ~ {window_end}")
+            lines.append(
+                "집계범위="
+                f"{self._format_batch_window_ts(window_start)} ~ "
+                f"{self._format_batch_window_ts(window_end)}"
+            )
+        lines.append("")
+        lines.append("이벤트별 건수")
+        for key, cnt in top:
+            lines.append(f"- {self._event_batch_label(key)}: {cnt}")
         if latest_samples:
-            lines.append(f"최신샘플={latest_samples[0]}")
+            lines.append("")
+            lines.append("최근 이벤트")
+            for sample in latest_samples:
+                lines.append(f"- {sample}")
         text = "\n".join(lines)
         try:
             rendered = event_prefixed_text(text, "session_monitor")
