@@ -6,6 +6,7 @@ import math
 import os
 import shutil
 import subprocess
+import time
 import uuid
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -110,6 +111,30 @@ class AgentLabOrchestrator:
         except Exception:
             raw = 30.0
         return max(5, int(raw))
+
+    @staticmethod
+    def _sync_alert_consecutive_threshold() -> int:
+        try:
+            raw = float(os.getenv("AGENT_LAB_SYNC_ALERT_CONSECUTIVE", "2") or 2)
+        except Exception:
+            raw = 2.0
+        return max(1, int(raw))
+
+    @staticmethod
+    def _post_exec_sync_retries() -> int:
+        try:
+            raw = float(os.getenv("AGENT_LAB_POST_EXEC_SYNC_RETRIES", "2") or 2)
+        except Exception:
+            raw = 2.0
+        return max(0, min(8, int(raw)))
+
+    @staticmethod
+    def _post_exec_sync_retry_delay_sec() -> float:
+        try:
+            raw = float(os.getenv("AGENT_LAB_POST_EXEC_SYNC_RETRY_DELAY_SEC", "1.5") or 1.5)
+        except Exception:
+            raw = 1.5
+        return max(0.1, min(10.0, float(raw)))
 
     @staticmethod
     def _strict_report_windows_enabled() -> bool:
@@ -1039,6 +1064,63 @@ class AgentLabOrchestrator:
         return max(0.0, float((now - parsed).total_seconds()))
 
     @staticmethod
+    def _sync_streak_meta_key(market_scope: str) -> str:
+        return f"sync_mismatch_streak:{str(market_scope or 'ALL').strip().upper() or 'ALL'}"
+
+    def _get_sync_mismatch_streak(self, market_scope: str) -> int:
+        key = self._sync_streak_meta_key(market_scope)
+        raw = str(self.storage.get_system_meta(key, "0") or "0")
+        try:
+            return max(0, int(float(raw)))
+        except Exception:
+            return 0
+
+    def _set_sync_mismatch_streak(self, market_scope: str, value: int) -> None:
+        key = self._sync_streak_meta_key(market_scope)
+        self.storage.upsert_system_meta(key, str(max(0, int(value))), now_iso())
+
+    def _inc_sync_mismatch_streak(self, market_scope: str) -> int:
+        cur = self._get_sync_mismatch_streak(market_scope)
+        nxt = cur + 1
+        self._set_sync_mismatch_streak(market_scope, nxt)
+        return nxt
+
+    def _sync_after_execution_with_retry(self, market_scope: str = "ALL") -> Dict[str, Any]:
+        retries = self._post_exec_sync_retries()
+        delay_sec = self._post_exec_sync_retry_delay_sec()
+        attempts = retries + 1
+        last: Dict[str, Any] = {}
+        for idx in range(attempts):
+            last = self.sync_account(
+                market=market_scope,
+                strict=False,
+                notify=False,
+                track_streak=False,
+            )
+            if not bool(last.get("blocked", False)):
+                final_ok = self.sync_account(
+                    market=market_scope,
+                    strict=False,
+                    notify=False,
+                    track_streak=True,
+                )
+                final_ok["post_exec_retry_attempts"] = int(idx + 1)
+                final_ok["post_exec_retry_used"] = bool(idx > 0)
+                return final_ok
+            if idx < (attempts - 1):
+                time.sleep(delay_sec)
+        final_fail = self.sync_account(
+            market=market_scope,
+            strict=False,
+            notify=True,
+            track_streak=True,
+        )
+        final_fail["post_exec_retry_attempts"] = int(attempts)
+        final_fail["post_exec_retry_used"] = bool(retries > 0)
+        final_fail["post_exec_retry_failed"] = True
+        return final_fail
+
+    @staticmethod
     def _has_rate_limit_error(errors: List[Any]) -> bool:
         text = " ".join(str(x) for x in (errors or []))
         norm = text.lower()
@@ -1076,11 +1158,19 @@ class AgentLabOrchestrator:
             )
         return len(mismatches) == 0, {"mismatches": mismatches, "mismatch_count": len(mismatches)}
 
-    def sync_account(self, market: str = "ALL", strict: bool = False) -> Dict[str, Any]:
+    def sync_account(
+        self,
+        market: str = "ALL",
+        strict: bool = False,
+        *,
+        notify: bool = True,
+        track_streak: bool = True,
+    ) -> Dict[str, Any]:
         market_scope = str(market or "ALL").strip().upper()
         strict_flag = bool(strict)
         if not strict and _truthy(os.getenv("AGENT_LAB_SYNC_STRICT", "1")):
             strict_flag = True
+        alert_threshold = self._sync_alert_consecutive_threshold()
         max_staleness_sec = self._sync_max_staleness_sec()
         self._ensure_unified_executor_agent()
         epoch_id = self._epoch_id()
@@ -1103,8 +1193,20 @@ class AgentLabOrchestrator:
         if not payload["ok"]:
             payload["reason"] = "broker_rate_limited" if self._has_rate_limit_error(payload["errors"]) else "broker_fetch_failed"
             payload["blocked"] = strict_flag
+            if bool(payload["blocked"]) and bool(track_streak):
+                payload["sync_mismatch_streak"] = int(self._inc_sync_mismatch_streak(market_scope))
+            elif bool(track_streak):
+                payload["sync_mismatch_streak"] = int(self._get_sync_mismatch_streak(market_scope))
             self.storage.log_event("sync_mismatch", payload, now_iso())
-            if payload["blocked"]:
+            should_notify = bool(
+                payload["blocked"]
+                and notify
+                and (
+                    (not track_streak)
+                    or int(payload.get("sync_mismatch_streak", 0) or 0) >= alert_threshold
+                )
+            )
+            if should_notify:
                 self._notify(
                     "[AgentLab] 계좌 동기화 실패\n"
                     f"시장범위={market_scope}\n"
@@ -1134,6 +1236,14 @@ class AgentLabOrchestrator:
         payload["mismatch_count"] = int(detail.get("mismatch_count", 0) or 0)
         payload["detail"] = detail
         payload["blocked"] = bool(strict_flag and not matched and _truthy(os.getenv("AGENT_LAB_SYNC_MISMATCH_BLOCK", "1")))
+        if bool(track_streak):
+            if matched:
+                self._set_sync_mismatch_streak(market_scope, 0)
+                payload["sync_mismatch_streak"] = 0
+            elif bool(payload["blocked"]):
+                payload["sync_mismatch_streak"] = int(self._inc_sync_mismatch_streak(market_scope))
+            else:
+                payload["sync_mismatch_streak"] = int(self._get_sync_mismatch_streak(market_scope))
 
         self.storage.insert_reconcile_event(
             check_type="portfolio_positions",
@@ -1146,7 +1256,15 @@ class AgentLabOrchestrator:
         )
         event_type = "account_synced" if matched else "sync_mismatch"
         self.storage.log_event(event_type, payload, now_iso())
-        if payload["blocked"]:
+        should_notify = bool(
+            payload["blocked"]
+            and notify
+            and (
+                (not track_streak)
+                or int(payload.get("sync_mismatch_streak", 0) or 0) >= alert_threshold
+            )
+        )
+        if should_notify:
             self._notify(
                 "[AgentLab] 계좌 동기화 불일치\n"
                 f"시장범위={market_scope}\n"
@@ -2247,7 +2365,7 @@ class AgentLabOrchestrator:
             "equity": ledger,
         }
         if self._unified_shadow_mode():
-            out["sync_post_execution"] = self.sync_account(market="ALL", strict=False)
+            out["sync_post_execution"] = self._sync_after_execution_with_retry("ALL")
         self._write_json_artifact(yyyymmdd, f"approval_{proposal_id}", out)
         self.storage.log_event("orders_approved", out, now_iso())
         self._append_activity_artifact(yyyymmdd, "orders_approved", out)

@@ -226,6 +226,21 @@ class PaperBroker:
                     "payload": row,
                 }
             )
+        positions_value_krw = float(sum(float(p.get("market_value_krw", 0.0) or 0.0) for p in positions))
+        if float(cash_krw) < 0.0:
+            # Domestic mock/live payload can expose dnca_tot_amt as negative (settlement-centric),
+            # which is not suitable as trading cash. Prefer non-negative proxy fields first.
+            proxy_cash = cls._pick_present_value(
+                summary,
+                ["ord_psbl_cash", "wdrw_psbl_amt", "wdrw_psbl_tot_amt", "prvs_rcdl_excc_amt"],
+                default=-1.0,
+            )
+            if float(proxy_cash) >= 0.0:
+                cash_krw = float(proxy_cash)
+            elif float(equity_krw) > 0.0 and positions_value_krw >= 0.0:
+                derived = float(equity_krw) - positions_value_krw
+                if derived >= 0.0:
+                    cash_krw = float(derived)
         # Keep account figures API-authoritative.
         # If there are no holdings and equity is positive, prefer total equity as cash proxy.
         if len(positions) == 0 and float(equity_krw) > 0.0 and float(cash_krw) <= 0.0:

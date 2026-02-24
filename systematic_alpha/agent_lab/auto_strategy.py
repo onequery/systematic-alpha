@@ -336,33 +336,43 @@ class AutoStrategyDaemon:
         if not pending:
             return
         counts: Dict[str, int] = {}
-        samples: List[str] = []
+        latest_samples: List[str] = []
         batch_ids: List[int] = []
-        for row in pending[: max(1, self.event_batch_max_items)]:
+        selected = pending[: max(1, self.event_batch_max_items)]
+        for row in selected:
             batch_ids.append(int(row.get("event_batch_id", 0) or 0))
             evt = row.get("events", {}) if isinstance(row, dict) else {}
             if not isinstance(evt, dict):
                 evt = {}
             key = str(evt.get("event", "misc")).strip().lower() or "misc"
             counts[key] = counts.get(key, 0) + 1
-            if len(samples) < 3:
-                txt = str(evt.get("text", "")).strip().replace("\n", " ")
-                if len(txt) > 80:
-                    txt = txt[:80] + "..."
-                if txt:
-                    samples.append(txt)
+        for row in reversed(selected):
+            if len(latest_samples) >= 3:
+                break
+            evt = row.get("events", {}) if isinstance(row, dict) else {}
+            if not isinstance(evt, dict):
+                evt = {}
+            txt = str(evt.get("text", "")).strip().replace("\n", " ")
+            if len(txt) > 80:
+                txt = txt[:80] + "..."
+            if txt:
+                latest_samples.append(txt)
         total = int(sum(counts.values()))
         if total <= 0:
             return
         top = sorted(counts.items(), key=lambda x: x[1], reverse=True)[:5]
+        window_start = str(selected[0].get("created_at", "")) if selected else ""
+        window_end = str(selected[-1].get("created_at", "")) if selected else ""
         lines = [
             "[AgentLab] 이벤트 요약 배치",
             f"구간={self.event_batch_minutes}분",
             f"이벤트수={total}",
             f"상위={', '.join([f'{k}:{v}' for k, v in top])}",
         ]
-        if samples:
-            lines.append(f"샘플={samples[0]}")
+        if window_start and window_end:
+            lines.append(f"집계범위={window_start} ~ {window_end}")
+        if latest_samples:
+            lines.append(f"최신샘플={latest_samples[0]}")
         text = "\n".join(lines)
         try:
             rendered = event_prefixed_text(text, "session_monitor")
@@ -386,7 +396,14 @@ class AutoStrategyDaemon:
         sent_at = _now_iso()
         self.storage.insert_event_batch(
             batch_key="summary",
-            events={"counts": counts, "total": total, "samples": samples, "window_minutes": self.event_batch_minutes},
+            events={
+                "counts": counts,
+                "total": total,
+                "samples": latest_samples,
+                "window_minutes": self.event_batch_minutes,
+                "window_start": window_start,
+                "window_end": window_end,
+            },
             sent=sent,
             created_at=sent_at,
             sent_at=sent_at if sent else None,
