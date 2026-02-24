@@ -297,6 +297,7 @@ class TelegramChatRuntime:
             "PENDING_APPROVAL": "승인대기",
             "APPROVED": "승인됨",
             "EXECUTED": "실행됨",
+            "SUBMITTED": "접수됨",
             "BLOCKED": "차단됨",
             "REJECTED": "반려됨",
             "SIGNAL_OK": "신호정상",

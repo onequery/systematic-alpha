@@ -43,6 +43,7 @@ Options:
   --interval SEC            dashboard refresh interval in seconds (default: 3)
   --tail-lines N            tail lines for each log section (default: 20)
   --event-limit N           number of recent DB events to show (default: 20)
+  --payload-max N           max chars for summarized payload/log line (default: 220)
   --once                    render one dashboard frame and exit
   -h, --help                show this help
 
@@ -57,6 +58,7 @@ MODE="dashboard"
 INTERVAL=3
 TAIL_LINES=20
 EVENT_LIMIT=20
+PAYLOAD_MAX=220
 ONCE=0
 
 while [[ $# -gt 0 ]]; do
@@ -75,6 +77,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --event-limit)
       EVENT_LIMIT="${2:-20}"
+      shift 2
+      ;;
+    --payload-max)
+      PAYLOAD_MAX="${2:-220}"
       shift 2
       ;;
     --once)
@@ -204,18 +210,94 @@ show_db_events() {
     echo "(db not found: $DB_PATH)"
     return
   fi
-  DB_PATH="$DB_PATH" EVENT_LIMIT="$EVENT_LIMIT" "$PYTHON_BIN" - <<'PY'
+  DB_PATH="$DB_PATH" EVENT_LIMIT="$EVENT_LIMIT" PAYLOAD_MAX="$PAYLOAD_MAX" "$PYTHON_BIN" - <<'PY'
+import json
 import os
 import sqlite3
 from pathlib import Path
 
 db = Path(os.environ["DB_PATH"])
 limit = int(float(os.environ.get("EVENT_LIMIT", "20") or 20))
+max_chars = int(float(os.environ.get("PAYLOAD_MAX", "220") or 220))
 con = sqlite3.connect(str(db))
 cur = con.cursor()
+
+HEAVY_KEYS = {
+    "proposals",
+    "shadow_proposals",
+    "execution_results",
+    "orders",
+    "fills",
+    "attempts",
+    "discussion",
+    "rationale",
+    "payload",
+    "raw",
+    "broker_response_json",
+}
+PRIORITY_KEYS = [
+    "market",
+    "date",
+    "session_date",
+    "status",
+    "status_code",
+    "signal_status",
+    "invalid_reason",
+    "ok",
+    "matched",
+    "blocked",
+    "mismatch_count",
+    "reason",
+    "proposal_id",
+    "agent_id",
+    "returncode",
+    "elapsed_sec",
+    "timeout_sec",
+    "timed_out",
+]
+
+def _clip(text: str) -> str:
+    body = str(text or "")
+    return body if len(body) <= max_chars else (body[:max_chars] + "...")
+
+def _fmt_value(value):
+    if isinstance(value, list):
+        return f"[{len(value)}]"
+    if isinstance(value, dict):
+        return f"{{{len(value)}}}"
+    return str(value)
+
+def summarize_payload(raw: str) -> str:
+    text = str(raw or "")
+    try:
+        payload = json.loads(text)
+    except Exception:
+        return _clip(text.replace("\n", " "))
+    if not isinstance(payload, dict):
+        return _clip(_fmt_value(payload))
+    parts = []
+    for key in PRIORITY_KEYS:
+        if key in payload:
+            parts.append(f"{key}={_fmt_value(payload[key])}")
+    for key in HEAVY_KEYS:
+        if key in payload:
+            val = payload[key]
+            if isinstance(val, list):
+                parts.append(f"{key}=[{len(val)}]")
+            elif isinstance(val, dict):
+                parts.append(f"{key}={{{len(val)}}}")
+            else:
+                parts.append(f"{key}=<omitted>")
+    if not parts:
+        for idx, (k, v) in enumerate(payload.items()):
+            if idx >= 4:
+                break
+            parts.append(f"{k}={_fmt_value(v)}")
+    return _clip(", ".join(parts))
+
 cur.execute(
     """
-    SELECT created_at, event_type, substr(payload_json, 1, 180)
+    SELECT created_at, event_type, payload_json
     FROM state_events
     ORDER BY event_id DESC
     LIMIT ?
@@ -226,9 +308,152 @@ rows = cur.fetchall()
 if not rows:
     print("(no rows)")
 else:
-    for created_at, event_type, payload_head in rows:
-        print(f"{created_at} | {event_type} | {payload_head}")
+    for created_at, event_type, payload_json in rows:
+        print(f"{created_at} | {event_type} | {summarize_payload(payload_json)}")
 con.close()
+PY
+}
+
+render_jsonl_compact() {
+  local path="$1"
+  local tail_lines="$2"
+  local max_chars="$3"
+  FILE_PATH="$path" TAIL_LINES="$tail_lines" PAYLOAD_MAX="$max_chars" "$PYTHON_BIN" - <<'PY'
+import json
+import os
+from collections import deque
+from pathlib import Path
+
+path = Path(os.environ["FILE_PATH"])
+tail_lines = int(float(os.environ.get("TAIL_LINES", "20") or 20))
+max_chars = int(float(os.environ.get("PAYLOAD_MAX", "220") or 220))
+
+HEAVY_KEYS = {
+    "proposals",
+    "shadow_proposals",
+    "execution_results",
+    "orders",
+    "fills",
+    "attempts",
+    "discussion",
+    "rationale",
+    "payload",
+    "raw",
+    "broker_response_json",
+}
+PRIORITY_KEYS = [
+    "market",
+    "date",
+    "session_date",
+    "status",
+    "status_code",
+    "signal_status",
+    "invalid_reason",
+    "ok",
+    "matched",
+    "blocked",
+    "mismatch_count",
+    "reason",
+    "proposal_id",
+    "agent_id",
+    "returncode",
+    "elapsed_sec",
+    "timeout_sec",
+    "timed_out",
+]
+
+def _clip(text: str) -> str:
+    body = str(text or "")
+    return body if len(body) <= max_chars else (body[:max_chars] + "...")
+
+def _fmt_value(value):
+    if isinstance(value, list):
+        return f"[{len(value)}]"
+    if isinstance(value, dict):
+        return f"{{{len(value)}}}"
+    return str(value)
+
+def summarize_payload(payload):
+    if not isinstance(payload, dict):
+        return _clip(_fmt_value(payload))
+    parts = []
+    for key in PRIORITY_KEYS:
+        if key in payload:
+            parts.append(f"{key}={_fmt_value(payload[key])}")
+    for key in HEAVY_KEYS:
+        if key in payload:
+            val = payload[key]
+            if isinstance(val, list):
+                parts.append(f"{key}=[{len(val)}]")
+            elif isinstance(val, dict):
+                parts.append(f"{key}={{{len(val)}}}")
+            else:
+                parts.append(f"{key}=<omitted>")
+    if not parts:
+        for idx, (k, v) in enumerate(payload.items()):
+            if idx >= 4:
+                break
+            parts.append(f"{k}={_fmt_value(v)}")
+    return _clip(", ".join(parts))
+
+buf = deque(maxlen=max(1, tail_lines))
+if path.exists():
+    with path.open("r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            buf.append(line.rstrip("\n"))
+
+if not buf:
+    print("(empty)")
+else:
+    for raw in buf:
+        text = raw.strip()
+        if not text:
+            continue
+        try:
+            obj = json.loads(text)
+        except Exception:
+            print(_clip(text))
+            continue
+        if isinstance(obj, dict):
+            ts = str(obj.get("ts") or obj.get("created_at") or obj.get("updated_at") or "-")
+            event_type = str(obj.get("event_type") or obj.get("event") or obj.get("type") or "-")
+            payload = obj.get("payload")
+            if payload is None:
+                payload = {k: v for k, v in obj.items() if k not in {"ts", "event_type"}}
+            print(f"{ts} | {event_type} | {summarize_payload(payload)}")
+        else:
+            print(_clip(text))
+PY
+}
+
+tail_compact() {
+  local path="$1"
+  local tail_lines="$2"
+  local max_chars="$3"
+  FILE_PATH="$path" TAIL_LINES="$tail_lines" PAYLOAD_MAX="$max_chars" "$PYTHON_BIN" - <<'PY'
+import os
+from collections import deque
+from pathlib import Path
+
+path = Path(os.environ["FILE_PATH"])
+tail_lines = int(float(os.environ.get("TAIL_LINES", "20") or 20))
+max_chars = int(float(os.environ.get("PAYLOAD_MAX", "220") or 220))
+
+def _clip(text: str) -> str:
+    body = str(text or "")
+    return body if len(body) <= max_chars else (body[:max_chars] + "...")
+
+buf = deque(maxlen=max(1, tail_lines))
+if path.exists():
+    with path.open("r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            buf.append(line.rstrip("\n"))
+
+if not buf:
+    print("(empty)")
+else:
+    for line in buf:
+        print(_clip(line))
 PY
 }
 
@@ -238,13 +463,13 @@ show_activity_logs() {
   local p2="$ROOT_DIR/out/agent_lab/$YDAY_KST/activity_log.jsonl"
   if [[ -f "$p1" ]]; then
     echo "-- $p1"
-    tail -n "$TAIL_LINES" "$p1" || true
+    render_jsonl_compact "$p1" "$TAIL_LINES" "$PAYLOAD_MAX" || true
   else
     echo "-- $p1 (missing)"
   fi
   if [[ -f "$p2" ]]; then
     echo "-- $p2"
-    tail -n "$TAIL_LINES" "$p2" || true
+    render_jsonl_compact "$p2" "$TAIL_LINES" "$PAYLOAD_MAX" || true
   else
     echo "-- $p2 (missing)"
   fi
@@ -257,7 +482,7 @@ show_main_logs() {
     "$ROOT_DIR/logs/cron/agent_auto-strategy-daemon_bootstrap.log" \
     "$ROOT_DIR/logs/cron/agent_telegram-chat_bootstrap.log"; do
     echo "-- $f"
-    tail -n "$TAIL_LINES" "$f" || true
+    tail_compact "$f" "$TAIL_LINES" "$PAYLOAD_MAX" || true
   done
 }
 
@@ -275,7 +500,7 @@ render_dashboard() {
   clear_screen
   echo "[monitor_agent_lab_wsl] $(TZ=Asia/Seoul date '+%F %T %Z')"
   echo "root=$ROOT_DIR"
-  echo "mode=$MODE interval=${INTERVAL}s tail_lines=$TAIL_LINES event_limit=$EVENT_LIMIT"
+  echo "mode=$MODE interval=${INTERVAL}s tail_lines=$TAIL_LINES event_limit=$EVENT_LIMIT payload_max=$PAYLOAD_MAX"
   echo
   show_processes
   echo

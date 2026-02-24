@@ -571,7 +571,8 @@ class PaperBroker:
             status = "FILLED"
             if self.execution_mode in {"mojito_mock", "mock_api"}:
                 send = self._send_order(market=market, order=order)
-                broker_resp = send
+                broker_resp = dict(send)
+                broker_resp["fx_rate"] = float(fx_rate)
                 if send.get("ok"):
                     payload = send.get("response")
                     api_err = self._api_error_text(payload if isinstance(payload, dict) else {})
@@ -582,6 +583,7 @@ class PaperBroker:
                         broker_resp["reason"] = api_err
                     elif isinstance(payload, dict):
                         broker_order_id = str(payload.get("ODNO") or payload.get("output", {}).get("ODNO") or "")
+                        status = "SUBMITTED"
                 else:
                     status = "REJECTED"
 

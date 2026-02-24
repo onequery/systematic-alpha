@@ -706,6 +706,44 @@ class AgentLabOrchestrator:
             row["orders"] = []
         return row
 
+    def _proposal_order_results(self, proposal_id: int) -> List[Dict[str, Any]]:
+        rows = self.storage.query_all(
+            """
+            SELECT
+                paper_order_id,
+                symbol,
+                side,
+                order_type,
+                quantity,
+                limit_price,
+                reference_price,
+                status,
+                broker_order_id,
+                submitted_at
+            FROM paper_orders
+            WHERE proposal_id = ?
+            ORDER BY paper_order_id ASC
+            """,
+            (int(proposal_id),),
+        )
+        out: List[Dict[str, Any]] = []
+        for row in rows:
+            out.append(
+                {
+                    "paper_order_id": int(row.get("paper_order_id")),
+                    "symbol": str(row.get("symbol", "")),
+                    "side": str(row.get("side", "")),
+                    "order_type": str(row.get("order_type", "")),
+                    "quantity": float(row.get("quantity", 0.0) or 0.0),
+                    "limit_price": row.get("limit_price"),
+                    "reference_price": float(row.get("reference_price", 0.0) or 0.0),
+                    "status": str(row.get("status", "")),
+                    "broker_order_id": str(row.get("broker_order_id", "")),
+                    "submitted_at": str(row.get("submitted_at", "")),
+                }
+            )
+        return out
+
     @staticmethod
     def _orders_to_text(
         orders: List[Dict[str, Any]],
@@ -722,6 +760,7 @@ class AgentLabOrchestrator:
         }
         status_map = {
             "FILLED": "체결",
+            "SUBMITTED": "접수",
             "REJECTED": "거부",
             "CANCELED": "취소",
             "BLOCKED": "차단",
@@ -1095,6 +1134,198 @@ class AgentLabOrchestrator:
         return out
 
     @staticmethod
+    def _decode_json_obj(raw: Any) -> Dict[str, Any]:
+        if isinstance(raw, dict):
+            return raw
+        if isinstance(raw, str):
+            text = str(raw).strip()
+            if not text:
+                return {}
+            try:
+                decoded = json.loads(text)
+            except Exception:
+                return {}
+            if isinstance(decoded, dict):
+                return decoded
+        return {}
+
+    def _list_submitted_paper_orders(self, market_scope: str = "ALL") -> List[Dict[str, Any]]:
+        where_market = ""
+        params: List[Any] = ["SUBMITTED"]
+        scope = str(market_scope or "ALL").strip().upper()
+        if scope in {"KR", "US"}:
+            where_market = " AND market = ? "
+            params.append(scope)
+        where_agent = ""
+        if self._unified_shadow_mode():
+            where_agent = " AND agent_id = ? "
+            params.append(self.UNIFIED_EXECUTOR_AGENT_ID)
+        return self.storage.query_all(
+            f"""
+            SELECT
+                paper_order_id,
+                market,
+                symbol,
+                side,
+                order_type,
+                quantity,
+                limit_price,
+                reference_price,
+                broker_response_json,
+                submitted_at
+            FROM paper_orders
+            WHERE status = ?
+            {where_market}
+            {where_agent}
+            ORDER BY submitted_at ASC, paper_order_id ASC
+            """,
+            tuple(params),
+        )
+
+    @staticmethod
+    def _submitted_delta_map(rows: List[Dict[str, Any]]) -> Dict[Tuple[str, str], float]:
+        out: Dict[Tuple[str, str], float] = {}
+        for row in rows:
+            market = str(row.get("market", "")).strip().upper()
+            symbol = str(row.get("symbol", "")).strip().upper()
+            side = str(row.get("side", "")).strip().upper()
+            qty = float(row.get("quantity", 0.0) or 0.0)
+            if not market or not symbol or qty <= 0:
+                continue
+            signed = qty if side == "BUY" else (-qty if side == "SELL" else 0.0)
+            out[(market, symbol)] = out.get((market, symbol), 0.0) + signed
+        return out
+
+    def _settle_submitted_orders_from_server(
+        self,
+        *,
+        market_scope: str,
+        server_positions: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        submitted = self._list_submitted_paper_orders(market_scope)
+        if not submitted:
+            return {
+                "submitted_count": 0,
+                "filled_count": 0,
+                "pending_count": 0,
+                "filled_orders": [],
+            }
+
+        server_map = self._position_map(server_positions)
+        local_rows = self._local_positions_from_fills(market_scope)
+        local_map = self._position_map(local_rows)
+        filled_orders: List[Dict[str, Any]] = []
+
+        for row in submitted:
+            market = str(row.get("market", "")).strip().upper()
+            symbol = str(row.get("symbol", "")).strip().upper()
+            side = str(row.get("side", "")).strip().upper()
+            order_type = str(row.get("order_type", "MARKET")).strip().upper()
+            qty = float(row.get("quantity", 0.0) or 0.0)
+            if qty <= 0 or not market or not symbol:
+                continue
+            key = (market, symbol)
+            server_qty = float(server_map.get(key, 0.0) or 0.0)
+            local_qty = float(local_map.get(key, 0.0) or 0.0)
+            should_fill = False
+            if side == "BUY":
+                should_fill = (server_qty - local_qty) >= (qty - 1e-9)
+            elif side == "SELL":
+                should_fill = (local_qty - server_qty) >= (qty - 1e-9)
+            if not should_fill:
+                continue
+
+            limit_price = row.get("limit_price")
+            reference_price = float(row.get("reference_price", 0.0) or 0.0)
+            fill_price = float(limit_price or reference_price) if order_type == "LIMIT" else reference_price
+            if fill_price <= 0:
+                fill_price = max(0.0, reference_price)
+            broker_payload = self._decode_json_obj(row.get("broker_response_json"))
+            fx_rate = float(
+                broker_payload.get("fx_rate", broker_payload.get("requested_fx_rate", 1.0)) or 1.0
+            )
+            if fx_rate <= 0:
+                fx_rate = 1.0
+            fill_value_krw = float(fill_price) * float(qty) * float(fx_rate)
+            paper_order_id = int(row.get("paper_order_id"))
+            self.storage.insert_paper_fill(
+                paper_order_id=paper_order_id,
+                fill_price=float(fill_price),
+                fill_quantity=float(qty),
+                fill_value_krw=float(fill_value_krw),
+                fx_rate=float(fx_rate),
+                filled_at=now_iso(),
+            )
+            self.storage.update_paper_order_status(paper_order_id=paper_order_id, status="FILLED")
+            if side == "BUY":
+                local_map[key] = local_qty + qty
+            elif side == "SELL":
+                local_map[key] = max(0.0, local_qty - qty)
+            filled_orders.append(
+                {
+                    "paper_order_id": paper_order_id,
+                    "market": market,
+                    "symbol": symbol,
+                    "side": side,
+                    "quantity": qty,
+                }
+            )
+
+        out = {
+            "submitted_count": len(submitted),
+            "filled_count": len(filled_orders),
+            "pending_count": max(0, len(submitted) - len(filled_orders)),
+            "filled_orders": filled_orders,
+        }
+        if filled_orders:
+            self.storage.log_event(
+                "order_settlement_confirmed",
+                {
+                    "market_scope": str(market_scope or "ALL").strip().upper(),
+                    "filled_count": len(filled_orders),
+                    "pending_count": out["pending_count"],
+                    "filled_orders": filled_orders,
+                },
+                now_iso(),
+            )
+        return out
+
+    def _is_pending_settlement_mismatch(self, detail: Dict[str, Any], market_scope: str) -> bool:
+        mismatches = list((detail or {}).get("mismatches") or [])
+        if not mismatches:
+            return False
+        submitted = self._list_submitted_paper_orders(market_scope)
+        if not submitted:
+            return False
+        pending = self._submitted_delta_map(submitted)
+        if not pending:
+            return False
+        for item in mismatches:
+            if not isinstance(item, dict):
+                return False
+            market = str(item.get("market", "")).strip().upper()
+            symbol = str(item.get("symbol", "")).strip().upper()
+            key = (market, symbol)
+            if key not in pending:
+                return False
+            try:
+                delta = float(item.get("delta_qty", 0.0) or 0.0)
+            except Exception:
+                return False
+            pending_signed = float(pending.get(key, 0.0) or 0.0)
+            # delta is server_qty - local_qty.
+            # pending buy => expected positive delta; pending sell => expected negative delta.
+            if pending_signed > 0:
+                if delta < -1e-9 or abs(delta) > abs(pending_signed) + 1e-9:
+                    return False
+            elif pending_signed < 0:
+                if delta > 1e-9 or abs(delta) > abs(pending_signed) + 1e-9:
+                    return False
+            else:
+                return False
+        return True
+
+    @staticmethod
     def _age_seconds_from_iso(value: str) -> Optional[float]:
         try:
             parsed = datetime.fromisoformat(str(value))
@@ -1331,6 +1562,11 @@ class AgentLabOrchestrator:
         )
         server_positions = list(fetched.get("positions", []) or [])
         self.storage.replace_account_positions(snapshot_id, server_positions)
+        settlement = self._settle_submitted_orders_from_server(
+            market_scope=market_scope,
+            server_positions=server_positions,
+        )
+        payload["settlement"] = settlement
         local_positions = self._local_positions_from_fills(market_scope)
         matched, detail = self._reconcile_positions(server_positions=server_positions, local_positions=local_positions)
         payload["matched"] = bool(matched)
@@ -1339,6 +1575,8 @@ class AgentLabOrchestrator:
         payload["equity_krw"] = float(fetched.get("equity_krw", 0.0) or 0.0)
         payload["mismatch_count"] = int(detail.get("mismatch_count", 0) or 0)
         payload["detail"] = detail
+        if (not matched) and self._is_pending_settlement_mismatch(detail=detail, market_scope=market_scope):
+            payload["reason"] = "pending_settlement"
         payload["blocked"] = bool(strict_flag and not matched and _truthy(os.getenv("AGENT_LAB_SYNC_MISMATCH_BLOCK", "1")))
         if bool(track_streak):
             if matched:
@@ -1370,13 +1608,22 @@ class AgentLabOrchestrator:
         )
         if should_notify:
             if self._allow_sync_alert_notification(market_scope, payload):
-                self._notify(
-                    "[AgentLab] 계좌 동기화 불일치\n"
-                    f"시장범위={market_scope}\n"
-                    f"불일치_건수={payload['mismatch_count']}\n"
-                    "조치=불일치 해소 전 주문 차단",
-                    event="sync_mismatch",
-                )
+                if str(payload.get("reason", "")).strip().lower() == "pending_settlement":
+                    self._notify(
+                        "[AgentLab] 계좌 동기화 대기(체결 반영 중)\n"
+                        f"시장범위={market_scope}\n"
+                        f"불일치_건수={payload['mismatch_count']}\n"
+                        "조치=반영 확인 전 주문 차단",
+                        event="sync_mismatch",
+                    )
+                else:
+                    self._notify(
+                        "[AgentLab] 계좌 동기화 불일치\n"
+                        f"시장범위={market_scope}\n"
+                        f"불일치_건수={payload['mismatch_count']}\n"
+                        "조치=불일치 해소 전 주문 차단",
+                        event="sync_mismatch",
+                    )
         return payload
 
     def _latest_account_context(self, market_scope: str = "ALL") -> Dict[str, Any]:
@@ -2426,14 +2673,16 @@ class AgentLabOrchestrator:
             decision="APPROVE",
             note=note,
         )
-        fills = self.paper_broker.execute_orders(
+        submit_results = self.paper_broker.execute_orders(
             proposal_id=proposal_id,
             agent_id=agent_id,
             market=market,
             orders=list(proposal["orders"]),
             fx_rate=fx_rate,
         )
-        rejected_count = sum(1 for row in fills if str((row or {}).get("status", "")).upper() == "REJECTED")
+        rejected_count = sum(
+            1 for row in submit_results if str((row or {}).get("status", "")).upper() == "REJECTED"
+        )
         if rejected_count > 0:
             self.storage.log_event(
                 "broker_api_error",
@@ -2451,9 +2700,21 @@ class AgentLabOrchestrator:
                 f"시장={market}\n"
                 f"제안ID={proposal_id}\n"
                 f"거부_주문수={rejected_count}",
-                event="broker_api_error",
-            )
+                    event="broker_api_error",
+                )
         symbol_name_map = self._load_symbol_name_map(market, yyyymmdd)
+        sync_post: Optional[Dict[str, Any]] = None
+        if self._unified_shadow_mode():
+            sync_post = self._sync_after_execution_with_retry("ALL")
+        order_results = self._proposal_order_results(proposal_id)
+        if not order_results:
+            order_results = submit_results
+        filled_count = sum(
+            1 for row in order_results if str((row or {}).get("status", "")).upper() == "FILLED"
+        )
+        submitted_count = sum(
+            1 for row in order_results if str((row or {}).get("status", "")).upper() == "SUBMITTED"
+        )
         self.storage.update_order_proposal_status(
             proposal_id=proposal_id,
             status=PROPOSAL_STATUS_EXECUTED,
@@ -2466,21 +2727,28 @@ class AgentLabOrchestrator:
             "proposal_uuid": proposal["proposal_uuid"],
             "agent_id": agent_id,
             "status": PROPOSAL_STATUS_EXECUTED,
-            "fills": fills,
+            "fills": order_results,
+            "filled_count": int(filled_count),
+            "submitted_count": int(submitted_count),
             "equity": ledger,
         }
-        if self._unified_shadow_mode():
-            out["sync_post_execution"] = self._sync_after_execution_with_retry("ALL")
+        if sync_post is not None:
+            out["sync_post_execution"] = sync_post
         self._write_json_artifact(yyyymmdd, f"approval_{proposal_id}", out)
         self.storage.log_event("orders_approved", out, now_iso())
         self._append_activity_artifact(yyyymmdd, "orders_approved", out)
+        result_label = "결과"
+        if filled_count > 0 and submitted_count == 0:
+            result_label = "체결"
+        elif submitted_count > 0:
+            result_label = "주문"
         self._notify(
             "[AgentLab] 거래 실행\n"
             f"시장={market}\n"
             f"일자={yyyymmdd}\n"
             f"에이전트={agent_id}\n"
             f"제안ID={proposal_id}\n"
-            f"체결={self._orders_to_text(fills, limit=5, symbol_name_map=symbol_name_map)}"
+            f"{result_label}={self._orders_to_text(order_results, limit=5, symbol_name_map=symbol_name_map)}"
             ,
             event="trade_executed",
         )
