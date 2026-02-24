@@ -1859,16 +1859,28 @@ class AgentLabOrchestrator:
             if prev is None or float(agg["vote_weight"]) > float(prev.get("vote_weight", 0.0)):
                 chosen[agg["symbol"]] = agg
 
-        min_ratio = float(os.getenv("AGENT_LAB_AGG_MIN_VOTE_RATIO", "0.34") or 0.34)
-        min_ratio = max(0.05, min(0.95, min_ratio))
+        min_ratio_buy = float(os.getenv("AGENT_LAB_AGG_MIN_VOTE_RATIO", "0.34") or 0.34)
+        min_ratio_buy = max(0.05, min(0.95, min_ratio_buy))
+        min_ratio_sell = float(os.getenv("AGENT_LAB_AGG_MIN_VOTE_RATIO_SELL", "0.33") or 0.33)
+        min_ratio_sell = max(0.05, min(0.95, min_ratio_sell))
         held_map = self._position_map(shared_positions)
         out_orders: List[Dict[str, Any]] = []
         dropped: List[Dict[str, Any]] = []
         est_sell_proceeds = 0.0
         for agg in chosen.values():
             vote_ratio = float(agg.get("vote_weight", 0.0) or 0.0) / total_weight
+            side_upper = str(agg.get("side", "")).strip().upper()
+            min_ratio = min_ratio_sell if side_upper == "SELL" else min_ratio_buy
             if vote_ratio < min_ratio:
-                dropped.append({"symbol": agg["symbol"], "side": agg["side"], "reason": "vote_ratio_low", "vote_ratio": vote_ratio})
+                dropped.append(
+                    {
+                        "symbol": agg["symbol"],
+                        "side": agg["side"],
+                        "reason": "vote_ratio_low",
+                        "vote_ratio": vote_ratio,
+                        "min_vote_ratio": min_ratio,
+                    }
+                )
                 continue
             qty = int(max(1, round(float(agg.get("weighted_qty", 0.0) or 0.0))))
             price = 0.0
@@ -1930,7 +1942,8 @@ class AgentLabOrchestrator:
         detail = {
             "intent_count": len(intents),
             "total_weight": total_weight,
-            "min_vote_ratio": min_ratio,
+            "min_vote_ratio_buy": min_ratio_buy,
+            "min_vote_ratio_sell": min_ratio_sell,
             "kept_orders": len(merged),
             "dropped": dropped,
             "est_sell_proceeds_krw": est_sell_proceeds,
