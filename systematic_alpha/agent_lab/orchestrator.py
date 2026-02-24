@@ -1038,6 +1038,17 @@ class AgentLabOrchestrator:
         now = datetime.now(parsed.tzinfo) if parsed.tzinfo else datetime.now()
         return max(0.0, float((now - parsed).total_seconds()))
 
+    @staticmethod
+    def _has_rate_limit_error(errors: List[Any]) -> bool:
+        text = " ".join(str(x) for x in (errors or []))
+        norm = text.lower()
+        return (
+            ("egw00201" in norm)
+            or ("초당 거래건수를 초과" in text)
+            or ("too many requests" in norm)
+            or ("rate limit" in norm)
+        )
+
     def _reconcile_positions(
         self,
         *,
@@ -1090,7 +1101,7 @@ class AgentLabOrchestrator:
         if fetched_age is not None:
             payload["fetched_age_sec"] = round(float(fetched_age), 3)
         if not payload["ok"]:
-            payload["reason"] = "broker_fetch_failed"
+            payload["reason"] = "broker_rate_limited" if self._has_rate_limit_error(payload["errors"]) else "broker_fetch_failed"
             payload["blocked"] = strict_flag
             self.storage.log_event("sync_mismatch", payload, now_iso())
             if payload["blocked"]:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import os
+import time
 from datetime import datetime
 from typing import Any, Dict, List
 
@@ -348,6 +349,82 @@ class PaperBroker:
             return f"rt_cd={rt_cd}, msg_cd={msg_cd}, msg1={msg1}"
         return ""
 
+    @staticmethod
+    def _is_rate_limit_text(text: str) -> bool:
+        raw = str(text or "")
+        norm = raw.lower()
+        return (
+            ("egw00201" in norm)
+            or ("초당 거래건수를 초과" in raw)
+            or ("too many requests" in norm)
+            or ("rate limit" in norm)
+        )
+
+    @classmethod
+    def _is_rate_limited_payload(cls, payload: Any) -> bool:
+        return cls._is_rate_limit_text(cls._api_error_text(payload))
+
+    @staticmethod
+    def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
+        try:
+            value = int(float(os.getenv(name, str(default)) or default))
+        except Exception:
+            value = int(default)
+        value = max(minimum, value)
+        value = min(maximum, value)
+        return value
+
+    @staticmethod
+    def _env_float(name: str, default: float, minimum: float, maximum: float) -> float:
+        try:
+            value = float(os.getenv(name, str(default)) or default)
+        except Exception:
+            value = float(default)
+        value = max(minimum, value)
+        value = min(maximum, value)
+        return value
+
+    def _call_with_rate_limit_retry(self, fn: Any, *, op_name: str) -> Any:
+        retries = self._env_int("AGENT_LAB_BROKER_RATE_LIMIT_RETRIES", 2, 0, 10)
+        base_delay = self._env_float("AGENT_LAB_BROKER_RATE_LIMIT_BACKOFF_SEC", 1.2, 0.0, 60.0)
+        mult = self._env_float("AGENT_LAB_BROKER_RATE_LIMIT_BACKOFF_MULT", 1.7, 1.0, 5.0)
+        max_delay = self._env_float("AGENT_LAB_BROKER_RATE_LIMIT_BACKOFF_MAX_SEC", 8.0, 0.1, 120.0)
+        max_attempts = retries + 1
+
+        last_exc: Exception | None = None
+        for attempt in range(max_attempts):
+            try:
+                payload = fn()
+                if self._is_rate_limited_payload(payload):
+                    raise RuntimeError(self._api_error_text(payload))
+                return payload
+            except Exception as exc:
+                last_exc = exc
+                err_text = repr(exc)
+                is_rate = self._is_rate_limit_text(err_text)
+                if (not is_rate) or attempt >= (max_attempts - 1):
+                    raise
+                delay = min(max_delay, base_delay * (mult ** attempt))
+                try:
+                    self.storage.log_event(
+                        "broker_rate_limit_retry",
+                        {
+                            "op": str(op_name),
+                            "attempt": int(attempt + 1),
+                            "max_attempts": int(max_attempts),
+                            "delay_sec": round(float(delay), 3),
+                            "error": err_text[:240],
+                        },
+                        datetime.now().isoformat(timespec="seconds"),
+                    )
+                except Exception:
+                    pass
+                time.sleep(delay)
+
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError(f"{op_name}:unknown_error")
+
     def _fetch_us_balance_with_fallback(self, broker: Any) -> Dict[str, Any]:
         """
         Primary: fetch_balance()
@@ -355,7 +432,10 @@ class PaperBroker:
         oversea day/night endpoint payload differs (e.g. missing 'output').
         """
         try:
-            payload = broker.fetch_balance()
+            payload = self._call_with_rate_limit_retry(
+                lambda: broker.fetch_balance(),
+                op_name="US.fetch_balance",
+            )
             if isinstance(payload, dict):
                 return payload
             return {}
@@ -366,7 +446,10 @@ class PaperBroker:
         candidates: List[Dict[str, Any]] = []
         for foreign_currency in (False, True):
             try:
-                payload = broker.fetch_present_balance(foreign_currency=foreign_currency)
+                payload = self._call_with_rate_limit_retry(
+                    lambda fc=foreign_currency: broker.fetch_present_balance(foreign_currency=fc),
+                    op_name=f"US.fetch_present_balance.{int(bool(foreign_currency))}",
+                )
                 if isinstance(payload, dict):
                     api_err = self._api_error_text(payload)
                     if api_err:
@@ -410,7 +493,10 @@ class PaperBroker:
                 if mk == "US":
                     payload = self._fetch_us_balance_with_fallback(broker)
                 else:
-                    payload = broker.fetch_balance()
+                    payload = self._call_with_rate_limit_retry(
+                        lambda: broker.fetch_balance(),
+                        op_name=f"{mk}.fetch_balance",
+                    )
                 if mk == "KR":
                     parsed = self._parse_balance_domestic(payload if isinstance(payload, dict) else {})
                 else:
@@ -421,6 +507,9 @@ class PaperBroker:
                 out["positions"].extend(list(parsed.get("positions", []) or []))
             except Exception as exc:
                 out["errors"].append(f"{mk}:{repr(exc)}")
+            spacing = self._env_float("AGENT_LAB_BROKER_BALANCE_CALL_SPACING_SEC", 0.25, 0.0, 10.0)
+            if spacing > 0:
+                time.sleep(spacing)
 
         out["ok"] = len(out["errors"]) == 0 and len(out["markets"]) == len(targets)
         return out
