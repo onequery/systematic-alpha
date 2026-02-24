@@ -243,6 +243,18 @@ def parse_args() -> argparse.Namespace:
         help="CSV path for overnight performance tracking. Default: out/{kr|us}/YYYYMMDD/selection_overnight_report.csv",
     )
     parser.add_argument(
+        "--skip-overnight-report-update",
+        action="store_true",
+        default=False,
+        help="Skip pending overnight report update step at run start.",
+    )
+    parser.add_argument(
+        "--skip-overnight-report-append",
+        action="store_true",
+        default=False,
+        help="Skip append step to overnight report at run end.",
+    )
+    parser.add_argument(
         "--test-assume-open",
         dest="test_assume_open",
         action="store_true",
@@ -311,6 +323,8 @@ def build_config(args: argparse.Namespace) -> StrategyConfig:
         analytics_dir=analytics_dir,
         enable_analytics_log=args.enable_analytics_log,
         test_assume_open=args.test_assume_open,
+        skip_overnight_report_update=args.skip_overnight_report_update,
+        skip_overnight_report_append=args.skip_overnight_report_append,
     )
 
 

@@ -1042,6 +1042,16 @@ class AutoStrategyDaemon:
             str(overnight_path),
             "--allow-short-bias",
         ]
+        defer_overnight_report = _truthy(
+            os.getenv("AGENT_LAB_INTRADAY_DEFER_OVERNIGHT_REPORT", "1")
+        )
+        if defer_overnight_report:
+            cmd.extend(
+                [
+                    "--skip-overnight-report-update",
+                    "--skip-overnight-report-append",
+                ]
+            )
         if self._use_mock_market_data():
             cmd.append("--mock")
         allow_low_cov = _truthy(os.getenv("AGENT_LAB_INTRADAY_ALLOW_LOW_COVERAGE", "1"))
@@ -1055,7 +1065,33 @@ class AutoStrategyDaemon:
         stdout_text = ""
         stderr_text = ""
         returncode = 0
-        refresh_timeout_sec = max(120, collect_seconds + 180)
+        timeout_base_grace_sec = max(
+            60,
+            int(float(os.getenv("AGENT_LAB_INTRADAY_REFRESH_TIMEOUT_BASE_GRACE_SEC", "240") or 240)),
+        )
+        timeout_per_symbol_sec = max(
+            0.0,
+            float(os.getenv("AGENT_LAB_INTRADAY_REFRESH_TIMEOUT_PER_SYMBOL_SEC", "0.6") or 0.6),
+        )
+        timeout_per_pick_sec = max(
+            0.0,
+            float(os.getenv("AGENT_LAB_INTRADAY_REFRESH_TIMEOUT_PER_PICK_SEC", "2.0") or 2.0),
+        )
+        timeout_min_sec = max(
+            120,
+            int(float(os.getenv("AGENT_LAB_INTRADAY_REFRESH_TIMEOUT_MIN_SEC", "240") or 240)),
+        )
+        timeout_max_sec = max(
+            timeout_min_sec,
+            int(float(os.getenv("AGENT_LAB_INTRADAY_REFRESH_TIMEOUT_MAX_SEC", "540") or 540)),
+        )
+        timeout_computed = (
+            float(collect_seconds)
+            + float(timeout_base_grace_sec)
+            + (float(max_symbols_scan) * float(timeout_per_symbol_sec))
+            + (float(final_picks) * float(timeout_per_pick_sec))
+        )
+        refresh_timeout_sec = int(max(timeout_min_sec, min(timeout_max_sec, round(timeout_computed))))
         try:
             completed = subprocess.run(
                 cmd,
@@ -1078,10 +1114,14 @@ class AutoStrategyDaemon:
         log_body = (
             f"[intraday-refresh] started={now_kst.isoformat()}\n"
             f"command={' '.join(cmd)}\n"
+            f"timeout_sec={refresh_timeout_sec} (computed={timeout_computed:.2f}, "
+            f"min={timeout_min_sec}, max={timeout_max_sec}, base_grace={timeout_base_grace_sec}, "
+            f"per_symbol={timeout_per_symbol_sec}, per_pick={timeout_per_pick_sec})\n"
             f"returncode={returncode}\n"
             f"elapsed_sec={elapsed:.1f}\n\n"
             f"prefetch={json.dumps(prefetch, ensure_ascii=False)}\n"
             f"uncapped_mode={uncapped_mode}\n"
+            f"defer_overnight_report={defer_overnight_report}\n"
             f"timed_out={timed_out}\n\n"
             f"[stdout]\n{stdout_text}\n\n[stderr]\n{stderr_text}\n"
         )
@@ -1093,10 +1133,12 @@ class AutoStrategyDaemon:
             "ok": bool(returncode == 0 and output_json.exists()),
             "returncode": int(returncode),
             "elapsed_sec": round(elapsed, 2),
+            "timeout_sec": int(refresh_timeout_sec),
             "output_json": str(output_json),
             "log_path": str(log_path),
             "uncapped_mode": bool(uncapped_mode),
             "timed_out": bool(timed_out),
+            "defer_overnight_report": bool(defer_overnight_report),
             "prefetch": prefetch,
         }
         invalid_reason = ""
@@ -1128,6 +1170,25 @@ class AutoStrategyDaemon:
                 log_path=log_path,
             )
         return payload
+
+    def _signal_age_seconds(self, signal: Optional[Dict[str, Any]], now_kst: datetime) -> Optional[float]:
+        if not isinstance(signal, dict):
+            return None
+        raw_ts = str(signal.get("generated_at") or signal.get("created_at") or "").strip()
+        if not raw_ts:
+            return None
+        parsed = _parse_iso(raw_ts)
+        if parsed is None:
+            return None
+        try:
+            if parsed.tzinfo is not None:
+                now_ref = now_kst.astimezone(parsed.tzinfo)
+                age = (now_ref - parsed).total_seconds()
+            else:
+                age = (now_kst.replace(tzinfo=None) - parsed).total_seconds()
+            return max(0.0, float(age))
+        except Exception:
+            return None
 
     def _intraday_monitor_policy(self) -> Dict[str, Any]:
         agents = self.storage.list_agents()
@@ -1229,6 +1290,9 @@ class AutoStrategyDaemon:
             "propose_ok": False,
             "sync_blocked": bool(sync_blocked),
         }
+        require_refresh_success = market_open and _truthy(
+            os.getenv("AGENT_LAB_INTRADAY_REQUIRE_REFRESH_SUCCESS", "1")
+        )
         if refresh_enabled:
             payload["refresh_triggered"] = True
             refresh = self._refresh_intraday_signal(market, now_kst)
@@ -1264,6 +1328,13 @@ class AutoStrategyDaemon:
                     signal = self._latest_session_signal_for_market(market)
 
         signal_date = str(signal.get("session_date", "")) if signal else ""
+        signal_generated_at = str((signal or {}).get("generated_at", "") or (signal or {}).get("created_at", ""))
+        signal_max_age_sec = max(
+            30,
+            int(float(os.getenv("AGENT_LAB_INTRADAY_SIGNAL_MAX_AGE_SEC", "900") or 900)),
+        )
+        signal_age_sec = self._signal_age_seconds(signal, now_kst)
+        signal_too_old = signal_age_sec is None or signal_age_sec > float(signal_max_age_sec)
         signal_status_raw = str(signal.get("status_code", "NO_SIGNAL")) if signal else "NO_SIGNAL"
         signal_is_stale = bool(signal_date) and signal_date != expected_session_date
         signal_status = "STALE_SIGNAL" if signal_is_stale else signal_status_raw
@@ -1271,17 +1342,36 @@ class AutoStrategyDaemon:
         status_counts = self._proposal_status_counts(market, proposal_date) if proposal_date else {}
         payload["session_date"] = expected_session_date
         payload["signal_session_date"] = signal_date
+        payload["signal_generated_at"] = signal_generated_at
+        payload["signal_age_sec"] = None if signal_age_sec is None else round(float(signal_age_sec), 2)
+        payload["signal_max_age_sec"] = int(signal_max_age_sec)
+        payload["signal_too_old"] = bool(signal_too_old)
         payload["signal_status_raw"] = signal_status_raw
         payload["signal_is_stale"] = signal_is_stale
         payload["signal_status"] = signal_status
         payload["proposal_session_date"] = proposal_date
         payload["proposal_status_counts"] = status_counts
+        refresh_blocked = bool(
+            require_refresh_success
+            and refresh_enabled
+            and payload.get("refresh_triggered", False)
+            and not payload.get("refresh_ok", False)
+        )
+        payload["require_refresh_success"] = bool(require_refresh_success)
+        payload["refresh_blocked"] = refresh_blocked
 
         # Optional advanced mode: re-run propose cycle during regular sessions only.
         propose_enabled = (not sync_blocked) and market_open and (
             self._max_freedom_mode() or _truthy(os.getenv("AGENT_LAB_INTRADAY_MONITOR_PROPOSE", "1"))
         )
-        if propose_enabled and signal and signal_status_raw == "SIGNAL_OK" and not signal_is_stale:
+        if (
+            propose_enabled
+            and (not refresh_blocked)
+            and signal
+            and signal_status_raw == "SIGNAL_OK"
+            and not signal_is_stale
+            and (not signal_too_old)
+        ):
             try:
                 proposed = self.orchestrator.propose_orders(
                     market=market,
@@ -1303,8 +1393,12 @@ class AutoStrategyDaemon:
                 payload["propose_error"] = repr(exc)
         elif propose_enabled and market_open:
             payload["propose_triggered"] = False
-            if signal_is_stale:
+            if refresh_blocked:
+                payload["propose_skip_reason"] = "refresh_failed_in_cycle"
+            elif signal_is_stale:
                 payload["propose_skip_reason"] = "stale_signal_date_mismatch"
+            elif signal_too_old:
+                payload["propose_skip_reason"] = "stale_signal_age"
             elif not signal:
                 payload["propose_skip_reason"] = "missing_signal_for_session"
             else:

@@ -623,7 +623,10 @@ def run(config: StrategyConfig) -> None:
         except Exception as exc:
             log(f"[analytics] persist failed: {exc}")
 
-    update_pending_overnight_reports(selector, config.overnight_report_path, config.market)
+    if config.skip_overnight_report_update:
+        log("[overnight-report] pending-row update skipped by config.")
+    else:
+        update_pending_overnight_reports(selector, config.overnight_report_path, config.market)
 
     stage_started = perf_counter()
     log("[1/4] Loading universe...")
@@ -815,7 +818,10 @@ def run(config: StrategyConfig) -> None:
         ranked=ranked,
         debug=build_debug_payload(),
     )
-    append_selection_report_rows(selector, config.overnight_report_path, final, decision_at)
+    if config.skip_overnight_report_append:
+        log("[overnight-report] append skipped by config.")
+    else:
+        append_selection_report_rows(selector, config.overnight_report_path, final, decision_at)
     persist_analytics_snapshot(decision_at=decision_at, invalid_reason=None)
     print("\nTop codes:", ", ".join(item.code for item in final) if final else "(none)")
     log(f"Run finished (total elapsed {perf_counter() - total_started:.1f}s)")

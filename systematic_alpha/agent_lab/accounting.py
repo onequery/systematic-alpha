@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 from datetime import datetime, timedelta
 from statistics import pstdev
@@ -18,12 +19,42 @@ class AccountingEngine:
     def __init__(self, storage: AgentLabStorage):
         self.storage = storage
 
+    @staticmethod
+    def _broker_response_has_api_error(raw: Any) -> bool:
+        payload: Dict[str, Any] = {}
+        if isinstance(raw, dict):
+            payload = raw
+        elif isinstance(raw, str):
+            text = str(raw or "").strip()
+            if not text:
+                return False
+            try:
+                decoded = json.loads(text)
+            except Exception:
+                return False
+            if isinstance(decoded, dict):
+                payload = decoded
+        if not payload:
+            return False
+        if payload.get("ok") is False:
+            return True
+        candidates: List[Dict[str, Any]] = []
+        resp = payload.get("response")
+        if isinstance(resp, dict):
+            candidates.append(resp)
+        candidates.append(payload)
+        for cand in candidates:
+            rt_cd = str(cand.get("rt_cd", "")).strip()
+            if rt_cd and rt_cd != "0":
+                return True
+        return False
+
     def allocated_capital(self, agent_id: str) -> float:
         row = self.storage.query_one("SELECT allocated_capital_krw FROM agents WHERE agent_id = ?", (agent_id,))
         return float(row["allocated_capital_krw"]) if row else 0.0
 
     def _fills_with_orders(self, agent_id: str) -> List[Dict[str, Any]]:
-        return self.storage.query_all(
+        rows = self.storage.query_all(
             """
             SELECT
                 pf.paper_fill_id,
@@ -34,7 +65,8 @@ class AccountingEngine:
                 pf.filled_at,
                 po.market,
                 po.symbol,
-                po.side
+                po.side,
+                po.broker_response_json
             FROM paper_fills pf
             JOIN paper_orders po ON po.paper_order_id = pf.paper_order_id
             WHERE po.agent_id = ?
@@ -42,6 +74,11 @@ class AccountingEngine:
             """,
             (agent_id,),
         )
+        return [
+            row
+            for row in rows
+            if not self._broker_response_has_api_error(row.get("broker_response_json"))
+        ]
 
     def rebuild_agent_ledger(self, agent_id: str) -> Dict[str, Any]:
         fills = self._fills_with_orders(agent_id)

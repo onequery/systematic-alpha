@@ -121,6 +121,14 @@ class AgentLabOrchestrator:
         return max(1, int(raw))
 
     @staticmethod
+    def _sync_alert_cooldown_minutes() -> int:
+        try:
+            raw = float(os.getenv("AGENT_LAB_SYNC_ALERT_COOLDOWN_MINUTES", "10") or 10)
+        except Exception:
+            raw = 10.0
+        return max(0, int(raw))
+
+    @staticmethod
     def _post_exec_sync_retries() -> int:
         try:
             raw = float(os.getenv("AGENT_LAB_POST_EXEC_SYNC_RETRIES", "2") or 2)
@@ -994,6 +1002,36 @@ class AgentLabOrchestrator:
             out[(market, symbol)] = out.get((market, symbol), 0.0) + qty
         return out
 
+    @staticmethod
+    def _broker_response_has_api_error(raw: Any) -> bool:
+        payload: Dict[str, Any] = {}
+        if isinstance(raw, dict):
+            payload = raw
+        elif isinstance(raw, str):
+            text = str(raw or "").strip()
+            if not text:
+                return False
+            try:
+                decoded = json.loads(text)
+            except Exception:
+                return False
+            if isinstance(decoded, dict):
+                payload = decoded
+        if not payload:
+            return False
+        if payload.get("ok") is False:
+            return True
+        candidates: List[Dict[str, Any]] = []
+        resp = payload.get("response")
+        if isinstance(resp, dict):
+            candidates.append(resp)
+        candidates.append(payload)
+        for cand in candidates:
+            rt_cd = str(cand.get("rt_cd", "")).strip()
+            if rt_cd and rt_cd != "0":
+                return True
+        return False
+
     def _local_positions_from_fills(self, market_scope: str = "ALL") -> List[Dict[str, Any]]:
         where_market = ""
         params: List[Any] = []
@@ -1007,7 +1045,7 @@ class AgentLabOrchestrator:
             where_agent = ""
         rows = self.storage.query_all(
             f"""
-            SELECT po.market, po.symbol, po.side, pf.fill_quantity, pf.fill_price, pf.fx_rate
+            SELECT po.market, po.symbol, po.side, pf.fill_quantity, pf.fill_price, pf.fx_rate, po.broker_response_json
             FROM paper_fills pf
             JOIN paper_orders po ON po.paper_order_id = pf.paper_order_id
             WHERE 1=1
@@ -1019,6 +1057,8 @@ class AgentLabOrchestrator:
         )
         positions: Dict[Tuple[str, str], Dict[str, float]] = {}
         for row in rows:
+            if self._broker_response_has_api_error(row.get("broker_response_json")):
+                continue
             market = str(row.get("market", "")).strip().upper()
             symbol = str(row.get("symbol", "")).strip().upper()
             side = str(row.get("side", "")).strip().upper()
@@ -1066,6 +1106,69 @@ class AgentLabOrchestrator:
     @staticmethod
     def _sync_streak_meta_key(market_scope: str) -> str:
         return f"sync_mismatch_streak:{str(market_scope or 'ALL').strip().upper() or 'ALL'}"
+
+    @staticmethod
+    def _sync_alert_ts_meta_key(market_scope: str) -> str:
+        return f"sync_alert_last_sent:{str(market_scope or 'ALL').strip().upper() or 'ALL'}"
+
+    @staticmethod
+    def _sync_alert_sig_meta_key(market_scope: str) -> str:
+        return f"sync_alert_last_sig:{str(market_scope or 'ALL').strip().upper() or 'ALL'}"
+
+    @staticmethod
+    def _sync_alert_signature(payload: Dict[str, Any]) -> str:
+        detail = payload.get("detail")
+        mismatches = (detail or {}).get("mismatches") if isinstance(detail, dict) else None
+        if isinstance(mismatches, list) and mismatches:
+            parts: List[str] = []
+            for item in mismatches:
+                if not isinstance(item, dict):
+                    continue
+                market = str(item.get("market", "")).strip().upper()
+                symbol = str(item.get("symbol", "")).strip().upper()
+                try:
+                    delta = float(item.get("delta_qty", 0.0) or 0.0)
+                except Exception:
+                    delta = 0.0
+                parts.append(f"{market}:{symbol}:{delta:.6f}")
+            if parts:
+                return "|".join(sorted(parts))
+        reason = str(payload.get("reason", "") or "").strip().lower()
+        errors = payload.get("errors")
+        if isinstance(errors, list):
+            err = "|".join(str(x) for x in errors[:2])
+        else:
+            err = str(errors or "")
+        return f"reason={reason}|errors={err}"
+
+    def _allow_sync_alert_notification(self, market_scope: str, payload: Dict[str, Any]) -> bool:
+        cooldown_min = self._sync_alert_cooldown_minutes()
+        if cooldown_min <= 0:
+            return True
+        ts_key = self._sync_alert_ts_meta_key(market_scope)
+        sig_key = self._sync_alert_sig_meta_key(market_scope)
+        now = datetime.now()
+        now_s = now_iso()
+        signature = self._sync_alert_signature(payload)
+        last_sig = str(self.storage.get_system_meta(sig_key, "") or "")
+        last_sent_raw = str(self.storage.get_system_meta(ts_key, "") or "")
+        send = False
+        if signature != last_sig:
+            send = True
+        else:
+            if not last_sent_raw:
+                send = True
+            else:
+                try:
+                    last_sent = datetime.fromisoformat(last_sent_raw)
+                    elapsed = now - last_sent
+                    send = elapsed >= timedelta(minutes=cooldown_min)
+                except Exception:
+                    send = True
+        if send:
+            self.storage.upsert_system_meta(ts_key, now_s, now_s)
+            self.storage.upsert_system_meta(sig_key, signature, now_s)
+        return send
 
     def _get_sync_mismatch_streak(self, market_scope: str) -> int:
         key = self._sync_streak_meta_key(market_scope)
@@ -1207,13 +1310,14 @@ class AgentLabOrchestrator:
                 )
             )
             if should_notify:
-                self._notify(
-                    "[AgentLab] 계좌 동기화 실패\n"
-                    f"시장범위={market_scope}\n"
-                    f"사유={payload['reason']}\n"
-                    f"오류={payload['errors'][:2]}",
-                    event="sync_mismatch",
-                )
+                if self._allow_sync_alert_notification(market_scope, payload):
+                    self._notify(
+                        "[AgentLab] 계좌 동기화 실패\n"
+                        f"시장범위={market_scope}\n"
+                        f"사유={payload['reason']}\n"
+                        f"오류={payload['errors'][:2]}",
+                        event="sync_mismatch",
+                    )
             return payload
 
         snapshot_id = self.storage.insert_account_snapshot(
@@ -1265,13 +1369,14 @@ class AgentLabOrchestrator:
             )
         )
         if should_notify:
-            self._notify(
-                "[AgentLab] 계좌 동기화 불일치\n"
-                f"시장범위={market_scope}\n"
-                f"불일치_건수={payload['mismatch_count']}\n"
-                "조치=불일치 해소 전 주문 차단",
-                event="sync_mismatch",
-            )
+            if self._allow_sync_alert_notification(market_scope, payload):
+                self._notify(
+                    "[AgentLab] 계좌 동기화 불일치\n"
+                    f"시장범위={market_scope}\n"
+                    f"불일치_건수={payload['mismatch_count']}\n"
+                    "조치=불일치 해소 전 주문 차단",
+                    event="sync_mismatch",
+                )
         return payload
 
     def _latest_account_context(self, market_scope: str = "ALL") -> Dict[str, Any]:

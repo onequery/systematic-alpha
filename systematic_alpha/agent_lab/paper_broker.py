@@ -127,14 +127,30 @@ class PaperBroker:
                 if order_type == "LIMIT":
                     px = int(float(order.get("limit_price") or order.get("reference_price") or 0))
                     if side == "BUY":
-                        resp = broker.create_limit_buy_order(symbol, px, qty)
+                        resp = self._call_with_rate_limit_retry(
+                            lambda b=broker, s=symbol, p=px, q=qty: b.create_limit_buy_order(s, p, q),
+                            op_name=f"{market}.{exchange_code}.limit_buy.{symbol}",
+                        )
                     else:
-                        resp = broker.create_limit_sell_order(symbol, px, qty)
+                        resp = self._call_with_rate_limit_retry(
+                            lambda b=broker, s=symbol, p=px, q=qty: b.create_limit_sell_order(s, p, q),
+                            op_name=f"{market}.{exchange_code}.limit_sell.{symbol}",
+                        )
                 else:
                     if side == "BUY":
-                        resp = broker.create_market_buy_order(symbol, qty)
+                        resp = self._call_with_rate_limit_retry(
+                            lambda b=broker, s=symbol, q=qty: b.create_market_buy_order(s, q),
+                            op_name=f"{market}.{exchange_code}.market_buy.{symbol}",
+                        )
                     else:
-                        resp = broker.create_market_sell_order(symbol, qty)
+                        resp = self._call_with_rate_limit_retry(
+                            lambda b=broker, s=symbol, q=qty: b.create_market_sell_order(s, q),
+                            op_name=f"{market}.{exchange_code}.market_sell.{symbol}",
+                        )
+                api_err = self._api_error_text(resp if isinstance(resp, dict) else {})
+                if api_err:
+                    attempts.append({"exchange": exchange_code, "ok": False, "reason": api_err})
+                    continue
                 return {"ok": True, "response": resp, "exchange": exchange_code, "attempts": attempts}
             except Exception as exc:
                 attempts.append({"exchange": exchange_code, "ok": False, "reason": repr(exc)})
@@ -558,7 +574,13 @@ class PaperBroker:
                 broker_resp = send
                 if send.get("ok"):
                     payload = send.get("response")
-                    if isinstance(payload, dict):
+                    api_err = self._api_error_text(payload if isinstance(payload, dict) else {})
+                    if api_err:
+                        status = "REJECTED"
+                        broker_resp = dict(send)
+                        broker_resp["ok"] = False
+                        broker_resp["reason"] = api_err
+                    elif isinstance(payload, dict):
                         broker_order_id = str(payload.get("ODNO") or payload.get("output", {}).get("ODNO") or "")
                 else:
                     status = "REJECTED"
