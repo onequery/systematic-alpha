@@ -191,13 +191,22 @@ def apply_network_env_guard() -> Dict[str, str]:
                     "from systematic_alpha.network_env import apply_network_env_guard\n",
                 )
             if "apply_network_env_guard()" not in src:
-                src = src.replace(
-                    "def main() -> None:\n    load_dotenv(\".env\", override=False)\n",
-                    "def main() -> None:\n    load_dotenv(\".env\", override=False)\n"
+                src_new = src.replace(
+                    "def main() -> None:\n    load_env_stack(Path(__file__).resolve().parent)\n",
+                    "def main() -> None:\n    load_env_stack(Path(__file__).resolve().parent)\n"
                     "    # self-heal:network-guard-v1\n"
                     "    apply_network_env_guard()\n",
                     1,
                 )
+                if src_new == src:
+                    src_new = src.replace(
+                        "def main() -> None:\n    load_dotenv(\".env\", override=False)\n",
+                        "def main() -> None:\n    load_dotenv(\".env\", override=False)\n"
+                        "    # self-heal:network-guard-v1\n"
+                        "    apply_network_env_guard()\n",
+                        1,
+                    )
+                src = src_new
             self._write_text("main.py", src)
             changed.append("main.py")
 
@@ -211,13 +220,22 @@ def apply_network_env_guard() -> Dict[str, str]:
                     "from systematic_alpha.network_env import apply_network_env_guard\n",
                 )
             if "apply_network_env_guard()" not in src:
-                src = src.replace(
-                    "def main() -> None:\n    load_dotenv(\".env\", override=False)\n",
-                    "def main() -> None:\n    load_dotenv(\".env\", override=False)\n"
+                src_new = src.replace(
+                    "def main() -> None:\n    args = parse_args()\n    load_env_stack(args.project_root)\n",
+                    "def main() -> None:\n    args = parse_args()\n    load_env_stack(args.project_root)\n"
                     "    # self-heal:network-guard-v1\n"
                     "    apply_network_env_guard()\n",
                     1,
                 )
+                if src_new == src:
+                    src_new = src.replace(
+                        "def main() -> None:\n    load_dotenv(\".env\", override=False)\n",
+                        "def main() -> None:\n    load_dotenv(\".env\", override=False)\n"
+                        "    # self-heal:network-guard-v1\n"
+                        "    apply_network_env_guard()\n",
+                        1,
+                    )
+                src = src_new
             self._write_text("systematic_alpha/agent_lab/cli.py", src)
             changed.append("systematic_alpha/agent_lab/cli.py")
 

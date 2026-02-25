@@ -26,8 +26,11 @@ pip install -r requirements.txt
 
 ## 3. 환경변수
 
-`.env.example`를 `.env`로 복사 후 값 입력:
+환경 파일을 2개로 분리해서 사용합니다.
 
+1) 비밀키: `.env`
+
+- `.env.example`를 `.env`로 복사 후 값 입력
 - 필수
   - `KIS_APP_KEY`
   - `KIS_APP_SECRET`
@@ -37,8 +40,12 @@ pip install -r requirements.txt
   - `TELEGRAM_CHAT_ID`
 - OpenAI(권장)
   - `OPENAI_API_KEY`
-  - `OPENAI_MODEL`
-  - `OPENAI_MAX_DAILY_COST`
+
+2) 비민감 런타임 설정: `config/agent_lab.config`
+
+- `config/agent_lab.config.example`를 `config/agent_lab.config`로 복사 후 값 조정
+- 예: `OPENAI_MODEL`, `OPENAI_MAX_DAILY_COST`, `AGENT_LAB_*`, `TELEGRAM_ENABLED`
+- 로딩 우선순위: `프로세스 환경변수 > .env > config/agent_lab.config`
 
 알림 필터(중요):
 

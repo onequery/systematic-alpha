@@ -4,7 +4,7 @@ import argparse
 from pathlib import Path
 from typing import Any, Dict
 
-from systematic_alpha.dotenv import load_dotenv
+from systematic_alpha.dotenv import load_env_stack
 from systematic_alpha.agent_lab.auto_strategy import run_auto_strategy_daemon
 from systematic_alpha.agent_lab.orchestrator import AgentLabOrchestrator
 from systematic_alpha.agent_lab.self_heal import run_data_reception_self_heal
@@ -106,10 +106,10 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
-    load_dotenv(".env", override=False)
+    args = parse_args()
+    load_env_stack(args.project_root)
     # self-heal:network-guard-v1
     apply_network_env_guard()
-    args = parse_args()
     if args.command == "telegram-chat":
         payload = run_telegram_chat_worker(
             project_root=Path(args.project_root),

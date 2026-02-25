@@ -10,7 +10,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from systematic_alpha.credentials import load_credentials
-from systematic_alpha.dotenv import load_dotenv
+from systematic_alpha.dotenv import load_env_stack
 from systematic_alpha.models import StrategyConfig
 from systematic_alpha.mojito_loader import import_mojito_module
 from systematic_alpha.selector import DayTradingSelector
@@ -96,7 +96,7 @@ def main() -> int:
         return 1
 
     os.chdir(project_root)
-    load_dotenv(".env", override=False)
+    load_env_stack(project_root)
     execution_mode = str(os.getenv("AGENT_LAB_EXECUTION_MODE", "mojito_mock") or "mojito_mock").strip().lower()
     use_mock = "mock" in execution_mode
 

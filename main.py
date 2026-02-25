@@ -7,7 +7,7 @@ from zoneinfo import ZoneInfo
 
 from systematic_alpha.cli import run
 from systematic_alpha.credentials import load_credentials
-from systematic_alpha.dotenv import load_dotenv
+from systematic_alpha.dotenv import load_env_stack
 from systematic_alpha.models import StrategyConfig
 from systematic_alpha.network_env import apply_network_env_guard
 
@@ -329,7 +329,7 @@ def build_config(args: argparse.Namespace) -> StrategyConfig:
 
 
 def main() -> None:
-    load_dotenv(".env", override=False)
+    load_env_stack(Path(__file__).resolve().parent)
     # self-heal:network-guard-v1
     apply_network_env_guard()
     args = parse_args()

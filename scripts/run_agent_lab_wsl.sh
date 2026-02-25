@@ -4,13 +4,20 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-if [[ -f ".env" ]]; then
-  set -a
-  # BOM/CRLF-safe load for .env.
+load_env_file_safe() {
+  local file_path="$1"
+  if [[ ! -f "$file_path" ]]; then
+    return 0
+  fi
+  # BOM/CRLF-safe load for env-like files.
   # shellcheck disable=SC1090
-  source <(awk 'NR==1{sub(/^\xef\xbb\xbf/,"")} {sub(/\r$/,"")}1' ".env")
-  set +a
-fi
+  source <(awk 'NR==1{sub(/^\xef\xbb\xbf/,"")} {sub(/\r$/,"")}1' "$file_path")
+}
+
+set -a
+load_env_file_safe "$ROOT_DIR/config/agent_lab.config"
+load_env_file_safe "$ROOT_DIR/.env"
+set +a
 
 resolve_python_bin() {
   local candidate="${PYTHON_BIN:-}"

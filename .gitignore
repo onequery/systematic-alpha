@@ -1,6 +1,8 @@
 .env
 .env.*
 !.env.example
+config/agent_lab.config
+!config/agent_lab.config.example
 
 __pycache__/
 *.pyc

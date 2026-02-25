@@ -13,12 +13,19 @@ MARK_END="# <<< systematic-alpha tasks end <<<"
 
 mkdir -p "$ROOT_DIR/logs/cron"
 
-if [[ -f "$ROOT_DIR/.env" ]]; then
-  set -a
+load_env_file_safe() {
+  local file_path="$1"
+  if [[ ! -f "$file_path" ]]; then
+    return 0
+  fi
   # shellcheck disable=SC1090
-  source <(awk 'NR==1{sub(/^\xef\xbb\xbf/,"")} {sub(/\r$/,"")}1' "$ROOT_DIR/.env")
-  set +a
-fi
+  source <(awk 'NR==1{sub(/^\xef\xbb\xbf/,"")} {sub(/\r$/,"")}1' "$file_path")
+}
+
+set -a
+load_env_file_safe "$ROOT_DIR/config/agent_lab.config"
+load_env_file_safe "$ROOT_DIR/.env"
+set +a
 
 PREFETCH_KR_UNIVERSE_SIZE="${AGENT_LAB_PREFETCH_KR_UNIVERSE_SIZE:-180}"
 PREFETCH_KR_MAX_SYMBOLS_SCAN="${AGENT_LAB_PREFETCH_KR_MAX_SYMBOLS_SCAN:-240}"

@@ -10,7 +10,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from systematic_alpha.credentials import load_credentials
-from systematic_alpha.dotenv import load_dotenv
+from systematic_alpha.dotenv import load_env_stack
 from systematic_alpha.models import StrategyConfig
 from systematic_alpha.mojito_loader import import_mojito_module
 from systematic_alpha.selector_us import USDayTradingSelector
@@ -89,7 +89,7 @@ def main() -> int:
         return 1
 
     os.chdir(project_root)
-    load_dotenv(".env", override=False)
+    load_env_stack(project_root)
 
     api_key, api_secret, acc_no, user_id = load_credentials(args.key_file)
     config = build_prefetch_config(
