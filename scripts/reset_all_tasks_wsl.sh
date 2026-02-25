@@ -4,6 +4,117 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
+usage() {
+  cat <<'EOF'
+Usage: scripts/reset_all_tasks_wsl.sh [options]
+
+Options:
+  --force                 proceed even if active run_daily/prefetch jobs are running
+  --no-wait               do not wait for active run_daily/prefetch jobs (warn only)
+  --wait-timeout-sec N    max wait time for active jobs (default: 900)
+  --wait-poll-sec N       polling interval while waiting (default: 5)
+  -h, --help              show this help
+
+Env overrides:
+  RESET_FORCE=1
+  RESET_WAIT_FOR_ACTIVE_JOBS=0|1
+  RESET_ACTIVE_WAIT_TIMEOUT_SEC=900
+  RESET_ACTIVE_WAIT_POLL_SEC=5
+EOF
+}
+
+FORCE_RESET="${RESET_FORCE:-0}"
+WAIT_FOR_ACTIVE_JOBS="${RESET_WAIT_FOR_ACTIVE_JOBS:-1}"
+ACTIVE_WAIT_TIMEOUT_SEC="${RESET_ACTIVE_WAIT_TIMEOUT_SEC:-900}"
+ACTIVE_WAIT_POLL_SEC="${RESET_ACTIVE_WAIT_POLL_SEC:-5}"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --force)
+      FORCE_RESET=1
+      shift
+      ;;
+    --no-wait)
+      WAIT_FOR_ACTIVE_JOBS=0
+      shift
+      ;;
+    --wait-timeout-sec)
+      ACTIVE_WAIT_TIMEOUT_SEC="${2:-900}"
+      shift 2
+      ;;
+    --wait-poll-sec)
+      ACTIVE_WAIT_POLL_SEC="${2:-5}"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown arg: $1" >&2
+      usage
+      exit 2
+      ;;
+  esac
+done
+
+if ! [[ "$ACTIVE_WAIT_TIMEOUT_SEC" =~ ^[0-9]+$ ]]; then
+  ACTIVE_WAIT_TIMEOUT_SEC=900
+fi
+if ! [[ "$ACTIVE_WAIT_POLL_SEC" =~ ^[0-9]+$ ]] || (( ACTIVE_WAIT_POLL_SEC < 1 )); then
+  ACTIVE_WAIT_POLL_SEC=5
+fi
+
+list_active_market_jobs() {
+  ps -eo pid=,args= | awk -v self_pid="$$" '
+    {
+      pid = $1
+      $1 = ""
+      sub(/^[[:space:]]+/, "", $0)
+      cmd = $0
+      if (pid == self_pid) next
+      if (cmd ~ /reset_all_tasks_wsl\.sh|reset_tasks_preserve_state_wsl\.sh/) next
+      if (cmd ~ /run_daily_wsl\.sh|prefetch_kr_universe\.py|prefetch_us_universe\.py|prefetch_us_market_cache\.py|python[^ ]* .*main\.py --market/) {
+        print pid " " cmd
+      }
+    }
+  '
+}
+
+wait_for_active_market_jobs() {
+  local jobs
+  jobs="$(list_active_market_jobs)"
+  if [[ -z "$jobs" ]]; then
+    return 0
+  fi
+
+  if [[ "$FORCE_RESET" == "1" || "$WAIT_FOR_ACTIVE_JOBS" != "1" ]]; then
+    echo "[reset] warning: active run_daily/prefetch job(s) detected; proceeding by force/no-wait."
+    echo "$jobs"
+    return 0
+  fi
+
+  local started_at now elapsed remain
+  started_at="$(date +%s)"
+  while [[ -n "$jobs" ]]; do
+    now="$(date +%s)"
+    elapsed=$((now - started_at))
+    if (( elapsed >= ACTIVE_WAIT_TIMEOUT_SEC )); then
+      echo "[reset] ERROR: active run_daily/prefetch job(s) still running after ${ACTIVE_WAIT_TIMEOUT_SEC}s."
+      echo "$jobs"
+      echo "[reset] aborting reset to avoid interrupting market jobs."
+      echo "[reset] use --force (or RESET_FORCE=1) to override."
+      return 1
+    fi
+
+    remain=$((ACTIVE_WAIT_TIMEOUT_SEC - elapsed))
+    echo "[reset] active run_daily/prefetch job(s) detected; waiting ${ACTIVE_WAIT_POLL_SEC}s (remaining ${remain}s)"
+    echo "$jobs"
+    sleep "$ACTIVE_WAIT_POLL_SEC"
+    jobs="$(list_active_market_jobs)"
+  done
+}
+
 ensure_cron_running() {
   if pgrep -x cron >/dev/null 2>&1; then
     echo "[reset] cron daemon: running"
@@ -69,6 +180,7 @@ ensure_cron_running() {
   return 1
 }
 
+wait_for_active_market_jobs
 ensure_cron_running
 /usr/bin/env bash "$ROOT_DIR/scripts/remove_all_tasks_wsl.sh"
 /usr/bin/env bash "$ROOT_DIR/scripts/register_all_tasks_wsl.sh"

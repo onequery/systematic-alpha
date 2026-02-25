@@ -92,11 +92,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ "$DATE_EXPLICIT" != "1" && "$MARKET" == "US" ]]; then
-  # US close-time tasks run on KST early morning; map to previous KST session date.
-  HOUR_KST="$(TZ=Asia/Seoul date +%H)"
-  if (( 10#$HOUR_KST < 9 )); then
-    RUN_DATE="$(TZ=Asia/Seoul date -d '1 day' +%Y%m%d)"
-  fi
+  # Use US local session date directly (DST-safe for preopen/open/close tasks).
+  RUN_DATE="$(TZ=America/New_York date +%Y%m%d)"
 fi
 
 RUN_STAMP="$(TZ=Asia/Seoul date +%Y%m%d_%H%M%S)"

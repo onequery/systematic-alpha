@@ -87,9 +87,18 @@ chmod +x scripts/*.sh
 ./scripts/reset_tasks_preserve_state_wsl.sh
 ```
 
+옵션:
+
+```bash
+# run_daily/prefetch 실행 중이어도 즉시 리셋
+./scripts/reset_tasks_preserve_state_wsl.sh --force
+```
+
 동작 요약:
 - `reset_tasks_preserve_state_wsl.sh`는 내부적으로 `remove_all_tasks_wsl.sh` + `register_all_tasks_wsl.sh`를 실행합니다.
 - `INIT_AGENT_LAB=0`으로 동작하므로 기존 자본/전략/메모리 상태는 유지하고 크론/데몬만 재등록·재기동합니다.
+- 기본값으로 활성 `run_daily/prefetch/main.py --market` 작업을 감지하면 대기하고, 지정 시간(기본 900초) 내 종료되지 않으면 리셋을 중단합니다.
+- 강제 진행이 필요하면 `--force`(또는 `RESET_FORCE=1`)를 사용합니다.
 - 추가로 `cron` 데몬 생존 여부를 점검하고, 죽어 있으면 자동 시작을 시도합니다(필요 시 `sudo` 비밀번호 입력).
 - `cron` 시작 실패 시 reset은 오류로 종료되어, "등록은 됐지만 실행은 안 되는" 상태를 막습니다.
 

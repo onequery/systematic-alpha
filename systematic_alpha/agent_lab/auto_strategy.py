@@ -818,7 +818,8 @@ class AutoStrategyDaemon:
             us_universe_size=us_universe_size,
         )
         stamp = now_kst.strftime("%Y%m%d_%H%M%S")
-        log_dir = self.project_root / "logs" / "agent_lab" / run_date
+        # Keep intraday prefetch logs alongside market signal logs for path consistency.
+        log_dir = self.project_root / "logs" / market.lower() / run_date
         log_dir.mkdir(parents=True, exist_ok=True)
         log_path = log_dir / f"intraday_prefetch_{market.lower()}_{stamp}.log"
 
@@ -1042,7 +1043,8 @@ class AutoStrategyDaemon:
         out_base = self.project_root / "out" / market_lc / run_date
         result_dir = out_base / "results"
         result_dir.mkdir(parents=True, exist_ok=True)
-        log_dir = self.project_root / "logs" / "agent_lab" / run_date
+        # Keep intraday refresh logs alongside run_daily market logs.
+        log_dir = self.project_root / "logs" / market_lc / run_date
         log_dir.mkdir(parents=True, exist_ok=True)
 
         output_json = result_dir / f"{market_lc}_daily_{stamp}.json"
