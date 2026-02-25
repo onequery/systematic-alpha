@@ -45,6 +45,8 @@ class StrategyConfig:
     analytics_dir: Optional[str]
     enable_analytics_log: bool
     test_assume_open: bool
+    skip_overnight_report_update: bool = False
+    skip_overnight_report_append: bool = False
 
 
 @dataclass

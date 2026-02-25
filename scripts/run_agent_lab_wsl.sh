@@ -53,6 +53,10 @@ CHAT_MEMORY_LIMIT=20
 AUTO_STRATEGY_POLL="${AGENT_LAB_DAEMON_POLL_SECONDS:-60}"
 AUTO_STRATEGY_COOLDOWN=180
 AUTO_STRATEGY_MAX_UPDATES=2
+RECONCILE_SUBMITTED_APPLY="0"
+RECONCILE_SUBMITTED_MAX_AGE_SEC="${AGENT_LAB_SUBMITTED_RECONCILE_AGE_SEC:-1800}"
+RECONCILE_SUBMITTED_CLOSE_STATUS="${AGENT_LAB_SUBMITTED_RECONCILE_CLOSE_STATUS:-REJECTED}"
+RECONCILE_SUBMITTED_REASON="${AGENT_LAB_SUBMITTED_RECONCILE_REASON:-manual_reconcile_submitted}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -72,6 +76,10 @@ while [[ $# -gt 0 ]]; do
     --auto-strategy-poll) AUTO_STRATEGY_POLL="${2:-300}"; shift 2 ;;
     --auto-strategy-cooldown) AUTO_STRATEGY_COOLDOWN="${2:-180}"; shift 2 ;;
     --auto-strategy-max-updates) AUTO_STRATEGY_MAX_UPDATES="${2:-2}"; shift 2 ;;
+    --reconcile-apply) RECONCILE_SUBMITTED_APPLY="1"; shift ;;
+    --reconcile-max-age-sec) RECONCILE_SUBMITTED_MAX_AGE_SEC="${2:-1800}"; shift 2 ;;
+    --reconcile-close-status) RECONCILE_SUBMITTED_CLOSE_STATUS="${2:-REJECTED}"; shift 2 ;;
+    --reconcile-reason) RECONCILE_SUBMITTED_REASON="${2:-manual_reconcile_submitted}"; shift 2 ;;
     *) echo "Unknown arg: $1" >&2; exit 2 ;;
   esac
 done
@@ -127,6 +135,37 @@ case "$ACTION" in
     ;;
   close-report)
     run_cli close-report --market "$MARKET" --date "$RUN_DATE"
+    ;;
+  sync-account)
+    if [[ "${AGENT_LAB_SYNC_STRICT:-1}" == "1" ]]; then
+      run_cli sync-account --market "$MARKET" --strict
+    else
+      run_cli sync-account --market "$MARKET"
+    fi
+    ;;
+  reconcile-submitted)
+    if [[ "$RECONCILE_SUBMITTED_APPLY" == "1" ]]; then
+      run_cli reconcile-submitted \
+        --market "$MARKET" \
+        --max-age-sec "$RECONCILE_SUBMITTED_MAX_AGE_SEC" \
+        --close-status "$RECONCILE_SUBMITTED_CLOSE_STATUS" \
+        --reason "$RECONCILE_SUBMITTED_REASON" \
+        --apply
+    else
+      run_cli reconcile-submitted \
+        --market "$MARKET" \
+        --max-age-sec "$RECONCILE_SUBMITTED_MAX_AGE_SEC" \
+        --close-status "$RECONCILE_SUBMITTED_CLOSE_STATUS" \
+        --reason "$RECONCILE_SUBMITTED_REASON"
+    fi
+    ;;
+  shadow-report)
+    if [[ -z "$DATE_FROM" ]]; then DATE_FROM="$RUN_DATE"; fi
+    if [[ -z "$DATE_TO" ]]; then DATE_TO="$RUN_DATE"; fi
+    run_cli shadow-report --from "$DATE_FROM" --to "$DATE_TO"
+    ;;
+  cutover-reset)
+    run_cli cutover-reset --require-flat --archive --reinit --restart-tasks
     ;;
   telegram-chat)
     if [[ "$CHAT_ONCE" == "1" ]]; then

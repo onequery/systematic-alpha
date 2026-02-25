@@ -114,6 +114,10 @@ class TelegramChatRuntime:
         self.kst = ZoneInfo("Asia/Seoul")
         self.et = ZoneInfo("America/New_York")
 
+    @staticmethod
+    def _unified_shadow_mode() -> bool:
+        return str(os.getenv("AGENT_LAB_EXECUTION_MODEL", "legacy_multi_agent") or "legacy_multi_agent").strip().lower() == "unified_shadow"
+
     def _sanitize_error(self, value: Any) -> str:
         text = repr(value)
         if self.token:
@@ -293,6 +297,7 @@ class TelegramChatRuntime:
             "PENDING_APPROVAL": "승인대기",
             "APPROVED": "승인됨",
             "EXECUTED": "실행됨",
+            "SUBMITTED": "접수됨",
             "BLOCKED": "차단됨",
             "REJECTED": "반려됨",
             "SIGNAL_OK": "신호정상",
@@ -460,6 +465,12 @@ class TelegramChatRuntime:
         chat_last_err = self.storage.get_latest_event("telegram_chat_worker_error")
         err_at = str(chat_last_err.get("created_at", "-")) if chat_last_err else "-"
         lines.append(f"- 데몬:telegram_chat={'실행중' if chat_alive else '중지'} 마지막_오류={err_at}")
+        reconcile = self.storage.get_latest_reconcile_event("ALL")
+        if reconcile:
+            lines.append(
+                f"- 계좌동기화: {'정상' if bool(reconcile.get('matched', False)) else '불일치'} "
+                f"시각={reconcile.get('created_at', '-')}"
+            )
         return lines
 
     def _format_market_pipeline_block(self, market: str) -> List[str]:
@@ -921,14 +932,17 @@ class TelegramChatRuntime:
         latest_proposal_us = self._latest_proposal(agent_id, "US")
         latest_equity = self._latest_equity(agent_id)
         heartbeat = self.storage.get_latest_event("auto_strategy_heartbeat")
+        reconcile = self.storage.get_latest_reconcile_event("ALL")
+        latest_snapshot = self.storage.get_latest_account_snapshot("ALL")
         recent_directives = self._list_directives(agent_id=agent_id, limit=8)
-        positions = self.storage.list_positions(agent_id)
+        positions = [] if self._unified_shadow_mode() else self.storage.list_positions(agent_id)
         if len(positions) > 20:
             positions = positions[:20]
         heartbeat_payload = heartbeat.get("payload", {}) if heartbeat else {}
         monitor_payload = heartbeat_payload.get("intraday_monitor", {}) if isinstance(heartbeat_payload, dict) else {}
         monitor_enabled = bool(monitor_payload.get("enabled", False))
         pipeline_mode = "adaptive_intraday" if monitor_enabled else "session_based"
+        shadow_latest = self.storage.get_latest_shadow_scores().get(agent_id, {})
 
         return {
             "agent_id": agent_id,
@@ -944,7 +958,16 @@ class TelegramChatRuntime:
             "latest_equity": latest_equity,
             "recent_directives": recent_directives,
             "positions": positions,
+            "shadow_latest": shadow_latest,
+            "account_sync": {
+                "matched": bool((reconcile or {}).get("matched", False)),
+                "detail": str((reconcile or {}).get("detail", "")),
+                "created_at": str((reconcile or {}).get("created_at", "")),
+                "snapshot_equity_krw": float((latest_snapshot or {}).get("equity_krw", 0.0) or 0.0),
+                "snapshot_cash_krw": float((latest_snapshot or {}).get("cash_krw", 0.0) or 0.0),
+            },
             "execution_model": {
+                "mode": "unified_shadow" if self._unified_shadow_mode() else "legacy_multi_agent",
                 "signal_pipeline_mode": pipeline_mode,
                 "collect_seconds_semantics": "각 리프레시 실행에서 실시간 샘플링 구간을 의미하며, 에이전트가 장중 리프레시 사이클을 반복 트리거할 수 있음",
                 "latest_auto_strategy_heartbeat": heartbeat_payload if heartbeat else None,
@@ -1090,15 +1113,20 @@ class TelegramChatRuntime:
         ctx = self._build_agent_context(agent_id)
         eq = ctx.get("latest_equity") or {}
         pos = ctx.get("positions") or []
+        shadow = ctx.get("shadow_latest") or {}
+        sync = ctx.get("account_sync") or {}
         active = ctx.get("active_strategy") or {}
         version_tag = str(active.get("version_tag", "N/A"))
         markets = [str(market).upper()] if market else ["KR", "US"]
         lines = [
             f"[{agent_id}] 상태",
             f"- 전략: {version_tag}",
-            f"- 보유포지션수: {len(pos)}",
+            f"- 실행모델: {'통합포트폴리오+섀도우' if self._unified_shadow_mode() else '에이전트별 장부'}",
+            f"- 보유포지션수: {'(통합포트폴리오 별도)' if self._unified_shadow_mode() else len(pos)}",
             f"- 평가자산_원화: {float(eq.get('equity_krw', 0.0) or 0.0):.0f}",
             f"- 낙폭: {float(eq.get('drawdown', 0.0) or 0.0):.4f}",
+            f"- 섀도우_점수: {float(shadow.get('score', 0.0) or 0.0):.4f}",
+            f"- 계좌동기화: {'정상' if bool(sync.get('matched', False)) else '불일치'} ({sync.get('created_at', '-')})",
         ]
         for mk in markets:
             latest = self._latest_proposal(agent_id, mk) or {}
@@ -1115,7 +1143,14 @@ class TelegramChatRuntime:
         agents = self.storage.list_agents()
         if not agents:
             return "등록된 에이전트가 없습니다. 먼저 Agent Lab init을 실행하세요."
+        reconcile = self.storage.get_latest_reconcile_event("ALL") or {}
+        snapshot = self.storage.get_latest_account_snapshot("ALL") or {}
         lines = ["[AgentLab] 전체 에이전트 상태"]
+        lines.append(
+            f"- 실행모델={'통합포트폴리오+섀도우' if self._unified_shadow_mode() else '에이전트별 장부'} "
+            f"| 계좌동기화={'정상' if bool(reconcile.get('matched', False)) else '불일치'} "
+            f"| 계좌평가={float(snapshot.get('equity_krw', 0.0) or 0.0):.0f}"
+        )
         markets = [str(market).upper()] if market else ["KR", "US"]
         for mk in markets:
             lines.append(f"[{mk}]")

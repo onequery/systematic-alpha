@@ -210,6 +210,106 @@ class AgentLabStorage:
                 );
                 CREATE INDEX IF NOT EXISTS idx_state_events_type_ts
                     ON state_events(event_type, created_at DESC);
+
+                CREATE TABLE IF NOT EXISTS report_dispatch_locks (
+                    lock_key TEXT PRIMARY KEY,
+                    event_type TEXT NOT NULL,
+                    market TEXT NOT NULL,
+                    report_date TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_report_dispatch_locks_event_date
+                    ON report_dispatch_locks(event_type, market, report_date, created_at DESC);
+
+                CREATE TABLE IF NOT EXISTS account_snapshots (
+                    snapshot_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    epoch_id TEXT NOT NULL,
+                    market_scope TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    cash_krw REAL NOT NULL DEFAULT 0,
+                    equity_krw REAL NOT NULL DEFAULT 0,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_account_snapshots_scope_ts
+                    ON account_snapshots(market_scope, created_at DESC);
+
+                CREATE TABLE IF NOT EXISTS account_positions (
+                    account_position_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    snapshot_id INTEGER NOT NULL,
+                    market TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    quantity REAL NOT NULL DEFAULT 0,
+                    avg_price REAL NOT NULL DEFAULT 0,
+                    market_value_krw REAL NOT NULL DEFAULT 0,
+                    currency TEXT NOT NULL DEFAULT 'KRW',
+                    fx_rate REAL NOT NULL DEFAULT 1,
+                    payload_json TEXT NOT NULL DEFAULT '{}',
+                    FOREIGN KEY(snapshot_id) REFERENCES account_snapshots(snapshot_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_account_positions_snapshot
+                    ON account_positions(snapshot_id, market, symbol);
+
+                CREATE TABLE IF NOT EXISTS reconcile_events (
+                    reconcile_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    check_type TEXT NOT NULL,
+                    market_scope TEXT NOT NULL,
+                    matched INTEGER NOT NULL,
+                    detail TEXT NOT NULL DEFAULT '',
+                    expected_json TEXT NOT NULL DEFAULT '{}',
+                    actual_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_reconcile_events_ts
+                    ON reconcile_events(created_at DESC);
+
+                CREATE TABLE IF NOT EXISTS shadow_intents (
+                    shadow_intent_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    proposal_id INTEGER,
+                    agent_id TEXT NOT NULL,
+                    market TEXT NOT NULL,
+                    session_date TEXT NOT NULL,
+                    weight REAL NOT NULL DEFAULT 0,
+                    score REAL NOT NULL DEFAULT 0,
+                    orders_json TEXT NOT NULL,
+                    rationale TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_shadow_intents_agent_date
+                    ON shadow_intents(agent_id, session_date, created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_shadow_intents_market_date
+                    ON shadow_intents(market, session_date, created_at DESC);
+
+                CREATE TABLE IF NOT EXISTS shadow_scores (
+                    shadow_score_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    agent_id TEXT NOT NULL,
+                    as_of_date TEXT NOT NULL,
+                    score REAL NOT NULL DEFAULT 0.3333333333,
+                    return_pct REAL NOT NULL DEFAULT 0,
+                    risk_penalty REAL NOT NULL DEFAULT 0,
+                    sample_count INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(agent_id, as_of_date)
+                );
+                CREATE INDEX IF NOT EXISTS idx_shadow_scores_agent_date
+                    ON shadow_scores(agent_id, as_of_date DESC);
+
+                CREATE TABLE IF NOT EXISTS event_batches (
+                    event_batch_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    batch_key TEXT NOT NULL,
+                    events_json TEXT NOT NULL,
+                    sent INTEGER NOT NULL DEFAULT 0,
+                    sent_at TEXT,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_event_batches_key_ts
+                    ON event_batches(batch_key, created_at DESC);
+
+                CREATE TABLE IF NOT EXISTS system_meta (
+                    meta_key TEXT PRIMARY KEY,
+                    meta_value TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
                 """
             )
 
@@ -237,6 +337,33 @@ class AgentLabStorage:
                 (event_type, json.dumps(payload, ensure_ascii=False), created_at),
             )
 
+    def try_claim_report_dispatch(
+        self,
+        *,
+        event_type: str,
+        market: str,
+        report_date: str,
+        created_at: str,
+    ) -> bool:
+        lock_key = f"{str(event_type).strip().lower()}:{str(market).strip().upper()}:{str(report_date).strip()}"
+        with self.tx():
+            cur = self.execute(
+                """
+                INSERT OR IGNORE INTO report_dispatch_locks(
+                    lock_key, event_type, market, report_date, created_at
+                )
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    lock_key,
+                    str(event_type).strip().lower(),
+                    str(market).strip().upper(),
+                    str(report_date).strip(),
+                    str(created_at),
+                ),
+            )
+            return int(cur.rowcount or 0) > 0
+
     def upsert_agent(
         self,
         agent_id: str,
@@ -247,7 +374,9 @@ class AgentLabStorage:
         risk_style: str,
         constraints: Dict[str, Any],
         created_at: str,
+        is_active: int = 1,
     ) -> None:
+        active_flag = 1 if int(is_active) > 0 else 0
         with self.tx():
             self.execute(
                 """
@@ -255,7 +384,7 @@ class AgentLabStorage:
                     agent_id, name, role, philosophy, allocated_capital_krw,
                     risk_style, constraints_json, created_at, is_active
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(agent_id) DO UPDATE SET
                     name=excluded.name,
                     role=excluded.role,
@@ -263,7 +392,7 @@ class AgentLabStorage:
                     allocated_capital_krw=excluded.allocated_capital_krw,
                     risk_style=excluded.risk_style,
                     constraints_json=excluded.constraints_json,
-                    is_active=1
+                    is_active=excluded.is_active
                 """,
                 (
                     agent_id,
@@ -274,6 +403,7 @@ class AgentLabStorage:
                     risk_style,
                     json.dumps(constraints, ensure_ascii=False),
                     created_at,
+                    active_flag,
                 ),
             )
 
@@ -604,6 +734,26 @@ class AgentLabStorage:
                 WHERE paper_order_id = ?
                 """,
                 (status, int(paper_order_id)),
+            )
+
+    def update_paper_order_status_with_response(
+        self,
+        paper_order_id: int,
+        status: str,
+        broker_response_json: Dict[str, Any],
+    ) -> None:
+        with self.tx():
+            self.execute(
+                """
+                UPDATE paper_orders
+                SET status = ?, broker_response_json = ?
+                WHERE paper_order_id = ?
+                """,
+                (
+                    str(status),
+                    json.dumps(broker_response_json, ensure_ascii=False),
+                    int(paper_order_id),
+                ),
             )
 
     def insert_paper_fill(
@@ -962,12 +1112,445 @@ class AgentLabStorage:
             row["payload"] = json.loads(row.pop("payload_json"))
         return rows
 
-    def cleanup_legacy_runtime_state(self, *, retain_days: int = 30, keep_agent_memories: int = 300) -> Dict[str, int]:
+    def upsert_system_meta(self, meta_key: str, meta_value: Any, updated_at: str) -> None:
+        if isinstance(meta_value, (dict, list)):
+            raw = json.dumps(meta_value, ensure_ascii=False)
+        else:
+            raw = str(meta_value)
+        with self.tx():
+            self.execute(
+                """
+                INSERT INTO system_meta(meta_key, meta_value, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(meta_key) DO UPDATE SET
+                    meta_value=excluded.meta_value,
+                    updated_at=excluded.updated_at
+                """,
+                (str(meta_key), raw, str(updated_at)),
+            )
+
+    def get_system_meta(self, meta_key: str, default: Any = None) -> Any:
+        row = self.query_one(
+            """
+            SELECT meta_value
+            FROM system_meta
+            WHERE meta_key = ?
+            LIMIT 1
+            """,
+            (str(meta_key),),
+        )
+        if not row:
+            return default
+        raw = str(row.get("meta_value", ""))
+        if raw == "":
+            return default
+        try:
+            return json.loads(raw)
+        except Exception:
+            return raw
+
+    def insert_account_snapshot(
+        self,
+        *,
+        epoch_id: str,
+        market_scope: str,
+        source: str,
+        cash_krw: float,
+        equity_krw: float,
+        payload: Dict[str, Any],
+        created_at: str,
+    ) -> int:
+        with self.tx():
+            cur = self.execute(
+                """
+                INSERT INTO account_snapshots(
+                    epoch_id, market_scope, source, cash_krw, equity_krw, payload_json, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(epoch_id),
+                    str(market_scope).upper(),
+                    str(source),
+                    float(cash_krw),
+                    float(equity_krw),
+                    json.dumps(payload, ensure_ascii=False),
+                    str(created_at),
+                ),
+            )
+            return int(cur.lastrowid)
+
+    def replace_account_positions(self, snapshot_id: int, rows: List[Dict[str, Any]]) -> int:
+        with self.tx():
+            self.execute("DELETE FROM account_positions WHERE snapshot_id = ?", (int(snapshot_id),))
+            inserted = 0
+            for row in rows:
+                self.execute(
+                    """
+                    INSERT INTO account_positions(
+                        snapshot_id, market, symbol, quantity, avg_price, market_value_krw,
+                        currency, fx_rate, payload_json
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        int(snapshot_id),
+                        str(row.get("market", "")).upper(),
+                        str(row.get("symbol", "")).upper(),
+                        float(row.get("quantity", 0.0) or 0.0),
+                        float(row.get("avg_price", 0.0) or 0.0),
+                        float(row.get("market_value_krw", 0.0) or 0.0),
+                        str(row.get("currency", "KRW") or "KRW").upper(),
+                        float(row.get("fx_rate", 1.0) or 1.0),
+                        json.dumps(row.get("payload", {}), ensure_ascii=False),
+                    ),
+                )
+                inserted += 1
+            return inserted
+
+    def get_latest_account_snapshot(self, market_scope: str = "ALL") -> Optional[Dict[str, Any]]:
+        row = self.query_one(
+            """
+            SELECT *
+            FROM account_snapshots
+            WHERE market_scope = ?
+            ORDER BY created_at DESC, snapshot_id DESC
+            LIMIT 1
+            """,
+            (str(market_scope).upper(),),
+        )
+        if row is None:
+            return None
+        try:
+            row["payload"] = json.loads(str(row.pop("payload_json") or "{}"))
+        except Exception:
+            row["payload"] = {}
+        return row
+
+    def list_account_positions_by_snapshot(self, snapshot_id: int) -> List[Dict[str, Any]]:
+        rows = self.query_all(
+            """
+            SELECT *
+            FROM account_positions
+            WHERE snapshot_id = ?
+            ORDER BY market, symbol
+            """,
+            (int(snapshot_id),),
+        )
+        for row in rows:
+            try:
+                row["payload"] = json.loads(str(row.pop("payload_json") or "{}"))
+            except Exception:
+                row["payload"] = {}
+        return rows
+
+    def insert_reconcile_event(
+        self,
+        *,
+        check_type: str,
+        market_scope: str,
+        matched: bool,
+        detail: str,
+        expected: Dict[str, Any],
+        actual: Dict[str, Any],
+        created_at: str,
+    ) -> int:
+        with self.tx():
+            cur = self.execute(
+                """
+                INSERT INTO reconcile_events(
+                    check_type, market_scope, matched, detail, expected_json, actual_json, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(check_type),
+                    str(market_scope).upper(),
+                    1 if bool(matched) else 0,
+                    str(detail),
+                    json.dumps(expected, ensure_ascii=False),
+                    json.dumps(actual, ensure_ascii=False),
+                    str(created_at),
+                ),
+            )
+            return int(cur.lastrowid)
+
+    def get_latest_reconcile_event(self, market_scope: str = "ALL") -> Optional[Dict[str, Any]]:
+        row = self.query_one(
+            """
+            SELECT *
+            FROM reconcile_events
+            WHERE market_scope = ?
+            ORDER BY created_at DESC, reconcile_id DESC
+            LIMIT 1
+            """,
+            (str(market_scope).upper(),),
+        )
+        if row is None:
+            return None
+        try:
+            row["expected"] = json.loads(str(row.pop("expected_json") or "{}"))
+        except Exception:
+            row["expected"] = {}
+        try:
+            row["actual"] = json.loads(str(row.pop("actual_json") or "{}"))
+        except Exception:
+            row["actual"] = {}
+        row["matched"] = bool(row.get("matched", 0))
+        return row
+
+    def insert_shadow_intent(
+        self,
+        *,
+        proposal_id: Optional[int],
+        agent_id: str,
+        market: str,
+        session_date: str,
+        weight: float,
+        score: float,
+        orders: List[Dict[str, Any]],
+        rationale: str,
+        created_at: str,
+    ) -> int:
+        with self.tx():
+            cur = self.execute(
+                """
+                INSERT INTO shadow_intents(
+                    proposal_id, agent_id, market, session_date, weight, score, orders_json, rationale, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    None if proposal_id is None else int(proposal_id),
+                    str(agent_id),
+                    str(market).upper(),
+                    str(session_date),
+                    float(weight),
+                    float(score),
+                    json.dumps(list(orders or []), ensure_ascii=False),
+                    str(rationale),
+                    str(created_at),
+                ),
+            )
+            return int(cur.lastrowid)
+
+    def list_shadow_intents(
+        self,
+        *,
+        market: Optional[str] = None,
+        session_date: Optional[str] = None,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
+        limit: int = 500,
+    ) -> List[Dict[str, Any]]:
+        where: List[str] = []
+        params: List[Any] = []
+        if market:
+            where.append("market = ?")
+            params.append(str(market).upper())
+        if session_date:
+            where.append("session_date = ?")
+            params.append(str(session_date))
+        if date_from:
+            where.append("session_date >= ?")
+            params.append(str(date_from))
+        if date_to:
+            where.append("session_date <= ?")
+            params.append(str(date_to))
+        where_sql = f"WHERE {' AND '.join(where)}" if where else ""
+        rows = self.query_all(
+            f"""
+            SELECT *
+            FROM shadow_intents
+            {where_sql}
+            ORDER BY created_at DESC, shadow_intent_id DESC
+            LIMIT ?
+            """,
+            tuple(params + [int(limit)]),
+        )
+        for row in rows:
+            try:
+                row["orders"] = json.loads(str(row.pop("orders_json") or "[]"))
+            except Exception:
+                row["orders"] = []
+        return rows
+
+    def upsert_shadow_score(
+        self,
+        *,
+        agent_id: str,
+        as_of_date: str,
+        score: float,
+        return_pct: float,
+        risk_penalty: float,
+        sample_count: int,
+        created_at: str,
+    ) -> None:
+        with self.tx():
+            self.execute(
+                """
+                INSERT INTO shadow_scores(
+                    agent_id, as_of_date, score, return_pct, risk_penalty, sample_count, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(agent_id, as_of_date) DO UPDATE SET
+                    score=excluded.score,
+                    return_pct=excluded.return_pct,
+                    risk_penalty=excluded.risk_penalty,
+                    sample_count=excluded.sample_count,
+                    created_at=excluded.created_at
+                """,
+                (
+                    str(agent_id),
+                    str(as_of_date),
+                    float(score),
+                    float(return_pct),
+                    float(risk_penalty),
+                    int(sample_count),
+                    str(created_at),
+                ),
+            )
+
+    def get_latest_shadow_scores(self) -> Dict[str, Dict[str, Any]]:
+        rows = self.query_all(
+            """
+            SELECT ss.*
+            FROM shadow_scores ss
+            JOIN (
+                SELECT agent_id, MAX(as_of_date) AS max_date
+                FROM shadow_scores
+                GROUP BY agent_id
+            ) x ON x.agent_id = ss.agent_id AND x.max_date = ss.as_of_date
+            """
+        )
+        out: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            out[str(row.get("agent_id", ""))] = row
+        return out
+
+    def list_shadow_scores(
+        self,
+        *,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
+        limit: int = 5000,
+    ) -> List[Dict[str, Any]]:
+        where: List[str] = []
+        params: List[Any] = []
+        if date_from:
+            where.append("as_of_date >= ?")
+            params.append(str(date_from))
+        if date_to:
+            where.append("as_of_date <= ?")
+            params.append(str(date_to))
+        where_sql = f"WHERE {' AND '.join(where)}" if where else ""
+        return self.query_all(
+            f"""
+            SELECT *
+            FROM shadow_scores
+            {where_sql}
+            ORDER BY as_of_date DESC, shadow_score_id DESC
+            LIMIT ?
+            """,
+            tuple(params + [int(limit)]),
+        )
+
+    def insert_event_batch(
+        self,
+        *,
+        batch_key: str,
+        events: Dict[str, Any],
+        sent: bool,
+        created_at: str,
+        sent_at: Optional[str] = None,
+    ) -> int:
+        with self.tx():
+            cur = self.execute(
+                """
+                INSERT INTO event_batches(batch_key, events_json, sent, sent_at, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    str(batch_key),
+                    json.dumps(events, ensure_ascii=False),
+                    1 if bool(sent) else 0,
+                    None if not sent_at else str(sent_at),
+                    str(created_at),
+                ),
+            )
+            return int(cur.lastrowid)
+
+    def get_latest_event_batch(self, batch_key: str) -> Optional[Dict[str, Any]]:
+        row = self.query_one(
+            """
+            SELECT *
+            FROM event_batches
+            WHERE batch_key = ?
+            ORDER BY created_at DESC, event_batch_id DESC
+            LIMIT 1
+            """,
+            (str(batch_key),),
+        )
+        if row is None:
+            return None
+        try:
+            row["events"] = json.loads(str(row.pop("events_json") or "{}"))
+        except Exception:
+            row["events"] = {}
+        row["sent"] = bool(row.get("sent", 0))
+        return row
+
+    def list_unsent_event_batches(self, batch_key: str = "pending", limit: int = 500) -> List[Dict[str, Any]]:
+        rows = self.query_all(
+            """
+            SELECT *
+            FROM event_batches
+            WHERE batch_key = ? AND sent = 0
+            ORDER BY created_at ASC, event_batch_id ASC
+            LIMIT ?
+            """,
+            (str(batch_key), int(limit)),
+        )
+        for row in rows:
+            try:
+                row["events"] = json.loads(str(row.pop("events_json") or "{}"))
+            except Exception:
+                row["events"] = {}
+            row["sent"] = bool(row.get("sent", 0))
+        return rows
+
+    def mark_event_batches_sent(self, batch_ids: List[int], sent_at: str) -> int:
+        if not batch_ids:
+            return 0
+        placeholders = ",".join("?" for _ in batch_ids)
+        with self.tx():
+            cur = self.execute(
+                f"""
+                UPDATE event_batches
+                SET sent = 1, sent_at = ?
+                WHERE event_batch_id IN ({placeholders})
+                """,
+                tuple([str(sent_at)] + [int(x) for x in batch_ids]),
+            )
+            return int(cur.rowcount or 0)
+
+    def cleanup_legacy_runtime_state(
+        self,
+        *,
+        retain_days: int = 30,
+        shadow_retain_days: Optional[int] = None,
+        keep_agent_memories: int = 300,
+    ) -> Dict[str, int]:
         retain_days = max(1, int(retain_days))
+        if shadow_retain_days is None:
+            shadow_retain_days = retain_days
+        shadow_retain_days = max(1, int(shadow_retain_days))
         keep_agent_memories = max(50, int(keep_agent_memories))
         cutoff_dt = datetime.now() - timedelta(days=retain_days)
         cutoff_iso = cutoff_dt.isoformat(timespec="seconds")
         cutoff_date = cutoff_dt.strftime("%Y%m%d")
+        shadow_cutoff_dt = datetime.now() - timedelta(days=shadow_retain_days)
+        shadow_cutoff_date = shadow_cutoff_dt.strftime("%Y%m%d")
 
         legacy_payload_markers = [
             "%PENDING_APPROVAL%",
@@ -987,6 +1570,12 @@ class AgentLabStorage:
             "state_events_removed": 0,
             "daily_reviews_removed": 0,
             "agent_memories_trimmed": 0,
+            "account_snapshots_removed": 0,
+            "account_positions_removed": 0,
+            "reconcile_events_removed": 0,
+            "shadow_intents_removed": 0,
+            "shadow_scores_removed": 0,
+            "event_batches_removed": 0,
         }
 
         with self.tx():
@@ -1052,6 +1641,64 @@ class AgentLabStorage:
                 (cutoff_date,),
             )
             removed["daily_reviews_removed"] = int(cur.rowcount or 0)
+
+            stale_snapshots = self.query_all(
+                """
+                SELECT snapshot_id
+                FROM account_snapshots
+                WHERE created_at < ?
+                """,
+                (cutoff_iso,),
+            )
+            snapshot_ids = [int(row["snapshot_id"]) for row in stale_snapshots]
+            if snapshot_ids:
+                placeholders = ",".join("?" for _ in snapshot_ids)
+                cur = self.execute(
+                    f"DELETE FROM account_positions WHERE snapshot_id IN ({placeholders})",
+                    tuple(snapshot_ids),
+                )
+                removed["account_positions_removed"] = int(cur.rowcount or 0)
+                cur = self.execute(
+                    f"DELETE FROM account_snapshots WHERE snapshot_id IN ({placeholders})",
+                    tuple(snapshot_ids),
+                )
+                removed["account_snapshots_removed"] = int(cur.rowcount or 0)
+
+            cur = self.execute(
+                """
+                DELETE FROM reconcile_events
+                WHERE created_at < ?
+                """,
+                (cutoff_iso,),
+            )
+            removed["reconcile_events_removed"] = int(cur.rowcount or 0)
+
+            cur = self.execute(
+                """
+                DELETE FROM shadow_intents
+                WHERE session_date < ?
+                """,
+                (shadow_cutoff_date,),
+            )
+            removed["shadow_intents_removed"] = int(cur.rowcount or 0)
+
+            cur = self.execute(
+                """
+                DELETE FROM shadow_scores
+                WHERE as_of_date < ?
+                """,
+                (shadow_cutoff_date,),
+            )
+            removed["shadow_scores_removed"] = int(cur.rowcount or 0)
+
+            cur = self.execute(
+                """
+                DELETE FROM event_batches
+                WHERE created_at < ?
+                """,
+                (cutoff_iso,),
+            )
+            removed["event_batches_removed"] = int(cur.rowcount or 0)
 
             agents = self.query_all("SELECT agent_id FROM agents WHERE is_active = 1")
             for agent in agents:

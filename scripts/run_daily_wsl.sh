@@ -35,6 +35,74 @@ resolve_python_bin() {
   command -v python
 }
 
+is_truthy() {
+  local raw="${1:-}"
+  local normalized
+  normalized="$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]')"
+  case "$normalized" in
+    1|true|yes|on|y)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+telegram_daily_patch_enabled() {
+  local token chat_id enabled_raw notify_raw
+  token="$(printf '%s' "${TELEGRAM_BOT_TOKEN:-}" | xargs)"
+  chat_id="$(printf '%s' "${TELEGRAM_CHAT_ID:-}" | xargs)"
+  enabled_raw="${TELEGRAM_ENABLED:-}"
+  notify_raw="${AGENT_LAB_NOTIFY_DAILY_PATCH:-1}"
+  if ! is_truthy "$notify_raw"; then
+    return 1
+  fi
+  if [[ -n "$enabled_raw" ]] && ! is_truthy "$enabled_raw"; then
+    return 1
+  fi
+  [[ -n "$token" && -n "$chat_id" ]]
+}
+
+send_telegram_notice() {
+  local text="${1:-}"
+  if [[ -z "$text" ]]; then
+    return 0
+  fi
+  if ! telegram_daily_patch_enabled; then
+    return 0
+  fi
+
+  local token chat_id thread_id
+  token="$(printf '%s' "${TELEGRAM_BOT_TOKEN:-}" | xargs)"
+  chat_id="$(printf '%s' "${TELEGRAM_CHAT_ID:-}" | xargs)"
+  thread_id="$(printf '%s' "${TELEGRAM_THREAD_ID:-}" | xargs)"
+
+  local -a curl_cmd=(
+    curl -sS --max-time 10 --retry 1 --retry-delay 1
+    -X POST "https://api.telegram.org/bot${token}/sendMessage"
+    --data-urlencode "chat_id=${chat_id}"
+    --data-urlencode "text=${text}"
+  )
+  if [[ -n "$thread_id" ]]; then
+    curl_cmd+=(--data-urlencode "message_thread_id=${thread_id}")
+  fi
+  if is_truthy "${TELEGRAM_DISABLE_NOTIFICATION:-0}"; then
+    curl_cmd+=(--data-urlencode "disable_notification=true")
+  fi
+
+  if is_truthy "${AGENT_LAB_TELEGRAM_USE_ENV_PROXY:-0}"; then
+    "${curl_cmd[@]}" >/dev/null 2>&1 || true
+  else
+    env \
+      -u http_proxy -u https_proxy \
+      -u HTTP_PROXY -u HTTPS_PROXY \
+      -u all_proxy -u ALL_PROXY \
+      -u no_proxy -u NO_PROXY \
+      "${curl_cmd[@]}" >/dev/null 2>&1 || true
+  fi
+}
+
 PYTHON_BIN="$(resolve_python_bin)"
 MARKET="KR"
 US_EXCHANGE="NASD"
@@ -99,6 +167,7 @@ mkdir -p "$OUT_BASE" "$LOG_DIR" "$RESULTS_DIR"
 
 OUTPUT_JSON="$RESULTS_DIR/${MARKET_LC}_daily_${RUN_STAMP}.json"
 LOG_FILE="$LOG_DIR/${MARKET_LC}_daily_${RUN_STAMP}.log"
+RUN_START_EPOCH="$(date +%s)"
 
 CMD=(
   "$PYTHON_BIN" -u main.py
@@ -124,10 +193,58 @@ if [[ ${#EXTRA_ARGS[@]} -gt 0 ]]; then
   CMD+=("${EXTRA_ARGS[@]}")
 fi
 
+notify_daily_patch_start() {
+  local now_kst
+  now_kst="$(TZ=Asia/Seoul date '+%F %T %Z')"
+  local msg
+  msg=$'[이벤트] [AgentLab] 일일 패치 시작\n'
+  msg+=$'시장='"$MARKET"$'\n'
+  msg+=$'일자='"$RUN_DATE"$'\n'
+  msg+=$'시각='"$now_kst"$'\n'
+  msg+=$'로그='"$LOG_FILE"
+  send_telegram_notice "$msg"
+}
+
+notify_daily_patch_end() {
+  local exit_code="${1:-0}"
+  local now_kst elapsed result title
+  now_kst="$(TZ=Asia/Seoul date '+%F %T %Z')"
+  elapsed="$(( $(date +%s) - RUN_START_EPOCH ))"
+  if [[ "$exit_code" -eq 0 ]]; then
+    result="성공"
+    title="[이벤트] [AgentLab] 일일 패치 종료"
+  else
+    result="실패"
+    title="[Action required] [AgentLab] 일일 패치 실패"
+  fi
+
+  local msg
+  msg="$title"$'\n'
+  msg+=$'시장='"$MARKET"$'\n'
+  msg+=$'일자='"$RUN_DATE"$'\n'
+  msg+=$'시각='"$now_kst"$'\n'
+  msg+=$'결과='"$result"$'\n'
+  msg+=$'종료코드='"$exit_code"$'\n'
+  msg+=$'경과시간='"${elapsed}"$'s\n'
+  msg+=$'결과파일='"$OUTPUT_JSON"$'\n'
+  msg+=$'로그='"$LOG_FILE"
+  send_telegram_notice "$msg"
+}
+
+on_script_exit() {
+  local rc=$?
+  trap - EXIT
+  notify_daily_patch_end "$rc"
+}
+
+trap on_script_exit EXIT
+
 {
   echo "[run_daily_wsl] started $(TZ=Asia/Seoul date '+%F %T %Z')"
   echo "[run_daily_wsl] python: $PYTHON_BIN"
   echo "[run_daily_wsl] command: ${CMD[*]}"
 } | tee -a "$LOG_FILE"
+
+notify_daily_patch_start
 
 "${CMD[@]}" 2>&1 | tee -a "$LOG_FILE"

@@ -46,6 +46,18 @@ pip install -r requirements.txt
   - 기본값: `trade_executed,preopen_plan,session_close_report,weekly_council`
   - 이 목록에 없는 이벤트는 텔레그램 푸시를 보내지 않습니다.
 
+통합 포트폴리오 + 서버 동기화:
+- `AGENT_LAB_EXECUTION_MODEL=unified_shadow`
+  - 단일 통합 포트폴리오로 실제 주문을 집행하고, 에이전트별 제안은 섀도우 의사결정으로 기록합니다.
+- `AGENT_LAB_SYNC_STRICT=1`
+  - 데몬/주문 경로에서 서버 계좌와 로컬 상태 불일치 시 주문을 차단합니다.
+- `AGENT_LAB_SYNC_MISMATCH_BLOCK=1`
+  - 불일치 시 즉시 차단 + Action required 알림을 보냅니다.
+- `AGENT_LAB_EVENT_BATCH_ENABLED=1`
+  - 일반 이벤트는 30분 배치 요약으로 전송합니다.
+- `AGENT_LAB_EVENT_BATCH_MINUTES=30`
+- `AGENT_LAB_EVENT_BATCH_MAX_ITEMS=30`
+
 정규장 시간 강제(거래 안전장치):
 - `AGENT_LAB_ENFORCE_MARKET_HOURS=1`이면 KR(09:00~15:35 KST), US(09:30~16:05 ET) 외 시간에는 주문 제안/실행을 차단합니다.
 
@@ -71,6 +83,8 @@ chmod +x scripts/*.sh
 동작 요약:
 - `reset_tasks_preserve_state_wsl.sh`는 내부적으로 `remove_all_tasks_wsl.sh` + `register_all_tasks_wsl.sh`를 실행합니다.
 - `INIT_AGENT_LAB=0`으로 동작하므로 기존 자본/전략/메모리 상태는 유지하고 크론/데몬만 재등록·재기동합니다.
+- 추가로 `cron` 데몬 생존 여부를 점검하고, 죽어 있으면 자동 시작을 시도합니다(필요 시 `sudo` 비밀번호 입력).
+- `cron` 시작 실패 시 reset은 오류로 종료되어, "등록은 됐지만 실행은 안 되는" 상태를 막습니다.
 
 모니터링(실행 중 상태 확인):
 
@@ -117,6 +131,9 @@ ps -ef | grep run_agent_lab_wsl.sh | grep -v grep
 - `auto-strategy-daemon`은 기본값에서 주간회의를 임의 호출하지 않습니다.
 - 주간회의/주간보고는 위 일요일 스케줄 태스크가 담당합니다.
 - WSL(Ubuntu) `cron`은 작업별 타임존 실행을 지원하지 않으므로, US 작업은 KST에서 DST/비DST 후보 시각 2개에 등록하고 ET 시각 일치 조건으로 실제 실행을 게이트합니다.
+- 프리패치는 기본적으로 KR `universe=180`, `scan=240`으로 제한되어 API 부하/타임아웃을 줄입니다.
+- 크론 프리패치가 실패/누락되어도 `auto-strategy-daemon`이 장중 리프레시 직전에 온디맨드 프리패치를 1회 보강 시도합니다.
+- 조정 변수: `AGENT_LAB_PREFETCH_KR_UNIVERSE_SIZE`, `AGENT_LAB_PREFETCH_KR_MAX_SYMBOLS_SCAN`, `AGENT_LAB_PREFETCH_TIMEOUT_SEC`.
 
 전략 승격 규칙(주간회의):
 - 일반 승격: `점수>=0.60` 2주 연속 + `리스크 위반<=3회` + `위반율<=15%` + `주간 제안수>=10`
@@ -142,7 +159,7 @@ ps -ef | grep run_agent_lab_wsl.sh | grep -v grep
 4. US 개장/마감도 2~3과 동일
 5. 주간 에이전트 토의 보고
 
-그 외 이벤트(하트비트, 데몬 시작, 장중 모니터링 등)는 기본적으로 텔레그램 푸시를 보내지 않습니다.
+그 외 이벤트(하트비트, 데몬 시작, 장중 모니터링 등)는 즉시 푸시하지 않고 배치 요약으로 전송합니다.
 설명이 필요한 보고(개장 전 플랜, 장 종료 후 결과/토의, 주간 토의 요약)는 OpenAI LLM이 활성화된 경우 LLM 설명문을 함께 생성합니다.
 
 ## 7. 텔레그램 명령어
@@ -184,6 +201,15 @@ ps -ef | grep run_agent_lab_wsl.sh | grep -v grep
 # 데몬
 ./scripts/run_agent_lab_wsl.sh --action telegram-chat
 ./scripts/run_agent_lab_wsl.sh --action auto-strategy-daemon
+
+# 서버 계좌 동기화(강제 모드)
+./scripts/run_agent_lab_wsl.sh --action sync-account --market ALL
+
+# 섀도우 성과 리포트
+./scripts/run_agent_lab_wsl.sh --action shadow-report --from YYYYMMDD --to YYYYMMDD
+
+# 컷오버 리셋(평탄화 완료 후 수동 실행)
+/home/heesu/anaconda3/envs/systematic-alpha/bin/python -m systematic_alpha.agent_lab.cli --project-root . cutover-reset --require-flat --archive --reinit --restart-tasks
 ```
 
 ## 9. 경로
@@ -194,6 +220,7 @@ ps -ef | grep run_agent_lab_wsl.sh | grep -v grep
 - 산출물: `out/agent_lab/YYYYMMDD/`
 - 주간 산출물: `out/agent_lab/YYYYMMDD_weekly/`
 - 로그: `logs/agent_lab/YYYYMMDD/`, `logs/cron/`
+- 컷오버 아카이브: `archive/agent_lab/<timestamp>/`
 
 ## 10. 트러블슈팅
 

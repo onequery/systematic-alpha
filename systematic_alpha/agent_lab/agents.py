@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import os
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from systematic_alpha.agent_lab.llm_client import LLMClient
@@ -13,6 +14,10 @@ from systematic_alpha.agent_lab.schemas import (
     ProposedOrder,
 )
 from systematic_alpha.agent_lab.strategy_registry import ALLOWED_PARAM_RANGES, StrategyRegistry
+
+
+def now_iso() -> str:
+    return datetime.now().isoformat(timespec="seconds")
 
 
 def _safe_float(value: Any, default: float) -> float:
@@ -272,6 +277,43 @@ class AgentDecisionEngine:
         return _truthy(os.getenv("AGENT_LAB_MAX_FREEDOM", "1"))
 
     @staticmethod
+    def _rotation_streak_threshold() -> int:
+        try:
+            raw = int(float(os.getenv("AGENT_LAB_ROTATION_FORCE_SELL_STREAK", "3") or 3))
+        except Exception:
+            raw = 3
+        return max(1, min(100, raw))
+
+    @staticmethod
+    def _rotation_sell_on_missing_rank() -> bool:
+        return _truthy(os.getenv("AGENT_LAB_ROTATION_SELL_ON_MISSING_RANK", "1"))
+
+    def _rotation_streak_key(self, agent_id: str, market: str, symbol: str) -> str:
+        aid = str(agent_id or "").strip().lower()
+        mkt = str(market or "").strip().upper()
+        sym = str(symbol or "").strip().upper()
+        return f"rotation_outside_target_streak:{aid}:{mkt}:{sym}"
+
+    def _get_rotation_streak(self, agent_id: str, market: str, symbol: str) -> int:
+        key = self._rotation_streak_key(agent_id, market, symbol)
+        try:
+            raw = self.registry.storage.get_system_meta(key, "0")
+            return max(0, int(float(raw or 0)))
+        except Exception:
+            return 0
+
+    def _set_rotation_streak(self, agent_id: str, market: str, symbol: str, value: int) -> None:
+        key = self._rotation_streak_key(agent_id, market, symbol)
+        try:
+            self.registry.storage.upsert_system_meta(
+                meta_key=key,
+                meta_value=str(max(0, int(value))),
+                updated_at=now_iso(),
+            )
+        except Exception:
+            pass
+
+    @staticmethod
     def _candidate_pass_count(candidate: Dict[str, Any], params: Dict[str, Any]) -> int:
         th_change = float(params.get("min_change_pct", 0.0) or 0.0)
         th_gap = float(params.get("min_gap_pct", 0.0) or 0.0)
@@ -356,6 +398,8 @@ class AgentDecisionEngine:
         allow_rotation_sell = (not max_freedom) or _truthy(os.getenv("AGENT_LAB_ENABLE_ROTATION_SELL", "0"))
         rotation_drop_rank = int(float(os.getenv("AGENT_LAB_ROTATION_DROP_RANK", str(max(10, max_picks * 2))) or max(10, max_picks * 2)))
         rotation_drop_score = float(os.getenv("AGENT_LAB_ROTATION_DROP_SCORE", "45") or 45.0)
+        rotation_force_streak = self._rotation_streak_threshold()
+        rotation_sell_missing_rank = self._rotation_sell_on_missing_rank()
         allow_add_to_held = max_freedom or _truthy(os.getenv("AGENT_LAB_ALLOW_ADD_TO_HELD", "0"))
         expand_pool = max_freedom or _truthy(os.getenv("AGENT_LAB_EXPAND_BUY_POOL", "1"))
 
@@ -380,6 +424,19 @@ class AgentDecisionEngine:
         orders: List[ProposedOrder] = []
         sell_symbols: set[str] = set()
 
+        # Track how long each held symbol stays outside current target set.
+        outside_streak_by_symbol: Dict[str, int] = {}
+        for sym in held_symbols.keys():
+            if not sym:
+                continue
+            if sym in target_symbols:
+                self._set_rotation_streak(agent.agent_id, market_norm, sym, 0)
+                outside_streak_by_symbol[sym] = 0
+            else:
+                nxt = self._get_rotation_streak(agent.agent_id, market_norm, sym) + 1
+                self._set_rotation_streak(agent.agent_id, market_norm, sym, nxt)
+                outside_streak_by_symbol[sym] = nxt
+
         # Rotate out stale symbols.
         for sym, row in held_symbols.items():
             if sym in target_symbols:
@@ -387,13 +444,24 @@ class AgentDecisionEngine:
             if not allow_rotation_sell:
                 continue
             rank_row = ranked_by_code.get(sym)
+            outside_streak = int(outside_streak_by_symbol.get(sym, 0) or 0)
+            force_reason = ""
             if max_freedom:
                 should_sell = False
+                if rank_row is None and rotation_sell_missing_rank:
+                    should_sell = True
+                    force_reason = "missing_rank"
+                if outside_streak >= rotation_force_streak:
+                    should_sell = True
+                    if not force_reason:
+                        force_reason = f"outside_target_streak={outside_streak}"
                 if rank_row:
                     rank_val = int(rank_row.get("rank", 999999) or 999999)
                     score_val = float(rank_row.get("recommendation_score", 0.0) or 0.0)
                     if rank_val >= rotation_drop_rank or score_val <= rotation_drop_score:
                         should_sell = True
+                        if not force_reason:
+                            force_reason = f"rank={rank_val},score={score_val:.2f}"
                 if not should_sell:
                     continue
             qty = float(row.get("quantity", 0.0) or 0.0)
@@ -401,6 +469,10 @@ class AgentDecisionEngine:
             if qty <= 0 or ref_price_krw <= 0:
                 continue
             ref_price_local = ref_price_krw if market_norm != "US" else (ref_price_krw / fx_rate)
+            rotation_score = 100.0 if force_reason else 60.0
+            reason_text = "outside current target set."
+            if force_reason:
+                reason_text = f"outside current target set ({force_reason})."
             orders.append(
                 ProposedOrder(
                     market=market,
@@ -411,9 +483,9 @@ class AgentDecisionEngine:
                     limit_price=None,
                     reference_price=float(ref_price_local),
                     signal_rank=0,
-                    recommendation_score=0.0,
+                    recommendation_score=float(rotation_score),
                     rationale=(
-                        f"{agent.name} rotation sell: symbol={sym} is outside current target set."
+                        f"{agent.name} rotation sell: symbol={sym} is {reason_text}"
                     ),
                 )
             )

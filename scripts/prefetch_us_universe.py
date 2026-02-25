@@ -79,7 +79,12 @@ def main() -> int:
         description="Prefetch and cache US objective universe (S&P 500 constituents)."
     )
     parser.add_argument("--project-root", type=str, default=".")
-    parser.add_argument("--output-csv", type=str, default=None)
+    parser.add_argument(
+        "--output-csv",
+        type=str,
+        default=None,
+        help="Output CSV path (backward compatible; previously used by cron).",
+    )
     parser.add_argument("--source-url", type=str, default=DEFAULT_SOURCE_URL)
     parser.add_argument("--min-count", type=int, default=450)
     args = parser.parse_args()

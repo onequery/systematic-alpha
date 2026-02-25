@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -331,6 +332,131 @@ class AgentLabOrchestratorTests(unittest.TestCase):
                     eval_row = dict((decision.get("promotion_evaluation", {}) or {}).get(aid, {}))
                     self.assertTrue(bool(eval_row.get("applied_immediately")))
                     self.assertIn(str(eval_row.get("mode", "")), {"immediate_promote", "forced_conservative_promote"})
+            finally:
+                orch.close()
+
+    def test_sync_account_strict_blocks_when_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            orch = AgentLabOrchestrator(project_root=root)
+            try:
+                orch.init_lab(capital_krw=10_000_000, agents=1)
+                fake_snapshot = {
+                    "ok": True,
+                    "market_scope": "ALL",
+                    "source": "test",
+                    "fetched_at": "2026-02-23T09:00:00+09:00",
+                    "cash_krw": 1_000_000.0,
+                    "equity_krw": 1_500_000.0,
+                    "positions": [
+                        {
+                            "market": "KR",
+                            "symbol": "005930",
+                            "quantity": 3.0,
+                            "avg_price": 70000.0,
+                            "market_value_krw": 210000.0,
+                            "currency": "KRW",
+                            "fx_rate": 1.0,
+                            "payload": {},
+                        }
+                    ],
+                    "markets": {"KR": {}, "US": {}},
+                    "errors": [],
+                }
+                with patch.object(orch.paper_broker, "fetch_account_snapshot", return_value=fake_snapshot):
+                    out = orch.sync_account(market="ALL", strict=True)
+                self.assertTrue(out.get("ok"))
+                self.assertFalse(out.get("matched"))
+                self.assertTrue(out.get("blocked"))
+            finally:
+                orch.close()
+
+    def test_cutover_reset_archives_and_reinitializes(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            run_date = "20260218"
+            _write_signal_file(root, "KR", run_date)
+            orch = AgentLabOrchestrator(project_root=root)
+            try:
+                orch.init_lab(capital_krw=9_000_000, agents=3)
+                fake_snapshot = {
+                    "ok": True,
+                    "market_scope": "ALL",
+                    "source": "test",
+                    "fetched_at": "2026-02-23T09:00:00+09:00",
+                    "cash_krw": 9_000_000.0,
+                    "equity_krw": 9_000_000.0,
+                    "positions": [],
+                    "markets": {"KR": {}, "US": {}},
+                    "errors": [],
+                }
+                with patch.object(orch.paper_broker, "fetch_account_snapshot", return_value=fake_snapshot):
+                    payload = orch.cutover_reset(
+                        require_flat=True,
+                        archive=True,
+                        reinit=True,
+                        restart_tasks=False,
+                    )
+                self.assertIn("new_epoch_id", payload)
+                self.assertTrue(payload.get("archive"))
+                archive_root = Path(str(payload.get("archive_root", "")))
+                self.assertTrue(archive_root.exists())
+                agents = orch.storage.list_agents()
+                self.assertEqual(3, len(agents))
+            finally:
+                orch.close()
+
+    def test_unified_shadow_propose_generates_unified_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            run_date = "20260218"
+            _write_signal_file(root, "KR", run_date)
+            orch = AgentLabOrchestrator(project_root=root)
+            try:
+                with patch.dict(
+                    os.environ,
+                    {
+                        "AGENT_LAB_EXECUTION_MODEL": "unified_shadow",
+                        "AGENT_LAB_ENFORCE_MARKET_HOURS": "0",
+                        "AGENT_LAB_SYNC_STRICT": "1",
+                    },
+                ):
+                    orch.init_lab(capital_krw=10_000_000, agents=3)
+                    orch.ingest_session(market="KR", yyyymmdd=run_date)
+                    fake_snapshot = {
+                        "ok": True,
+                        "market_scope": "ALL",
+                        "source": "test",
+                        "fetched_at": "2026-02-23T09:00:00+09:00",
+                        "cash_krw": 10_000_000.0,
+                        "equity_krw": 10_000_000.0,
+                        "positions": [],
+                        "markets": {"KR": {}, "US": {}},
+                        "errors": [],
+                    }
+                    with patch.object(orch.paper_broker, "fetch_account_snapshot", return_value=fake_snapshot):
+                        with patch.object(
+                            orch.paper_broker,
+                            "execute_orders",
+                            return_value=[
+                                {
+                                    "paper_order_id": 1,
+                                    "symbol": "005930",
+                                    "side": "BUY",
+                                    "status": "FILLED",
+                                    "reference_price": 70000.0,
+                                    "quantity": 1.0,
+                                    "fx_rate": 1.0,
+                                }
+                            ],
+                        ):
+                            payload = orch.propose_orders(market="KR", yyyymmdd=run_date)
+                self.assertEqual("unified_shadow", payload.get("execution_model"))
+                unified = payload.get("unified_execution", {})
+                self.assertTrue(bool(unified))
+                self.assertIn(unified.get("status"), {"APPROVED", "EXECUTED", "BLOCKED"})
+                self.assertIn("shadow_proposals", payload)
+                self.assertEqual(3, len(payload.get("shadow_proposals", [])))
             finally:
                 orch.close()
 
