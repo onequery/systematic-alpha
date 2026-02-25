@@ -112,6 +112,9 @@ class AutoStrategyDaemon:
         self.event_batch_enabled = _truthy(os.getenv("AGENT_LAB_EVENT_BATCH_ENABLED", "1"))
         self.event_batch_minutes = max(1, int(float(os.getenv("AGENT_LAB_EVENT_BATCH_MINUTES", "30") or 30)))
         self.event_batch_max_items = max(1, int(float(os.getenv("AGENT_LAB_EVENT_BATCH_MAX_ITEMS", "30") or 30)))
+        self.daemon_scheduled_reports_enabled = _truthy(
+            os.getenv("AGENT_LAB_DAEMON_SCHEDULED_REPORTS", "0")
+        )
         self.runtime_retention_days = max(
             1,
             int(float(os.getenv("AGENT_LAB_RUNTIME_RETENTION_DAYS", "30") or 30)),
@@ -976,6 +979,8 @@ class AutoStrategyDaemon:
         return now_kst
 
     def _run_scheduled_reports(self, now_kst: datetime) -> Dict[str, List[Dict[str, Any]]]:
+        if not self.daemon_scheduled_reports_enabled:
+            return {}
         # Safety net: generate preopen/close reports from daemon even if cron is down.
         out: Dict[str, List[Dict[str, Any]]] = {}
         for market in ("KR", "US"):

@@ -65,6 +65,13 @@ def parse_args() -> argparse.Namespace:
     p_sync.add_argument("--market", type=str, choices=["KR", "US", "ALL", "kr", "us", "all"], default="ALL")
     p_sync.add_argument("--strict", action="store_true")
 
+    p_reconcile = sub.add_parser("reconcile-submitted")
+    p_reconcile.add_argument("--market", type=str, choices=["KR", "US", "ALL", "kr", "us", "all"], default="ALL")
+    p_reconcile.add_argument("--max-age-sec", type=int, default=1800)
+    p_reconcile.add_argument("--apply", action="store_true")
+    p_reconcile.add_argument("--close-status", type=str, default="REJECTED")
+    p_reconcile.add_argument("--reason", type=str, default="manual_reconcile_submitted")
+
     p_cutover = sub.add_parser("cutover-reset")
     p_cutover.add_argument("--require-flat", action="store_true")
     p_cutover.add_argument("--archive", action="store_true")
@@ -175,6 +182,14 @@ def main() -> None:
             payload = orchestrator.sync_account(
                 market=str(args.market).upper(),
                 strict=bool(args.strict),
+            )
+        elif cmd == "reconcile-submitted":
+            payload = orchestrator.reconcile_submitted_orders(
+                market=str(args.market).upper(),
+                max_age_sec=int(args.max_age_sec),
+                apply=bool(args.apply),
+                close_status=str(args.close_status),
+                reason=str(args.reason),
             )
         elif cmd == "cutover-reset":
             payload = orchestrator.cutover_reset(

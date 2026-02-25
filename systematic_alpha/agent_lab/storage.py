@@ -211,6 +211,16 @@ class AgentLabStorage:
                 CREATE INDEX IF NOT EXISTS idx_state_events_type_ts
                     ON state_events(event_type, created_at DESC);
 
+                CREATE TABLE IF NOT EXISTS report_dispatch_locks (
+                    lock_key TEXT PRIMARY KEY,
+                    event_type TEXT NOT NULL,
+                    market TEXT NOT NULL,
+                    report_date TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_report_dispatch_locks_event_date
+                    ON report_dispatch_locks(event_type, market, report_date, created_at DESC);
+
                 CREATE TABLE IF NOT EXISTS account_snapshots (
                     snapshot_id INTEGER PRIMARY KEY AUTOINCREMENT,
                     epoch_id TEXT NOT NULL,
@@ -326,6 +336,33 @@ class AgentLabStorage:
                 """,
                 (event_type, json.dumps(payload, ensure_ascii=False), created_at),
             )
+
+    def try_claim_report_dispatch(
+        self,
+        *,
+        event_type: str,
+        market: str,
+        report_date: str,
+        created_at: str,
+    ) -> bool:
+        lock_key = f"{str(event_type).strip().lower()}:{str(market).strip().upper()}:{str(report_date).strip()}"
+        with self.tx():
+            cur = self.execute(
+                """
+                INSERT OR IGNORE INTO report_dispatch_locks(
+                    lock_key, event_type, market, report_date, created_at
+                )
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    lock_key,
+                    str(event_type).strip().lower(),
+                    str(market).strip().upper(),
+                    str(report_date).strip(),
+                    str(created_at),
+                ),
+            )
+            return int(cur.rowcount or 0) > 0
 
     def upsert_agent(
         self,
@@ -697,6 +734,26 @@ class AgentLabStorage:
                 WHERE paper_order_id = ?
                 """,
                 (status, int(paper_order_id)),
+            )
+
+    def update_paper_order_status_with_response(
+        self,
+        paper_order_id: int,
+        status: str,
+        broker_response_json: Dict[str, Any],
+    ) -> None:
+        with self.tx():
+            self.execute(
+                """
+                UPDATE paper_orders
+                SET status = ?, broker_response_json = ?
+                WHERE paper_order_id = ?
+                """,
+                (
+                    str(status),
+                    json.dumps(broker_response_json, ensure_ascii=False),
+                    int(paper_order_id),
+                ),
             )
 
     def insert_paper_fill(

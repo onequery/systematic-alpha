@@ -213,10 +213,19 @@ class PaperBroker:
             return None
 
     def _send_order(self, market: str, order: Dict[str, Any]) -> Dict[str, Any]:
+        market_upper = str(market or "").strip().upper()
         symbol = str(order["symbol"])
         qty = int(float(order["quantity"]))
         order_type = str(order.get("order_type", "MARKET")).upper()
         side = str(order.get("side", "BUY")).upper()
+        effective_order_type = str(order_type)
+        effective_limit_price: float | None = None
+        if market_upper == "US" and order_type == "MARKET" and self._env_bool("AGENT_LAB_US_MARKET_AS_AGGRESSIVE_LIMIT", True):
+            ref_price = self._to_float(order.get("reference_price"), 0.0)
+            aggressive_px = self._compute_us_aggressive_limit(side=side, ref_price=ref_price)
+            if aggressive_px is not None and aggressive_px > 0:
+                effective_order_type = "LIMIT"
+                effective_limit_price = aggressive_px
         attempts: List[Dict[str, Any]] = []
         for exchange_code in self._exchange_candidates(market):
             broker = self._get_broker(market, exchange_code)
@@ -224,8 +233,14 @@ class PaperBroker:
                 attempts.append({"exchange": exchange_code, "ok": False, "reason": "broker_unavailable"})
                 continue
             try:
-                if order_type == "LIMIT":
-                    px = int(float(order.get("limit_price") or order.get("reference_price") or 0))
+                if effective_order_type == "LIMIT":
+                    raw_px = effective_limit_price
+                    if raw_px is None:
+                        raw_px = self._to_float(order.get("limit_price") or order.get("reference_price"), 0.0)
+                    if market_upper == "US":
+                        px = float(max(0.0001, round(float(raw_px), 4)))
+                    else:
+                        px = int(max(1, round(float(raw_px))))
                     if side == "BUY":
                         resp = self._call_with_rate_limit_retry(
                             lambda b=broker, s=symbol, p=px, q=qty: b.create_limit_buy_order(s, p, q),
@@ -251,11 +266,24 @@ class PaperBroker:
                 if api_err:
                     attempts.append({"exchange": exchange_code, "ok": False, "reason": api_err})
                     continue
-                return {"ok": True, "response": resp, "exchange": exchange_code, "attempts": attempts}
+                return {
+                    "ok": True,
+                    "response": resp,
+                    "exchange": exchange_code,
+                    "attempts": attempts,
+                    "effective_order_type": effective_order_type,
+                    "effective_limit_price": effective_limit_price,
+                }
             except Exception as exc:
                 attempts.append({"exchange": exchange_code, "ok": False, "reason": repr(exc)})
                 continue
-        return {"ok": False, "reason": "all_exchange_attempts_failed", "attempts": attempts}
+        return {
+            "ok": False,
+            "reason": "all_exchange_attempts_failed",
+            "attempts": attempts,
+            "effective_order_type": effective_order_type,
+            "effective_limit_price": effective_limit_price,
+        }
 
     @staticmethod
     def _to_float(value: Any, default: float = 0.0) -> float:
@@ -537,6 +565,28 @@ class PaperBroker:
         value = min(maximum, value)
         return value
 
+    @staticmethod
+    def _env_bool(name: str, default: bool) -> bool:
+        raw = str(os.getenv(name, "1" if default else "0") or "").strip().lower()
+        if not raw:
+            return bool(default)
+        return raw in {"1", "true", "yes", "y", "on"}
+
+    def _compute_us_aggressive_limit(self, *, side: str, ref_price: float) -> float | None:
+        px = float(ref_price or 0.0)
+        if px <= 0:
+            return None
+        buy_bps = self._env_float("AGENT_LAB_US_AGGRESSIVE_BUY_BPS", 120.0, 1.0, 5000.0)
+        sell_bps = self._env_float("AGENT_LAB_US_AGGRESSIVE_SELL_BPS", 120.0, 1.0, 5000.0)
+        side_upper = str(side or "").strip().upper()
+        if side_upper == "BUY":
+            out = px * (1.0 + (buy_bps / 10000.0))
+            return round(max(0.0001, out), 4)
+        if side_upper == "SELL":
+            out = px * (1.0 - (sell_bps / 10000.0))
+            return round(max(0.0001, out), 4)
+        return None
+
     def _call_with_rate_limit_retry(self, fn: Any, *, op_name: str) -> Any:
         rate_retries = self._env_int("AGENT_LAB_BROKER_RATE_LIMIT_RETRIES", 2, 0, 10)
         rate_base_delay = self._env_float("AGENT_LAB_BROKER_RATE_LIMIT_BACKOFF_SEC", 1.2, 0.0, 60.0)
@@ -665,6 +715,110 @@ class PaperBroker:
 
         raise RuntimeError("; ".join(fallback_errors))
 
+    @staticmethod
+    def _merge_us_exchange_snapshots(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+        by_symbol: Dict[str, Dict[str, Any]] = {}
+        cash_candidates: List[float] = []
+        equity_candidates: List[float] = []
+        raw_by_exchange: Dict[str, Any] = {}
+        for item in rows:
+            if not isinstance(item, dict):
+                continue
+            exchange = str(item.get("exchange", "")).strip().upper()
+            parsed = item.get("parsed", {}) if isinstance(item.get("parsed"), dict) else {}
+            payload = item.get("payload", {}) if isinstance(item.get("payload"), dict) else {}
+            if exchange:
+                raw_by_exchange[exchange] = payload
+            cash = float(parsed.get("cash_krw", 0.0) or 0.0)
+            equity = float(parsed.get("equity_krw", 0.0) or 0.0)
+            if cash >= 0:
+                cash_candidates.append(cash)
+            if equity >= 0:
+                equity_candidates.append(equity)
+            for pos in list(parsed.get("positions", []) or []):
+                if not isinstance(pos, dict):
+                    continue
+                symbol = str(pos.get("symbol", "")).strip().upper()
+                qty = float(pos.get("quantity", 0.0) or 0.0)
+                if not symbol or qty <= 0:
+                    continue
+                avg = float(pos.get("avg_price", 0.0) or 0.0)
+                mv = float(pos.get("market_value_krw", 0.0) or 0.0)
+                fx = float(pos.get("fx_rate", 1.0) or 1.0)
+                ccy = str(pos.get("currency", "USD") or "USD").strip().upper()
+                st = by_symbol.setdefault(
+                    symbol,
+                    {
+                        "market": "US",
+                        "symbol": symbol,
+                        "quantity": 0.0,
+                        "avg_cost_krw": 0.0,
+                        "market_value_krw": 0.0,
+                        "fx_num": 0.0,
+                        "fx_den": 0.0,
+                        "currency": ccy,
+                    },
+                )
+                st["quantity"] += qty
+                st["avg_cost_krw"] += qty * avg
+                st["market_value_krw"] += max(0.0, mv)
+                st["fx_num"] += qty * max(0.0, fx)
+                st["fx_den"] += qty
+        positions: List[Dict[str, Any]] = []
+        for st in by_symbol.values():
+            qty = float(st.get("quantity", 0.0) or 0.0)
+            if qty <= 0:
+                continue
+            avg_price = float(st.get("avg_cost_krw", 0.0) or 0.0) / qty if qty > 0 else 0.0
+            fx_rate = float(st.get("fx_num", 0.0) or 0.0) / float(st.get("fx_den", 0.0) or 1.0)
+            if fx_rate <= 0:
+                fx_rate = 1.0
+            positions.append(
+                {
+                    "market": "US",
+                    "symbol": str(st.get("symbol", "")).strip().upper(),
+                    "quantity": qty,
+                    "avg_price": avg_price,
+                    "market_value_krw": float(st.get("market_value_krw", 0.0) or 0.0),
+                    "currency": str(st.get("currency", "USD")),
+                    "fx_rate": fx_rate,
+                    "payload": {"source": "merged_us_exchange_snapshots"},
+                }
+            )
+        cash_krw = max(cash_candidates) if cash_candidates else 0.0
+        equity_krw = max(equity_candidates) if equity_candidates else cash_krw
+        return {
+            "market": "US",
+            "cash_krw": float(cash_krw),
+            "equity_krw": float(max(equity_krw, cash_krw)),
+            "positions": positions,
+            "raw": {"by_exchange": raw_by_exchange},
+        }
+
+    def _fetch_us_snapshot_all_exchanges(self) -> Dict[str, Any]:
+        errors: List[str] = []
+        snapshots: List[Dict[str, Any]] = []
+        spacing = self._env_float("AGENT_LAB_US_BALANCE_EXCHANGE_SPACING_SEC", 0.25, 0.0, 10.0)
+        for exchange_code in self._exchange_candidates("US"):
+            broker = self._get_broker("US", exchange_code)
+            if broker is None:
+                errors.append(f"{exchange_code}:broker_unavailable")
+                continue
+            try:
+                payload = self._fetch_us_balance_with_fallback(broker)
+                parsed = self._parse_balance_oversea(payload if isinstance(payload, dict) else {})
+                snapshots.append({"exchange": exchange_code, "payload": payload, "parsed": parsed})
+            except Exception as exc:
+                errors.append(f"{exchange_code}:{repr(exc)}")
+            if spacing > 0:
+                time.sleep(spacing)
+        if not snapshots:
+            raise RuntimeError("; ".join(errors) if errors else "US:all_exchange_snapshot_failed")
+        merged = self._merge_us_exchange_snapshots(snapshots)
+        merged["raw_errors"] = errors
+        merged["exchange_count"] = len(snapshots)
+        return merged
+
     def fetch_account_snapshot(self, market: str = "ALL") -> Dict[str, Any]:
         market_upper = str(market or "ALL").strip().upper()
         targets = ["KR", "US"] if market_upper in {"ALL", "*"} else [market_upper]
@@ -681,22 +835,21 @@ class PaperBroker:
         }
 
         for mk in targets:
-            broker = self._get_broker(mk)
-            if broker is None:
-                out["errors"].append(f"{mk}:broker_unavailable")
-                continue
+            broker = None
+            if mk != "US":
+                broker = self._get_broker(mk)
+                if broker is None:
+                    out["errors"].append(f"{mk}:broker_unavailable")
+                    continue
             try:
                 if mk == "US":
-                    payload = self._fetch_us_balance_with_fallback(broker)
+                    parsed = self._fetch_us_snapshot_all_exchanges()
                 else:
                     payload = self._call_with_rate_limit_retry(
                         lambda: broker.fetch_balance(),
                         op_name=f"{mk}.fetch_balance",
                     )
-                if mk == "KR":
                     parsed = self._parse_balance_domestic(payload if isinstance(payload, dict) else {})
-                else:
-                    parsed = self._parse_balance_oversea(payload if isinstance(payload, dict) else {})
                 out["markets"][mk] = parsed
                 out["cash_krw"] += float(parsed.get("cash_krw", 0.0) or 0.0)
                 out["equity_krw"] += float(parsed.get("equity_krw", 0.0) or 0.0)
@@ -817,6 +970,15 @@ class PaperBroker:
                             status = "SUBMITTED"
                     else:
                         status = "REJECTED"
+                    eff_type = str(send.get("effective_order_type", order_type) or order_type).strip().upper()
+                    if eff_type in {"LIMIT", "MARKET"}:
+                        order_type = eff_type
+                    eff_limit = send.get("effective_limit_price")
+                    if eff_limit is not None:
+                        try:
+                            limit_price = float(eff_limit)
+                        except Exception:
+                            pass
 
                 if side == "SELL" and status in {"SUBMITTED", "FILLED"}:
                     current = float(sell_available.get(symbol, 0.0) or 0.0)

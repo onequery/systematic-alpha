@@ -1227,6 +1227,7 @@ class AgentLabOrchestrator:
                 quantity,
                 limit_price,
                 reference_price,
+                broker_order_id,
                 broker_response_json,
                 submitted_at
             FROM paper_orders
@@ -1271,6 +1272,7 @@ class AgentLabOrchestrator:
         local_rows = self._local_positions_from_fills(market_scope)
         local_map = self._position_map(local_rows)
         filled_orders: List[Dict[str, Any]] = []
+        filled_order_ids: set[int] = set()
 
         for row in submitted:
             market = str(row.get("market", "")).strip().upper()
@@ -1326,12 +1328,35 @@ class AgentLabOrchestrator:
                     "quantity": qty,
                 }
             )
+            filled_order_ids.add(int(paper_order_id))
+
+        pending_orders: List[Dict[str, Any]] = []
+        now_iso_ts = now_iso()
+        for row in submitted:
+            paper_order_id = int(row.get("paper_order_id"))
+            if paper_order_id in filled_order_ids:
+                continue
+            age_sec = self._age_seconds_from_iso(str(row.get("submitted_at", "")))
+            pending_orders.append(
+                {
+                    "paper_order_id": paper_order_id,
+                    "broker_order_id": str(row.get("broker_order_id", "")).strip(),
+                    "market": str(row.get("market", "")).strip().upper(),
+                    "symbol": str(row.get("symbol", "")).strip().upper(),
+                    "side": str(row.get("side", "")).strip().upper(),
+                    "quantity": float(row.get("quantity", 0.0) or 0.0),
+                    "submitted_at": str(row.get("submitted_at", "")),
+                    "age_sec": None if age_sec is None else float(age_sec),
+                    "observed_at": now_iso_ts,
+                }
+            )
 
         out = {
             "submitted_count": len(submitted),
             "filled_count": len(filled_orders),
             "pending_count": max(0, len(submitted) - len(filled_orders)),
             "filled_orders": filled_orders,
+            "pending_orders": pending_orders,
         }
         if filled_orders:
             self.storage.log_event(
@@ -1345,6 +1370,115 @@ class AgentLabOrchestrator:
                 now_iso(),
             )
         return out
+
+    @staticmethod
+    def _submitted_alert_stale_seconds() -> int:
+        try:
+            value = int(float(os.getenv("AGENT_LAB_SUBMITTED_STALE_ALERT_SEC", "180") or 180))
+        except Exception:
+            value = 180
+        return max(30, min(3600, value))
+
+    @staticmethod
+    def _submitted_alert_cooldown_minutes() -> int:
+        try:
+            value = int(float(os.getenv("AGENT_LAB_SUBMITTED_ALERT_COOLDOWN_MINUTES", "5") or 5))
+        except Exception:
+            value = 5
+        return max(1, min(240, value))
+
+    @staticmethod
+    def _submitted_alert_ts_meta_key(market_scope: str) -> str:
+        return f"submitted_alert_last_sent:{str(market_scope or 'ALL').strip().upper() or 'ALL'}"
+
+    @staticmethod
+    def _submitted_alert_sig_meta_key(market_scope: str) -> str:
+        return f"submitted_alert_last_sig:{str(market_scope or 'ALL').strip().upper() or 'ALL'}"
+
+    def _allow_submitted_alert_notification(self, market_scope: str, signature: str) -> bool:
+        cooldown_min = self._submitted_alert_cooldown_minutes()
+        ts_key = self._submitted_alert_ts_meta_key(market_scope)
+        sig_key = self._submitted_alert_sig_meta_key(market_scope)
+        now_s = now_iso()
+        last_sig = str(self.storage.get_system_meta(sig_key, "") or "")
+        last_sent_raw = str(self.storage.get_system_meta(ts_key, "") or "")
+        if signature != last_sig:
+            self.storage.upsert_system_meta(ts_key, now_s, now_s)
+            self.storage.upsert_system_meta(sig_key, signature, now_s)
+            return True
+        if not last_sent_raw:
+            self.storage.upsert_system_meta(ts_key, now_s, now_s)
+            self.storage.upsert_system_meta(sig_key, signature, now_s)
+            return True
+        try:
+            last_sent = datetime.fromisoformat(last_sent_raw)
+            elapsed = datetime.now() - last_sent
+            if elapsed < timedelta(minutes=cooldown_min):
+                return False
+        except Exception:
+            pass
+        self.storage.upsert_system_meta(ts_key, now_s, now_s)
+        self.storage.upsert_system_meta(sig_key, signature, now_s)
+        return True
+
+    def _maybe_alert_stale_submitted_orders(self, *, market_scope: str, settlement: Dict[str, Any]) -> None:
+        pending = list((settlement or {}).get("pending_orders") or [])
+        if not pending:
+            return
+        stale_sec = self._submitted_alert_stale_seconds()
+        stale_rows: List[Dict[str, Any]] = []
+        for row in pending:
+            if not isinstance(row, dict):
+                continue
+            age = row.get("age_sec")
+            try:
+                age_f = float(age)
+            except Exception:
+                age_f = -1.0
+            if age_f >= float(stale_sec):
+                stale_rows.append({**row, "age_sec": age_f})
+        if not stale_rows:
+            return
+        stale_rows.sort(key=lambda r: float(r.get("age_sec", 0.0) or 0.0), reverse=True)
+        sig_parts: List[str] = []
+        for row in stale_rows:
+            sig_parts.append(
+                f"{int(row.get('paper_order_id', 0))}:"
+                f"{str(row.get('broker_order_id', '')).strip()}:"
+                f"{str(row.get('market', '')).strip().upper()}:"
+                f"{str(row.get('symbol', '')).strip().upper()}:"
+                f"{str(row.get('side', '')).strip().upper()}:"
+                f"{float(row.get('quantity', 0.0) or 0.0):g}"
+            )
+        signature = "|".join(sig_parts)
+        if not self._allow_submitted_alert_notification(market_scope, signature):
+            return
+        lines = [
+            "[AgentLab] 미체결 주문 장기지연",
+            f"시장범위={str(market_scope or 'ALL').strip().upper()}",
+            f"기준_초={stale_sec}",
+            f"건수={len(stale_rows)}",
+        ]
+        for row in stale_rows[:5]:
+            lines.append(
+                "주문="
+                f"paper_order_id={int(row.get('paper_order_id', 0))}, "
+                f"broker_order_id={str(row.get('broker_order_id', '') or '-').strip() or '-'}, "
+                f"{str(row.get('side', '')).strip().upper()} {str(row.get('symbol', '')).strip().upper()} x{float(row.get('quantity', 0.0) or 0.0):g}, "
+                f"경과={int(float(row.get('age_sec', 0.0) or 0.0))}s"
+            )
+        lines.append("조치=브로커 체결/정정취소 상태 확인 필요")
+        self.storage.log_event(
+            "submitted_orders_stale_alert",
+            {
+                "market_scope": str(market_scope or "ALL").strip().upper(),
+                "threshold_sec": int(stale_sec),
+                "count": int(len(stale_rows)),
+                "orders": stale_rows[:10],
+            },
+            now_iso(),
+        )
+        self._notify("\n".join(lines), event="broker_api_error")
 
     def _is_pending_settlement_mismatch(self, detail: Dict[str, Any], market_scope: str) -> bool:
         mismatches = list((detail or {}).get("mismatches") or [])
@@ -1721,6 +1855,8 @@ class AgentLabOrchestrator:
             server_positions=server_positions,
         )
         payload["settlement"] = settlement
+        if notify:
+            self._maybe_alert_stale_submitted_orders(market_scope=market_scope, settlement=settlement)
         local_positions = self._local_positions_from_fills(market_scope)
         matched, detail = self._reconcile_positions(server_positions=server_positions, local_positions=local_positions)
         payload["matched"] = bool(matched)
@@ -1778,6 +1914,132 @@ class AgentLabOrchestrator:
                         "조치=불일치 해소 전 주문 차단",
                         event="sync_mismatch",
                     )
+        return payload
+
+    def reconcile_submitted_orders(
+        self,
+        *,
+        market: str = "ALL",
+        max_age_sec: int = 1800,
+        apply: bool = False,
+        close_status: str = "REJECTED",
+        reason: str = "manual_reconcile_submitted",
+    ) -> Dict[str, Any]:
+        scope = str(market or "ALL").strip().upper()
+        if scope not in {"KR", "US", "ALL"}:
+            scope = "ALL"
+        max_age = max(30, int(max_age_sec or 1800))
+        status_to = str(close_status or "REJECTED").strip().upper() or "REJECTED"
+        reason_txt = str(reason or "manual_reconcile_submitted").strip() or "manual_reconcile_submitted"
+        requested_apply = bool(apply)
+
+        sync_before = self.sync_account(
+            market=scope,
+            strict=False,
+            notify=False,
+            track_streak=False,
+        )
+
+        rows = self._list_submitted_paper_orders(scope)
+        row_by_id: Dict[int, Dict[str, Any]] = {}
+        candidates: List[Dict[str, Any]] = []
+        recent: List[Dict[str, Any]] = []
+        unknown_age: List[Dict[str, Any]] = []
+
+        for row in rows:
+            paper_order_id = int(row.get("paper_order_id"))
+            row_by_id[paper_order_id] = row
+            age_sec = self._age_seconds_from_iso(str(row.get("submitted_at", "")))
+            item = {
+                "paper_order_id": paper_order_id,
+                "broker_order_id": str(row.get("broker_order_id", "")).strip(),
+                "market": str(row.get("market", "")).strip().upper(),
+                "symbol": str(row.get("symbol", "")).strip().upper(),
+                "side": str(row.get("side", "")).strip().upper(),
+                "quantity": float(row.get("quantity", 0.0) or 0.0),
+                "submitted_at": str(row.get("submitted_at", "")),
+                "age_sec": None if age_sec is None else float(age_sec),
+            }
+            if age_sec is None:
+                unknown_age.append(item)
+                continue
+            if float(age_sec) >= float(max_age):
+                candidates.append(item)
+            else:
+                recent.append(item)
+
+        blocked_apply = bool(requested_apply and not bool(sync_before.get("ok", False)))
+        apply_reason = "sync_before_failed" if blocked_apply else ""
+        updated: List[Dict[str, Any]] = []
+        applied = False
+        if requested_apply and not blocked_apply:
+            for item in candidates:
+                paper_order_id = int(item["paper_order_id"])
+                raw_row = row_by_id.get(paper_order_id, {})
+                broker_payload = self._decode_json_obj(raw_row.get("broker_response_json"))
+                broker_payload["reconciled_cleanup"] = {
+                    "applied_at": now_iso(),
+                    "from_status": "SUBMITTED",
+                    "to_status": status_to,
+                    "reason": reason_txt,
+                    "age_sec": item.get("age_sec"),
+                }
+                self.storage.update_paper_order_status_with_response(
+                    paper_order_id=paper_order_id,
+                    status=status_to,
+                    broker_response_json=broker_payload,
+                )
+                updated.append(
+                    {
+                        "paper_order_id": paper_order_id,
+                        "broker_order_id": item.get("broker_order_id", ""),
+                        "market": item.get("market", ""),
+                        "symbol": item.get("symbol", ""),
+                        "side": item.get("side", ""),
+                        "quantity": item.get("quantity", 0.0),
+                        "age_sec": item.get("age_sec"),
+                        "status_to": status_to,
+                    }
+                )
+            applied = True
+
+        payload: Dict[str, Any] = {
+            "market_scope": scope,
+            "max_age_sec": int(max_age),
+            "requested_apply": requested_apply,
+            "applied": bool(applied),
+            "blocked_apply": bool(blocked_apply),
+            "blocked_reason": apply_reason,
+            "status_to": status_to,
+            "reason": reason_txt,
+            "sync_before": sync_before,
+            "submitted_total": int(len(rows)),
+            "eligible_count": int(len(candidates)),
+            "recent_count": int(len(recent)),
+            "unknown_age_count": int(len(unknown_age)),
+            "eligible_orders": candidates[:200],
+            "updated_orders": updated[:200],
+            "generated_at": now_iso(),
+        }
+        event_type = "submitted_orders_reconciled" if applied else "submitted_orders_reconcile_dryrun"
+        self.storage.log_event(event_type, payload, now_iso())
+        if applied and updated:
+            lines = [
+                "[AgentLab] 미해소 주문 정리 완료",
+                f"시장범위={scope}",
+                f"정리건수={len(updated)}",
+                f"상태변경=SUBMITTED->{status_to}",
+                f"기준_초={max_age}",
+                f"사유={reason_txt}",
+            ]
+            for row in updated[:5]:
+                lines.append(
+                    "주문="
+                    f"paper_order_id={int(row.get('paper_order_id', 0))}, "
+                    f"broker_order_id={str(row.get('broker_order_id', '') or '-').strip() or '-'}, "
+                    f"{str(row.get('side', '')).strip().upper()} {str(row.get('symbol', '')).strip().upper()}"
+                )
+            self._notify("\n".join(lines), event="broker_api_error")
         return payload
 
     def _latest_account_context(self, market_scope: str = "ALL") -> Dict[str, Any]:
@@ -3024,6 +3286,20 @@ class AgentLabOrchestrator:
                     "detail": detail,
                     "generated_at": now_iso(),
                 }
+        claimed = self.storage.try_claim_report_dispatch(
+            event_type="preopen_plan",
+            market=market,
+            report_date=yyyymmdd,
+            created_at=now_iso(),
+        )
+        if not claimed:
+            return {
+                "market": market,
+                "date": yyyymmdd,
+                "skipped": True,
+                "reason": "preopen_already_claimed",
+                "generated_at": now_iso(),
+            }
         if self._event_already_reported("preopen_plan", market, yyyymmdd):
             return {
                 "market": market,
@@ -3190,6 +3466,20 @@ class AgentLabOrchestrator:
                     "detail": detail,
                     "generated_at": now_iso(),
                 }
+        claimed = self.storage.try_claim_report_dispatch(
+            event_type="session_close_report",
+            market=market,
+            report_date=yyyymmdd,
+            created_at=now_iso(),
+        )
+        if not claimed:
+            return {
+                "market": market,
+                "date": yyyymmdd,
+                "skipped": True,
+                "reason": "close_report_already_claimed",
+                "generated_at": now_iso(),
+            }
         if self._event_already_reported("session_close_report", market, yyyymmdd):
             return {
                 "market": market,
