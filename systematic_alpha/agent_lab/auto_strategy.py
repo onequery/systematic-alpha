@@ -496,7 +496,8 @@ class AutoStrategyDaemon:
                 "reason": "legacy_execution_mode",
             }
         strict = _truthy(os.getenv("AGENT_LAB_SYNC_STRICT", "1"))
-        return self.orchestrator.sync_account(market="ALL", strict=strict)
+        sync_scope = self.orchestrator._execution_sync_scope()
+        return self.orchestrator.sync_account(market=sync_scope, strict=strict)
 
     def _maybe_run_retention_cleanup(self, now_kst: datetime) -> None:
         key = "runtime_cleanup_last_kst_date"

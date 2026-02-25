@@ -209,6 +209,18 @@ class AgentLabOrchestrator:
         mk = str(market or "").strip().upper()
         return mk in cls._order_enabled_markets()
 
+    @classmethod
+    def _execution_sync_scope(cls) -> str:
+        """
+        Sync scope used for execution gates.
+        - If only one order-enabled market is active (e.g., KR only), sync that market only.
+        - If both KR/US are enabled, keep ALL sync.
+        """
+        enabled = cls._order_enabled_markets()
+        if len(enabled) == 1:
+            return enabled[0]
+        return "ALL"
+
     def _is_market_open_now(self, market: str, now_utc: Optional[datetime] = None) -> Tuple[bool, str]:
         market_upper = str(market).strip().upper()
         if market_upper == "KR":
@@ -2174,8 +2186,9 @@ class AgentLabOrchestrator:
         auto_execute: bool,
     ) -> Dict[str, Any]:
         self._ensure_unified_executor_agent()
+        sync_scope = self._execution_sync_scope()
         sync_pre = self._sync_account_strict_with_retry(
-            market_scope="ALL",
+            market_scope=sync_scope,
             notify_on_fail=True,
             track_streak_on_fail=True,
         )
@@ -2195,7 +2208,7 @@ class AgentLabOrchestrator:
             self._append_activity_artifact(effective_session_date, "orders_proposed_skipped", payload)
             return payload
 
-        account_ctx = self._latest_account_context("ALL")
+        account_ctx = self._latest_account_context(sync_scope)
         shared_cash = float(account_ctx.get("cash_krw", 0.0) or 0.0)
         shared_equity = float(account_ctx.get("equity_krw", 0.0) or 0.0)
         shared_positions = list(account_ctx.get("positions", []) or [])
@@ -2333,7 +2346,7 @@ class AgentLabOrchestrator:
             )
 
         sync_pre_aggregate = self._sync_account_strict_with_retry(
-            market_scope="ALL",
+            market_scope=sync_scope,
             notify_on_fail=True,
             track_streak_on_fail=True,
         )
@@ -2342,7 +2355,7 @@ class AgentLabOrchestrator:
         if bool(sync_pre_aggregate.get("blocked", False)) and self._sync_fail_open_on_transient():
             if self._is_transient_sync_failure(sync_pre_aggregate):
                 grace_sec = self._sync_fail_open_grace_sec()
-                if self._recent_strict_sync_success("ALL", max_age_sec=grace_sec):
+                if self._recent_strict_sync_success(sync_scope, max_age_sec=grace_sec):
                     fail_open_used = True
                     fail_open_reason = "transient_sync_failure_with_recent_strict_sync_success"
                     self.storage.log_event(
@@ -2462,7 +2475,7 @@ class AgentLabOrchestrator:
                     }
                 )
 
-        sync_post = self.sync_account(market="ALL", strict=False)
+        sync_post = self.sync_account(market=sync_scope, strict=False)
         payload = {
             "market": market,
             "date": effective_session_date,
@@ -2941,7 +2954,7 @@ class AgentLabOrchestrator:
         symbol_name_map = self._load_symbol_name_map(market, yyyymmdd)
         sync_post: Optional[Dict[str, Any]] = None
         if self._unified_shadow_mode():
-            sync_post = self._sync_after_execution_with_retry("ALL")
+            sync_post = self._sync_after_execution_with_retry(self._execution_sync_scope())
         order_results = self._proposal_order_results(proposal_id)
         if not order_results:
             order_results = submit_results

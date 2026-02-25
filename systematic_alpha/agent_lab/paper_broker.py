@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import importlib
+import json
 import os
 import time
 from datetime import datetime
 from typing import Any, Dict, List
+from zoneinfo import ZoneInfo
 
 from systematic_alpha.agent_lab.storage import AgentLabStorage
 from systematic_alpha.credentials import load_credentials
@@ -79,6 +81,104 @@ class PaperBroker:
             "AMEX": "아멕스",
         }
         return fallback.get(normalized, "나스닥")
+
+    @staticmethod
+    def _session_date_for_market(market: str) -> str:
+        market_upper = str(market or "").strip().upper()
+        tz_name = "Asia/Seoul" if market_upper == "KR" else "America/New_York"
+        try:
+            return datetime.now(ZoneInfo(tz_name)).strftime("%Y%m%d")
+        except Exception:
+            return datetime.now().strftime("%Y%m%d")
+
+    @staticmethod
+    def _daily_untradable_meta_key(market: str, session_date: str) -> str:
+        return f"daily_untradable_symbols:{str(market or '').strip().upper()}:{str(session_date or '').strip()}"
+
+    def _load_daily_untradable_symbols(self, market: str, session_date: str) -> set[str]:
+        key = self._daily_untradable_meta_key(market, session_date)
+        raw = self.storage.get_system_meta(key, "[]")
+        out: set[str] = set()
+        try:
+            data = json.loads(str(raw or "[]"))
+        except Exception:
+            data = []
+        if isinstance(data, list):
+            for item in data:
+                sym = str(item or "").strip().upper()
+                if sym:
+                    out.add(sym)
+        return out
+
+    def _save_daily_untradable_symbols(self, market: str, session_date: str, symbols: set[str]) -> None:
+        key = self._daily_untradable_meta_key(market, session_date)
+        payload = sorted(str(x).strip().upper() for x in symbols if str(x).strip())
+        self.storage.upsert_system_meta(
+            key,
+            json.dumps(payload, ensure_ascii=False),
+            datetime.now().isoformat(timespec="seconds"),
+        )
+
+    def _append_daily_untradable_symbol(self, market: str, session_date: str, symbol: str) -> bool:
+        sym = str(symbol or "").strip().upper()
+        if not sym:
+            return False
+        current = self._load_daily_untradable_symbols(market, session_date)
+        if sym in current:
+            return False
+        current.add(sym)
+        self._save_daily_untradable_symbols(market, session_date, current)
+        return True
+
+    @staticmethod
+    def _is_non_tradable_error_text(text: str) -> bool:
+        raw = str(text or "")
+        norm = raw.lower()
+        return ("msg_cd=40070000" in norm) or ("매매불가 종목" in raw)
+
+    @staticmethod
+    def _collect_send_error_text(send_result: Dict[str, Any]) -> str:
+        if not isinstance(send_result, dict):
+            return ""
+        chunks: List[str] = []
+        reason = send_result.get("reason")
+        if reason:
+            chunks.append(str(reason))
+        attempts = send_result.get("attempts")
+        if isinstance(attempts, list):
+            for row in attempts:
+                if not isinstance(row, dict):
+                    continue
+                rr = row.get("reason")
+                if rr:
+                    chunks.append(str(rr))
+        return " | ".join(chunks)
+
+    def _has_recent_sell_submission(self, market: str, symbol: str, lookback_sec: int) -> bool:
+        if int(lookback_sec) <= 0:
+            return False
+        rows = self.storage.query_all(
+            """
+            SELECT side, status, submitted_at
+            FROM paper_orders
+            WHERE market = ? AND symbol = ? AND status IN ('SUBMITTED', 'FILLED')
+            ORDER BY submitted_at DESC
+            LIMIT 1
+            """,
+            (str(market or "").strip().upper(), str(symbol or "").strip().upper()),
+        )
+        if not rows:
+            return False
+        row = rows[0]
+        if str(row.get("side", "")).strip().upper() != "SELL":
+            return False
+        submitted_at = str(row.get("submitted_at", "")).strip()
+        try:
+            last_dt = datetime.fromisoformat(submitted_at)
+        except Exception:
+            return False
+        elapsed = (datetime.now() - last_dt).total_seconds()
+        return float(elapsed) <= float(lookback_sec)
 
     def _get_broker(self, market: str, us_exchange_code: str = ""):
         market_upper = market.upper()
@@ -621,8 +721,40 @@ class PaperBroker:
     ) -> List[Dict[str, Any]]:
         results: List[Dict[str, Any]] = []
         now_ts = datetime.now().isoformat(timespec="seconds")
+        market_upper = str(market or "").strip().upper()
+        enable_daily_blacklist = str(os.getenv("AGENT_LAB_DAILY_UNTRADABLE_BLACKLIST", "1")).strip().lower() in {
+            "1", "true", "yes", "on"
+        }
+        enable_sell_precheck_sync = str(os.getenv("AGENT_LAB_SELL_PRECHECK_SYNC", "1")).strip().lower() in {
+            "1", "true", "yes", "on"
+        }
+        sell_repeat_guard_sec = self._env_int("AGENT_LAB_SELL_REPEAT_GUARD_SEC", 900, 0, 86400)
+        session_date = self._session_date_for_market(market_upper)
+        daily_untradable_symbols = (
+            self._load_daily_untradable_symbols(market_upper, session_date) if enable_daily_blacklist else set()
+        )
+
+        sell_precheck_sync: Dict[str, Any] = {"ok": False, "reason": "disabled"}
+        sell_available: Dict[str, float] = {}
+        if self.execution_mode in {"mojito_mock", "mock_api"} and enable_sell_precheck_sync:
+            try:
+                sell_precheck_sync = self.fetch_account_snapshot(market=market_upper)
+            except Exception as exc:
+                sell_precheck_sync = {"ok": False, "reason": "exception", "errors": [repr(exc)]}
+            if bool(sell_precheck_sync.get("ok", False)):
+                for pos in list(sell_precheck_sync.get("positions", []) or []):
+                    if not isinstance(pos, dict):
+                        continue
+                    if str(pos.get("market", "")).strip().upper() != market_upper:
+                        continue
+                    sym = str(pos.get("symbol", "")).strip().upper()
+                    qty = float(pos.get("quantity", 0.0) or 0.0)
+                    if not sym or qty <= 0:
+                        continue
+                    sell_available[sym] = sell_available.get(sym, 0.0) + qty
+
         for order in orders:
-            symbol = str(order["symbol"])
+            symbol = str(order["symbol"]).strip().upper()
             side = str(order.get("side", "BUY")).upper()
             qty = float(order.get("quantity", 0.0) or 0.0)
             order_type = str(order.get("order_type", "MARKET")).upper()
@@ -634,32 +766,87 @@ class PaperBroker:
             broker_order_id = ""
             broker_resp: Dict[str, Any] = {}
             status = "FILLED"
+            submit_qty = float(qty)
             if self.execution_mode in {"mojito_mock", "mock_api"}:
-                send = self._send_order(market=market, order=order)
-                broker_resp = dict(send)
-                broker_resp["fx_rate"] = float(fx_rate)
-                if send.get("ok"):
-                    payload = send.get("response")
-                    api_err = self._api_error_text(payload if isinstance(payload, dict) else {})
-                    if api_err:
-                        status = "REJECTED"
-                        broker_resp = dict(send)
-                        broker_resp["ok"] = False
-                        broker_resp["reason"] = api_err
-                    elif isinstance(payload, dict):
-                        broker_order_id = str(payload.get("ODNO") or payload.get("output", {}).get("ODNO") or "")
-                        status = "SUBMITTED"
-                else:
+                precheck_reject_reason = ""
+                if enable_daily_blacklist and symbol in daily_untradable_symbols:
+                    precheck_reject_reason = "daily_untradable_blacklist"
+                elif side == "SELL":
+                    if self._has_recent_sell_submission(market_upper, symbol, sell_repeat_guard_sec):
+                        precheck_reject_reason = f"recent_sell_submission_guard({sell_repeat_guard_sec}s)"
+                    elif enable_sell_precheck_sync and not bool(sell_precheck_sync.get("ok", False)):
+                        precheck_reject_reason = "sell_precheck_sync_failed"
+                    elif enable_sell_precheck_sync:
+                        available_qty = float(sell_available.get(symbol, 0.0) or 0.0)
+                        if available_qty <= 0:
+                            precheck_reject_reason = "sell_precheck_no_position"
+                        elif submit_qty > available_qty:
+                            submit_qty = float(available_qty)
+
+                if precheck_reject_reason:
                     status = "REJECTED"
+                    broker_resp = {
+                        "ok": False,
+                        "reason": precheck_reject_reason,
+                        "market": market_upper,
+                        "symbol": symbol,
+                        "side": side,
+                        "requested_quantity": float(qty),
+                        "submit_quantity": float(submit_qty),
+                        "sell_precheck_sync": sell_precheck_sync if side == "SELL" and enable_sell_precheck_sync else {},
+                        "fx_rate": float(fx_rate),
+                    }
+                else:
+                    send_order = dict(order)
+                    send_order["quantity"] = float(submit_qty)
+                    send = self._send_order(market=market_upper, order=send_order)
+                    broker_resp = dict(send)
+                    broker_resp["fx_rate"] = float(fx_rate)
+                    broker_resp["requested_quantity"] = float(qty)
+                    broker_resp["submit_quantity"] = float(submit_qty)
+                    if send.get("ok"):
+                        payload = send.get("response")
+                        api_err = self._api_error_text(payload if isinstance(payload, dict) else {})
+                        if api_err:
+                            status = "REJECTED"
+                            broker_resp = dict(send)
+                            broker_resp["ok"] = False
+                            broker_resp["reason"] = api_err
+                        elif isinstance(payload, dict):
+                            broker_order_id = str(payload.get("ODNO") or payload.get("output", {}).get("ODNO") or "")
+                            status = "SUBMITTED"
+                    else:
+                        status = "REJECTED"
+
+                if side == "SELL" and status in {"SUBMITTED", "FILLED"}:
+                    current = float(sell_available.get(symbol, 0.0) or 0.0)
+                    sell_available[symbol] = max(0.0, current - float(submit_qty))
+
+                if enable_daily_blacklist and status == "REJECTED":
+                    err_text = self._collect_send_error_text(broker_resp)
+                    if self._is_non_tradable_error_text(err_text):
+                        added = self._append_daily_untradable_symbol(market_upper, session_date, symbol)
+                        daily_untradable_symbols.add(symbol)
+                        if added:
+                            self.storage.log_event(
+                                "daily_symbol_blacklisted",
+                                {
+                                    "market": market_upper,
+                                    "session_date": session_date,
+                                    "symbol": symbol,
+                                    "reason": err_text[:240],
+                                },
+                                now_ts,
+                            )
 
             paper_order_id = self.storage.insert_paper_order(
                 proposal_id=proposal_id,
                 agent_id=agent_id,
-                market=market,
+                market=market_upper,
                 symbol=symbol,
                 side=side,
                 order_type=order_type,
-                quantity=qty,
+                quantity=float(submit_qty),
                 limit_price=None if limit_price is None else float(limit_price),
                 reference_price=ref_price,
                 status=status,
@@ -670,11 +857,11 @@ class PaperBroker:
 
             if status == "FILLED":
                 fill_price = ref_price if order_type != "LIMIT" else float(limit_price or ref_price)
-                fill_value_krw = float(fill_price) * float(qty) * float(fx_rate)
+                fill_value_krw = float(fill_price) * float(submit_qty) * float(fx_rate)
                 self.storage.insert_paper_fill(
                     paper_order_id=paper_order_id,
                     fill_price=float(fill_price),
-                    fill_quantity=float(qty),
+                    fill_quantity=float(submit_qty),
                     fill_value_krw=float(fill_value_krw),
                     fx_rate=float(fx_rate),
                     filled_at=now_ts,
@@ -686,7 +873,7 @@ class PaperBroker:
                     "side": side,
                     "status": status,
                     "reference_price": ref_price,
-                    "quantity": qty,
+                    "quantity": float(submit_qty),
                     "fx_rate": fx_rate,
                 }
             )
