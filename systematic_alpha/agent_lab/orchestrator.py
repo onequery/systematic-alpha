@@ -193,6 +193,22 @@ class AgentLabOrchestrator:
     def _enforce_market_hours() -> bool:
         return _truthy(os.getenv("AGENT_LAB_ENFORCE_MARKET_HOURS", "1"))
 
+    @staticmethod
+    def _order_enabled_markets() -> List[str]:
+        raw = str(os.getenv("AGENT_LAB_ORDER_ENABLED_MARKETS", "KR,US") or "KR,US")
+        normalized = raw.replace(";", ",").replace("|", ",")
+        out: List[str] = []
+        for token in normalized.split(","):
+            mk = str(token or "").strip().upper()
+            if mk in {"KR", "US"} and mk not in out:
+                out.append(mk)
+        return out or ["KR", "US"]
+
+    @classmethod
+    def _is_order_market_enabled(cls, market: str) -> bool:
+        mk = str(market or "").strip().upper()
+        return mk in cls._order_enabled_markets()
+
     def _is_market_open_now(self, market: str, now_utc: Optional[datetime] = None) -> Tuple[bool, str]:
         market_upper = str(market).strip().upper()
         if market_upper == "KR":
@@ -2492,6 +2508,21 @@ class AgentLabOrchestrator:
     ) -> Dict[str, Any]:
         market = market.strip().upper()
         requested_session_date = str(yyyymmdd).strip()
+        if not self._is_order_market_enabled(market):
+            enabled_markets = self._order_enabled_markets()
+            payload = {
+                "market": market,
+                "date": requested_session_date,
+                "auto_execute": False,
+                "proposals": [],
+                "execution_results": [],
+                "skipped": True,
+                "reason": "market_disabled_by_env",
+                "enabled_order_markets": enabled_markets,
+            }
+            self.storage.log_event("orders_proposed_skipped", payload, now_iso())
+            self._append_activity_artifact(requested_session_date, "orders_proposed_skipped", payload)
+            return payload
         market_open, market_window_detail = self._is_market_open_now(market)
         if self._enforce_market_hours() and not market_open:
             payload = {
@@ -2803,6 +2834,28 @@ class AgentLabOrchestrator:
         market = str(proposal["market"]).upper()
         yyyymmdd = str(proposal["session_date"])
         agent_id = str(proposal["agent_id"])
+        if not self._is_order_market_enabled(market):
+            enabled_markets = self._order_enabled_markets()
+            block_reason = f"market_disabled_by_env:{','.join(enabled_markets)}"
+            self.storage.update_order_proposal_status(
+                proposal_id=proposal_id,
+                status=PROPOSAL_STATUS_BLOCKED,
+                blocked_reason=block_reason,
+                updated_at=now_iso(),
+            )
+            blocked_payload = {
+                "proposal_id": proposal_id,
+                "proposal_uuid": proposal["proposal_uuid"],
+                "agent_id": agent_id,
+                "market": market,
+                "session_date": yyyymmdd,
+                "status": PROPOSAL_STATUS_BLOCKED,
+                "blocked_reason": block_reason,
+                "enabled_order_markets": enabled_markets,
+            }
+            self.storage.log_event("orders_approval_blocked", blocked_payload, now_iso())
+            self._append_activity_artifact(yyyymmdd, "orders_approval_blocked", blocked_payload)
+            return blocked_payload
         if self._enforce_market_hours():
             market_open, market_window_detail = self._is_market_open_now(market)
             if not market_open:
