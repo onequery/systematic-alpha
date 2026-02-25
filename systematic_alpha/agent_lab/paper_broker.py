@@ -5,7 +5,7 @@ import json
 import os
 import time
 from datetime import datetime
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Set
 from zoneinfo import ZoneInfo
 
 from systematic_alpha.agent_lab.storage import AgentLabStorage
@@ -404,13 +404,36 @@ class PaperBroker:
             output1 = []
         if not isinstance(output2, list):
             output2 = []
-        summary = output2[0] if output2 else {}
-        if not isinstance(summary, dict):
-            summary = {}
+        summary_rows = [row for row in output2 if isinstance(row, dict)]
 
-        # Overseas API may return local-currency values. Prefer KRW fields if present.
-        cash_krw = cls._pick_value(summary, ["frcr_evlu_pfls_amt", "tot_evlu_pfls_amt", "ovrs_ord_psbl_amt", "cash_amt"])
-        equity_krw = cls._pick_value(summary, ["tot_evlu_amt", "frcr_buy_amt_smtl", "ovrs_tot_pfls", "tot_asst_amt"], default=cash_krw)
+        # Overseas output2 is often multi-currency rows; first row can be non-USD zeros.
+        cash_candidates: List[float] = []
+        equity_candidates: List[float] = []
+        for summary in summary_rows:
+            cash_candidates.append(
+                cls._pick_value(
+                    summary,
+                    [
+                        "frcr_drwg_psbl_amt_1",
+                        "nxdy_frcr_drwg_psbl_amt",
+                        "ovrs_ord_psbl_amt",
+                        "cash_amt",
+                        "frcr_evlu_pfls_amt",
+                        "tot_evlu_pfls_amt",
+                    ],
+                    default=0.0,
+                )
+            )
+            equity_candidates.append(
+                cls._pick_value(
+                    summary,
+                    ["tot_evlu_amt", "frcr_buy_amt_smtl", "ovrs_tot_pfls", "tot_asst_amt", "frcr_evlu_amt2"],
+                    default=0.0,
+                )
+            )
+
+        cash_krw = max(cash_candidates) if cash_candidates else 0.0
+        equity_krw = max(equity_candidates) if equity_candidates else cash_krw
         positions: List[Dict[str, Any]] = []
         for row in output1:
             if not isinstance(row, dict):
@@ -422,10 +445,21 @@ class PaperBroker:
                 or row.get("symbol")
                 or ""
             ).strip().upper()
-            qty = cls._pick_value(row, ["ovrs_cblc_qty", "hldg_qty", "ord_psbl_qty", "qty"])
+            qty = cls._pick_value(
+                row,
+                [
+                    "cblc_qty13",
+                    "ovrs_cblc_qty",
+                    "hldg_qty",
+                    "hold_qty",
+                    "ord_psbl_qty1",
+                    "ord_psbl_qty",
+                    "qty",
+                ],
+            )
             if not symbol or qty <= 0:
                 continue
-            avg_price = cls._pick_value(row, ["pchs_avg_pric", "avg_pric", "avg_price"])
+            avg_price = cls._pick_value(row, ["avg_unpr3", "pchs_avg_pric", "avg_pric", "avg_price"])
             fx_rate = cls._pick_value(row, ["bass_exrt", "frcr_exrt", "fx_rate"], default=1.0)
             if fx_rate <= 0:
                 fx_rate = 1.0
@@ -434,7 +468,7 @@ class PaperBroker:
                 ["frcr_evlu_amt2", "evlu_pfls_amt", "evlu_amt", "market_value_krw"],
             )
             if market_value_krw <= 0:
-                local_px = cls._pick_value(row, ["now_pric2", "ovrs_now_pric1", "last", "close"])
+                local_px = cls._pick_value(row, ["ovrs_now_pric1", "now_pric2", "last", "close"])
                 if local_px <= 0:
                     local_px = avg_price
                 market_value_krw = qty * local_px * fx_rate
@@ -450,6 +484,15 @@ class PaperBroker:
                     "payload": row,
                 }
             )
+        positions_value_krw = float(sum(float(p.get("market_value_krw", 0.0) or 0.0) for p in positions))
+        if float(equity_krw) <= 0.0 and positions_value_krw > 0.0:
+            equity_krw = float(positions_value_krw)
+        if float(cash_krw) < 0.0:
+            cash_krw = 0.0
+        if float(cash_krw) <= 0.0 and float(equity_krw) > 0.0 and positions_value_krw >= 0.0:
+            derived = float(equity_krw) - positions_value_krw
+            if derived >= 0.0:
+                cash_krw = float(derived)
         return {
             "market": "US",
             "cash_krw": float(cash_krw),
@@ -457,6 +500,173 @@ class PaperBroker:
             "positions": positions,
             "raw": payload,
         }
+
+    @staticmethod
+    def _pick_text_ci(row: Dict[str, Any], keys: List[str]) -> str:
+        if not isinstance(row, dict):
+            return ""
+        for key in keys:
+            if key in row:
+                value = row.get(key)
+                text = str(value or "").strip()
+                if text:
+                    return text
+        lowered = {str(k).strip().lower(): v for k, v in row.items()}
+        for key in keys:
+            value = lowered.get(str(key).strip().lower())
+            text = str(value or "").strip()
+            if text:
+                return text
+        return ""
+
+    @classmethod
+    def _normalize_side_text(cls, raw: str) -> str:
+        text = str(raw or "").strip().upper()
+        if not text:
+            return ""
+        if text in {"1", "01", "02_BUY", "BUY", "B"}:
+            return "BUY"
+        if text in {"2", "02", "01_SELL", "SELL", "S"}:
+            return "SELL"
+        if "매수" in raw:
+            return "BUY"
+        if "매도" in raw:
+            return "SELL"
+        return text
+
+    @classmethod
+    def _parse_open_order_rows(
+        cls,
+        *,
+        market: str,
+        exchange: str,
+        payload: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        rows: List[Dict[str, Any]] = []
+        for key in ("output", "output1", "output2"):
+            raw = payload.get(key)
+            if isinstance(raw, dict):
+                rows.append(raw)
+            elif isinstance(raw, list):
+                rows.extend([row for row in raw if isinstance(row, dict)])
+        seen: Set[str] = set()
+        market_upper = str(market or "").strip().upper()
+        ex_upper = str(exchange or "").strip().upper()
+        for row in rows:
+            broker_order_id = cls._pick_text_ci(
+                row,
+                ["ODNO", "odno", "ord_no", "ordno", "ORGN_ODNO", "orgn_odno"],
+            ).strip()
+            if not broker_order_id:
+                continue
+            unique_key = f"{market_upper}:{broker_order_id}"
+            if unique_key in seen:
+                continue
+            seen.add(unique_key)
+            symbol = cls._pick_text_ci(row, ["PDNO", "pdno", "ovrs_pdno", "symb", "symbol"]).strip().upper()
+            side = cls._normalize_side_text(
+                cls._pick_text_ci(
+                    row,
+                    ["SLL_BUY_DVSN_CD", "sll_buy_dvsn_cd", "sll_buy_dvsn_name", "side", "ord_dvsn"],
+                )
+            )
+            qty = cls._pick_value(
+                row,
+                [
+                    "ORD_QTY",
+                    "ord_qty",
+                    "RVSE_CNCL_QTY",
+                    "rvse_cncl_qty",
+                    "ord_psbl_qty",
+                    "ord_psbl_qty1",
+                    "qty",
+                ],
+                default=0.0,
+            )
+            out.append(
+                {
+                    "market": market_upper,
+                    "exchange": ex_upper,
+                    "broker_order_id": broker_order_id,
+                    "symbol": symbol,
+                    "side": side,
+                    "quantity": float(max(0.0, qty)),
+                    "raw": row,
+                }
+            )
+        return out
+
+    def _fetch_open_orders_for_target(self, market: str) -> Dict[str, Any]:
+        market_upper = str(market or "").strip().upper()
+        if market_upper not in {"KR", "US"}:
+            return {"market": market_upper, "ok": False, "open_orders": [], "errors": ["unsupported_market"]}
+        out: Dict[str, Any] = {
+            "market": market_upper,
+            "ok": False,
+            "open_orders": [],
+            "errors": [],
+            "attempted_exchanges": [],
+        }
+        param_candidates = [
+            {"CTX_AREA_FK100": "", "CTX_AREA_NK100": "", "INQR_DVSN_1": "0", "INQR_DVSN_2": "0"},
+            {"CTX_AREA_FK100": "", "CTX_AREA_NK100": "", "INQR_DVSN_1": "00", "INQR_DVSN_2": "00"},
+        ]
+        for exchange_code in self._exchange_candidates(market_upper):
+            broker = self._get_broker(market_upper, exchange_code)
+            out["attempted_exchanges"].append(exchange_code)
+            if broker is None:
+                out["errors"].append(f"{exchange_code}:broker_unavailable")
+                continue
+            exchange_ok = False
+            for idx, param in enumerate(param_candidates, start=1):
+                try:
+                    payload = self._call_with_rate_limit_retry(
+                        lambda p=dict(param), b=broker: b.fetch_open_order(p),
+                        op_name=f"{market_upper}.{exchange_code}.fetch_open_order.{idx}",
+                    )
+                    if not isinstance(payload, dict):
+                        out["errors"].append(f"{exchange_code}:invalid_payload_type")
+                        continue
+                    api_err = self._api_error_text(payload)
+                    if api_err:
+                        out["errors"].append(f"{exchange_code}:{api_err}")
+                        continue
+                    rows = self._parse_open_order_rows(market=market_upper, exchange=exchange_code, payload=payload)
+                    out["open_orders"].extend(rows)
+                    exchange_ok = True
+                    break
+                except Exception as exc:
+                    out["errors"].append(f"{exchange_code}:{repr(exc)}")
+            if exchange_ok:
+                out["ok"] = True
+        if market_upper == "KR" and "KR" in out.get("attempted_exchanges", []) and not out.get("ok", False):
+            out["errors"].append("KR:open_order_lookup_failed")
+        if market_upper == "US":
+            # SDK does not expose dedicated overseas open-order inquiry in all environments.
+            # Keep lookup best-effort and avoid hard-failing sync when empty.
+            out["best_effort"] = True
+        return out
+
+    def fetch_open_orders_snapshot(self, market: str = "ALL") -> Dict[str, Any]:
+        scope = str(market or "ALL").strip().upper()
+        targets = ["KR", "US"] if scope in {"ALL", "*"} else [scope]
+        out: Dict[str, Any] = {
+            "ok": True,
+            "market_scope": "ALL" if len(targets) > 1 else targets[0],
+            "fetched_at": datetime.now().isoformat(timespec="seconds"),
+            "markets": {},
+            "open_orders": [],
+            "errors": [],
+        }
+        for mk in targets:
+            market_out = self._fetch_open_orders_for_target(mk)
+            out["markets"][mk] = market_out
+            out["open_orders"].extend(list(market_out.get("open_orders", []) or []))
+            out["errors"].extend(list(market_out.get("errors", []) or []))
+            if mk == "KR" and not bool(market_out.get("ok", False)):
+                out["ok"] = False
+        return out
 
     @staticmethod
     def _normalize_oversea_payload(payload: Dict[str, Any]) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
