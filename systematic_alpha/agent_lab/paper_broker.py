@@ -446,11 +446,19 @@ class PaperBroker:
     @classmethod
     def _parse_balance_oversea(cls, payload: Dict[str, Any]) -> Dict[str, Any]:
         output1, output2 = cls._normalize_oversea_payload(payload)
+        output3 = payload.get("output3", [])
         if not isinstance(output1, list):
             output1 = []
         if not isinstance(output2, list):
             output2 = []
+        if isinstance(output3, dict):
+            output3 = [output3]
+        if not isinstance(output3, list):
+            output3 = []
+
         summary_rows = [row for row in output2 if isinstance(row, dict)]
+        if not summary_rows:
+            summary_rows = [row for row in output3 if isinstance(row, dict)]
 
         # Overseas output2 is often multi-currency rows; first row can be non-USD zeros.
         cash_candidates: List[float] = []
@@ -462,10 +470,12 @@ class PaperBroker:
                     [
                         "frcr_drwg_psbl_amt_1",
                         "nxdy_frcr_drwg_psbl_amt",
+                        "wdrw_psbl_tot_amt",
+                        "tot_dncl_amt",
+                        "dncl_amt",
+                        "frcr_use_psbl_amt",
                         "ovrs_ord_psbl_amt",
                         "cash_amt",
-                        "frcr_evlu_pfls_amt",
-                        "tot_evlu_pfls_amt",
                     ],
                     default=0.0,
                 )
@@ -473,7 +483,15 @@ class PaperBroker:
             equity_candidates.append(
                 cls._pick_value(
                     summary,
-                    ["tot_evlu_amt", "frcr_buy_amt_smtl", "ovrs_tot_pfls", "tot_asst_amt", "frcr_evlu_amt2"],
+                    [
+                        "tot_evlu_amt",
+                        "evlu_amt_smtl_amt",
+                        "evlu_amt_smtl",
+                        "tot_asst_amt",
+                        "frcr_buy_amt_smtl",
+                        "ovrs_tot_pfls",
+                        "frcr_evlu_amt2",
+                    ],
                     default=0.0,
                 )
             )
@@ -509,15 +527,15 @@ class PaperBroker:
             fx_rate = cls._pick_value(row, ["bass_exrt", "frcr_exrt", "fx_rate"], default=1.0)
             if fx_rate <= 0:
                 fx_rate = 1.0
-            market_value_krw = cls._pick_value(
-                row,
-                ["frcr_evlu_amt2", "evlu_pfls_amt", "evlu_amt", "market_value_krw"],
-            )
-            if market_value_krw <= 0:
-                local_px = cls._pick_value(row, ["ovrs_now_pric1", "now_pric2", "last", "close"])
-                if local_px <= 0:
-                    local_px = avg_price
+            # API fields with frcr_* are local-currency values; convert with fx_rate.
+            local_px = cls._pick_value(row, ["ovrs_now_pric1", "now_pric2", "last", "close"])
+            local_eval = cls._pick_value(row, ["frcr_evlu_amt2", "frcr_pchs_amt", "evlu_amt"])
+            if local_px > 0:
                 market_value_krw = qty * local_px * fx_rate
+            elif local_eval > 0:
+                market_value_krw = local_eval * fx_rate
+            else:
+                market_value_krw = qty * max(0.0, avg_price) * fx_rate
             positions.append(
                 {
                     "market": "US",
@@ -664,6 +682,388 @@ class PaperBroker:
                     "raw": row,
                 }
             )
+        return out
+
+    @staticmethod
+    def _status_text_is_open(text: str) -> Optional[bool]:
+        raw = str(text or "").strip()
+        if not raw:
+            return None
+        upper = raw.upper()
+        # Open-like keywords.
+        if any(token in upper for token in ("OPEN", "PENDING", "WORKING", "SUBMITTED", "접수", "미체결", "주문중")):
+            return True
+        # Closed-like keywords.
+        if any(token in upper for token in ("FILLED", "DONE", "CLOSED", "CANCEL", "REJECT", "체결", "완료", "종료", "취소", "거부")):
+            return False
+        return None
+
+    @classmethod
+    def _parse_order_status_rows(
+        cls,
+        *,
+        market: str,
+        exchange: str,
+        payload: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        for key in ("output", "output1", "output2"):
+            raw = payload.get(key)
+            if isinstance(raw, dict):
+                rows.append(raw)
+            elif isinstance(raw, list):
+                rows.extend([row for row in raw if isinstance(row, dict)])
+
+        out: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        market_upper = str(market or "").strip().upper()
+        ex_upper = str(exchange or "").strip().upper()
+        for row in rows:
+            broker_order_id = cls._pick_text_ci(
+                row,
+                [
+                    "ODNO",
+                    "odno",
+                    "ord_no",
+                    "ordno",
+                    "ORGN_ODNO",
+                    "orgn_odno",
+                    "ovrs_ord_no",
+                    "OVRS_ORD_NO",
+                    "ord_sqn",
+                    "ORD_SQN",
+                ],
+            ).strip()
+            if not broker_order_id:
+                continue
+            unique_key = f"{market_upper}:{broker_order_id}"
+            if unique_key in seen:
+                continue
+            seen.add(unique_key)
+            symbol = cls._pick_text_ci(row, ["PDNO", "pdno", "ovrs_pdno", "symb", "symbol"]).strip().upper()
+            side = cls._normalize_side_text(
+                cls._pick_text_ci(
+                    row,
+                    [
+                        "SLL_BUY_DVSN_CD",
+                        "sll_buy_dvsn_cd",
+                        "sll_buy_dvsn_name",
+                        "SLL_BUY_DVSN_NAME",
+                        "side",
+                        "ord_dvsn",
+                        "ORD_DVSN",
+                    ],
+                )
+            )
+            order_qty = cls._pick_value(
+                row,
+                [
+                    "ORD_QTY",
+                    "ord_qty",
+                    "tot_ord_qty",
+                    "TOT_ORD_QTY",
+                    "ft_ord_qty",
+                    "FT_ORD_QTY",
+                    "qty",
+                ],
+                default=0.0,
+            )
+            filled_qty = cls._pick_value(
+                row,
+                [
+                    "tot_ccld_qty",
+                    "TOT_CCLD_QTY",
+                    "ccld_qty",
+                    "CCLD_QTY",
+                    "exec_qty",
+                    "EXEC_QTY",
+                    "filled_qty",
+                ],
+                default=0.0,
+            )
+            unfilled_qty = cls._pick_value(
+                row,
+                [
+                    "nccs_qty",
+                    "NCCS_QTY",
+                    "ord_psbl_qty1",
+                    "ord_psbl_qty",
+                    "RVSE_CNCL_QTY",
+                    "rvse_cncl_qty",
+                ],
+                default=0.0,
+            )
+            status_text = cls._pick_text_ci(
+                row,
+                [
+                    "ord_sttus",
+                    "ORD_STTUS",
+                    "ord_status",
+                    "ORD_STATUS",
+                    "prcs_stat_name",
+                    "PRCS_STAT_NAME",
+                    "ccld_yn",
+                    "CCLD_YN",
+                ],
+            )
+
+            is_open = cls._status_text_is_open(status_text)
+            if is_open is None:
+                if unfilled_qty > 0:
+                    is_open = True
+                elif order_qty > 0 and filled_qty >= order_qty > 0:
+                    is_open = False
+                elif order_qty > 0 and filled_qty <= 0 and unfilled_qty <= 0:
+                    is_open = False
+                else:
+                    is_open = None
+
+            if order_qty <= 0 and filled_qty > 0:
+                is_filled_closed = True
+            else:
+                is_filled_closed = bool(order_qty > 0 and filled_qty >= (order_qty - 1e-9))
+            if bool(is_filled_closed):
+                is_open = False
+
+            out.append(
+                {
+                    "market": market_upper,
+                    "exchange": ex_upper,
+                    "broker_order_id": broker_order_id,
+                    "symbol": symbol,
+                    "side": side,
+                    "order_quantity": float(max(0.0, order_qty)),
+                    "filled_quantity": float(max(0.0, filled_qty)),
+                    "unfilled_quantity": float(max(0.0, unfilled_qty)),
+                    "is_open": is_open,
+                    "is_filled_closed": bool(is_filled_closed),
+                    "status_text": status_text,
+                    "raw": row,
+                }
+            )
+        return out
+
+    def _fetch_order_status_us_direct_exchange(self, exchange_code: str) -> Dict[str, Any]:
+        exchange_upper = str(exchange_code or "").strip().upper()
+        broker = self._get_broker("US", exchange_upper)
+        if broker is None:
+            return {
+                "ok": False,
+                "rows": [],
+                "errors": [f"{exchange_upper}:broker_unavailable"],
+                "best_effort": True,
+            }
+
+        base_url = str(getattr(broker, "base_url", "") or "").strip()
+        app_key = str(getattr(broker, "api_key", "") or "").strip()
+        app_secret = str(getattr(broker, "api_secret", "") or "").strip()
+        cano = str(getattr(broker, "acc_no_prefix", "") or "").strip()
+        acnt_prdt_cd = str(getattr(broker, "acc_no_postfix", "") or "").strip()
+        is_mock = bool(getattr(broker, "mock", True))
+        if not (base_url and app_key and app_secret and cano and acnt_prdt_cd):
+            return {
+                "ok": False,
+                "rows": [],
+                "errors": [f"{exchange_upper}:broker_fields_missing"],
+                "best_effort": True,
+            }
+
+        timeout_sec = self._env_float("AGENT_LAB_US_ORDER_STATUS_TIMEOUT_SEC", 8.0, 1.0, 60.0)
+        max_pages = self._env_int("AGENT_LAB_US_ORDER_STATUS_MAX_PAGES", 1, 1, 10)
+        default_paths = [
+            "/uapi/overseas-stock/v1/trading/inquire-ccnl",
+            "/uapi/overseas-stock/v1/trading/inquire-nccs",
+        ]
+        default_tr_ids = ["VTTS3035R", "VTTT3035R", "VTTS3018R", "VTTT3018R"] if is_mock else [
+            "TTTS3035R",
+            "JTTT3035R",
+            "TTTS3018R",
+            "JTTT3018R",
+        ]
+        paths = self._env_csv("AGENT_LAB_US_ORDER_STATUS_PATHS", default_paths)
+        tr_ids = self._env_csv(
+            "AGENT_LAB_US_ORDER_STATUS_TR_IDS_MOCK" if is_mock else "AGENT_LAB_US_ORDER_STATUS_TR_IDS_REAL",
+            default_tr_ids,
+        )
+
+        today_us = self._session_date_for_market("US")
+        param_candidates: List[Dict[str, Any]] = [
+            {
+                "CANO": cano,
+                "ACNT_PRDT_CD": acnt_prdt_cd,
+                "OVRS_EXCG_CD": exchange_upper,
+                "SORT_SQN": "DS",
+                "CTX_AREA_FK200": "",
+                "CTX_AREA_NK200": "",
+            },
+            {
+                "CANO": cano,
+                "ACNT_PRDT_CD": acnt_prdt_cd,
+                "OVRS_EXCG_CD": exchange_upper,
+                "SORT_SQN": "DS",
+                "ORD_STRT_DT": today_us,
+                "ORD_END_DT": today_us,
+                "SLL_BUY_DVSN_CD": "00",
+                "CCLD_NCCS_DVSN": "00",
+                "CTX_AREA_FK200": "",
+                "CTX_AREA_NK200": "",
+            },
+        ]
+
+        out: Dict[str, Any] = {
+            "ok": False,
+            "rows": [],
+            "errors": [],
+            "attempts": [],
+            "best_effort": True,
+        }
+        seen_order_ids: set[str] = set()
+        for path in paths:
+            norm_path = str(path or "").strip()
+            if not norm_path:
+                continue
+            if not norm_path.startswith("/"):
+                norm_path = "/" + norm_path
+            url = f"{base_url}{norm_path}"
+            for tr_id in tr_ids:
+                tr = str(tr_id or "").strip()
+                if not tr:
+                    continue
+                got_success = False
+                for candidate in param_candidates:
+                    ctx_fk200 = str(candidate.get("CTX_AREA_FK200", "") or "")
+                    ctx_nk200 = str(candidate.get("CTX_AREA_NK200", "") or "")
+                    for page in range(1, max_pages + 1):
+                        params = dict(candidate)
+                        params["CTX_AREA_FK200"] = ctx_fk200
+                        params["CTX_AREA_NK200"] = ctx_nk200
+                        try:
+                            def _request_page(
+                                *,
+                                u: str = url,
+                                p: Dict[str, Any] = dict(params),
+                                tr_id: str = tr,
+                                b: Any = broker,
+                                key: str = app_key,
+                                secret: str = app_secret,
+                            ) -> Dict[str, Any]:
+                                auth = str(getattr(b, "access_token", "") or "").strip()
+                                headers = {
+                                    "content-type": "application/json",
+                                    "authorization": auth,
+                                    "appKey": key,
+                                    "appSecret": secret,
+                                    "tr_id": tr_id,
+                                }
+                                return self._http_get_json(
+                                    url=u,
+                                    headers=headers,
+                                    params=p,
+                                    timeout_sec=timeout_sec,
+                                )
+
+                            payload = self._call_with_rate_limit_retry(
+                                _request_page,
+                                op_name=f"US.{exchange_upper}.order_status.{tr}.page{page}",
+                            )
+                        except Exception as exc:
+                            out["errors"].append(f"{exchange_upper}:{norm_path}:{tr}:{repr(exc)}")
+                            break
+                        if not isinstance(payload, dict):
+                            out["errors"].append(f"{exchange_upper}:{norm_path}:{tr}:invalid_payload_type")
+                            break
+                        api_err = self._api_error_text(payload)
+                        if api_err:
+                            out["errors"].append(f"{exchange_upper}:{norm_path}:{tr}:{api_err}")
+                            break
+
+                        got_success = True
+                        out["attempts"].append(
+                            {
+                                "exchange": exchange_upper,
+                                "path": norm_path,
+                                "tr_id": tr,
+                                "page": int(page),
+                                "msg_cd": str(payload.get("msg_cd", "") or ""),
+                                "msg1": str(payload.get("msg1", "") or ""),
+                            }
+                        )
+                        rows = self._parse_order_status_rows(market="US", exchange=exchange_upper, payload=payload)
+                        for row in rows:
+                            odno = str(row.get("broker_order_id", "")).strip()
+                            if not odno or odno in seen_order_ids:
+                                continue
+                            seen_order_ids.add(odno)
+                            out["rows"].append(row)
+
+                        tr_cont = str(payload.get("tr_cont", "") or "").strip().upper()
+                        next_fk = str(payload.get("ctx_area_fk200", "") or "").strip()
+                        next_nk = str(payload.get("ctx_area_nk200", "") or "").strip()
+                        if tr_cont in {"", "E"} or (not next_fk and not next_nk):
+                            break
+                        ctx_fk200 = next_fk
+                        ctx_nk200 = next_nk
+                        time.sleep(self._env_float("AGENT_LAB_US_ORDER_STATUS_PAGE_DELAY_SEC", 0.2, 0.0, 2.0))
+                    if got_success:
+                        out["ok"] = True
+                        break
+                if got_success:
+                    break
+        return out
+
+    def fetch_order_status_snapshot(self, market: str = "ALL") -> Dict[str, Any]:
+        scope = str(market or "ALL").strip().upper()
+        targets = ["KR", "US"] if scope in {"ALL", "*"} else [scope]
+        out: Dict[str, Any] = {
+            "ok": True,
+            "market_scope": "ALL" if len(targets) > 1 else targets[0],
+            "fetched_at": datetime.now().isoformat(timespec="seconds"),
+            "markets": {},
+            "rows": [],
+            "errors": [],
+        }
+        for mk in targets:
+            if mk == "US":
+                market_out: Dict[str, Any] = {"ok": False, "rows": [], "errors": [], "best_effort": True}
+                merged_rows: Dict[str, Dict[str, Any]] = {}
+                for ex in self._exchange_candidates("US"):
+                    per_ex = self._fetch_order_status_us_direct_exchange(ex)
+                    if bool(per_ex.get("ok", False)):
+                        market_out["ok"] = True
+                    market_out["errors"].extend(list(per_ex.get("errors", []) or []))
+                    for row in list(per_ex.get("rows", []) or []):
+                        if not isinstance(row, dict):
+                            continue
+                        odno = str(row.get("broker_order_id", "")).strip()
+                        if not odno:
+                            continue
+                        existing = merged_rows.get(odno)
+                        if not existing:
+                            merged_rows[odno] = row
+                            continue
+                        # Prefer rows with larger filled qty, then with explicit open/closed signal.
+                        ex_filled = float(existing.get("filled_quantity", 0.0) or 0.0)
+                        new_filled = float(row.get("filled_quantity", 0.0) or 0.0)
+                        if new_filled > ex_filled + 1e-9:
+                            merged_rows[odno] = row
+                            continue
+                        ex_open = existing.get("is_open")
+                        new_open = row.get("is_open")
+                        if ex_open is None and new_open is not None:
+                            merged_rows[odno] = row
+                market_out["rows"] = list(merged_rows.values())
+            else:
+                market_out = {
+                    "ok": True,
+                    "rows": [],
+                    "errors": [],
+                    "best_effort": True,
+                }
+            out["markets"][mk] = market_out
+            out["rows"].extend(list(market_out.get("rows", []) or []))
+            out["errors"].extend(list(market_out.get("errors", []) or []))
+            if mk == "KR" and not bool(market_out.get("ok", False)):
+                out["ok"] = False
         return out
 
     @staticmethod
@@ -1277,6 +1677,9 @@ class PaperBroker:
         cash_candidates: List[float] = []
         equity_candidates: List[float] = []
         raw_by_exchange: Dict[str, Any] = {}
+        merge_mode = str(os.getenv("AGENT_LAB_US_BALANCE_MERGE_MODE", "max") or "max").strip().lower()
+        if merge_mode not in {"max", "sum"}:
+            merge_mode = "max"
         for item in rows:
             if not isinstance(item, dict):
                 continue
@@ -1302,24 +1705,48 @@ class PaperBroker:
                 mv = float(pos.get("market_value_krw", 0.0) or 0.0)
                 fx = float(pos.get("fx_rate", 1.0) or 1.0)
                 ccy = str(pos.get("currency", "USD") or "USD").strip().upper()
-                st = by_symbol.setdefault(
-                    symbol,
-                    {
+                if merge_mode == "sum":
+                    st = by_symbol.setdefault(
+                        symbol,
+                        {
+                            "market": "US",
+                            "symbol": symbol,
+                            "quantity": 0.0,
+                            "avg_cost_krw": 0.0,
+                            "market_value_krw": 0.0,
+                            "fx_num": 0.0,
+                            "fx_den": 0.0,
+                            "currency": ccy,
+                            "source_exchange": exchange,
+                        },
+                    )
+                    st["quantity"] += qty
+                    st["avg_cost_krw"] += qty * avg
+                    st["market_value_krw"] += max(0.0, mv)
+                    st["fx_num"] += qty * max(0.0, fx)
+                    st["fx_den"] += qty
+                else:
+                    # Default is de-dup mode: same holdings can appear on NASD/NYSE/AMEX queries.
+                    # Keep the most informative single row per symbol to avoid triple counting.
+                    existing = by_symbol.get(symbol)
+                    cand = {
                         "market": "US",
                         "symbol": symbol,
-                        "quantity": 0.0,
-                        "avg_cost_krw": 0.0,
-                        "market_value_krw": 0.0,
-                        "fx_num": 0.0,
-                        "fx_den": 0.0,
+                        "quantity": float(qty),
+                        "avg_cost_krw": float(qty * avg),
+                        "market_value_krw": float(max(0.0, mv)),
+                        "fx_num": float(qty * max(0.0, fx)),
+                        "fx_den": float(qty),
                         "currency": ccy,
-                    },
-                )
-                st["quantity"] += qty
-                st["avg_cost_krw"] += qty * avg
-                st["market_value_krw"] += max(0.0, mv)
-                st["fx_num"] += qty * max(0.0, fx)
-                st["fx_den"] += qty
+                        "source_exchange": exchange,
+                    }
+                    if not existing:
+                        by_symbol[symbol] = cand
+                        continue
+                    ex_qty = float(existing.get("quantity", 0.0) or 0.0)
+                    ex_mv = float(existing.get("market_value_krw", 0.0) or 0.0)
+                    if (qty > ex_qty + 1e-9) or (abs(qty - ex_qty) <= 1e-9 and mv > ex_mv + 1e-9):
+                        by_symbol[symbol] = cand
         positions: List[Dict[str, Any]] = []
         for st in by_symbol.values():
             qty = float(st.get("quantity", 0.0) or 0.0)
@@ -1338,7 +1765,11 @@ class PaperBroker:
                     "market_value_krw": float(st.get("market_value_krw", 0.0) or 0.0),
                     "currency": str(st.get("currency", "USD")),
                     "fx_rate": fx_rate,
-                    "payload": {"source": "merged_us_exchange_snapshots"},
+                    "payload": {
+                        "source": "merged_us_exchange_snapshots",
+                        "merge_mode": merge_mode,
+                        "source_exchange": str(st.get("source_exchange", "")).strip().upper(),
+                    },
                 }
             )
         cash_krw = max(cash_candidates) if cash_candidates else 0.0
@@ -1348,7 +1779,7 @@ class PaperBroker:
             "cash_krw": float(cash_krw),
             "equity_krw": float(max(equity_krw, cash_krw)),
             "positions": positions,
-            "raw": {"by_exchange": raw_by_exchange},
+            "raw": {"by_exchange": raw_by_exchange, "merge_mode": merge_mode},
         }
 
     def _fetch_us_snapshot_all_exchanges(self) -> Dict[str, Any]:
@@ -1462,6 +1893,27 @@ class PaperBroker:
                         continue
                     sell_available[sym] = sell_available.get(sym, 0.0) + qty
 
+        enable_us_buy_precheck_sync = self._env_bool("AGENT_LAB_US_BUY_PRECHECK_SYNC", True)
+        us_buy_precheck_sync: Dict[str, Any] = {"ok": False, "reason": "disabled"}
+        us_cash_available_krw: float = 0.0
+        has_sell_orders_in_batch = any(
+            str(item.get("side", "")).strip().upper() == "SELL"
+            and float(item.get("quantity", 0.0) or 0.0) > 0
+            for item in list(orders or [])
+            if isinstance(item, dict)
+        )
+        if (
+            market_upper == "US"
+            and self.execution_mode in {"mojito_mock", "mock_api"}
+            and enable_us_buy_precheck_sync
+        ):
+            try:
+                us_buy_precheck_sync = self.fetch_account_snapshot(market="US")
+            except Exception as exc:
+                us_buy_precheck_sync = {"ok": False, "reason": "exception", "errors": [repr(exc)]}
+            if bool(us_buy_precheck_sync.get("ok", False)):
+                us_cash_available_krw = float(us_buy_precheck_sync.get("cash_krw", 0.0) or 0.0)
+
         for order in orders:
             symbol = str(order["symbol"]).strip().upper()
             side = str(order.get("side", "BUY")).upper()
@@ -1491,6 +1943,21 @@ class PaperBroker:
                             precheck_reject_reason = "sell_precheck_no_position"
                         elif submit_qty > available_qty:
                             submit_qty = float(available_qty)
+                elif side == "BUY" and market_upper == "US" and enable_us_buy_precheck_sync:
+                    if bool(us_buy_precheck_sync.get("ok", False)):
+                        order_cost_krw = float(ref_price) * float(submit_qty) * float(fx_rate)
+                        if us_cash_available_krw <= 0.0 and not has_sell_orders_in_batch:
+                            precheck_reject_reason = "us_buying_power_zero_precheck"
+                        elif order_cost_krw > us_cash_available_krw:
+                            unit_cost_krw = max(1e-9, float(ref_price) * float(fx_rate))
+                            affordable_qty = int(max(0.0, us_cash_available_krw) // unit_cost_krw)
+                            if affordable_qty <= 0:
+                                precheck_reject_reason = "us_buying_power_insufficient_precheck"
+                            else:
+                                submit_qty = float(min(int(submit_qty), affordable_qty))
+                    elif not has_sell_orders_in_batch:
+                        # In strict mode with no sell-proceeds path, skip speculative US buy when balance sync failed.
+                        precheck_reject_reason = "us_buy_precheck_sync_failed"
 
                 if precheck_reject_reason:
                     status = "REJECTED"
@@ -1503,6 +1970,8 @@ class PaperBroker:
                         "requested_quantity": float(qty),
                         "submit_quantity": float(submit_qty),
                         "sell_precheck_sync": sell_precheck_sync if side == "SELL" and enable_sell_precheck_sync else {},
+                        "us_buy_precheck_sync": us_buy_precheck_sync if side == "BUY" and market_upper == "US" and enable_us_buy_precheck_sync else {},
+                        "us_cash_available_krw": float(us_cash_available_krw) if side == "BUY" and market_upper == "US" else None,
                         "fx_rate": float(fx_rate),
                     }
                 else:
@@ -1539,6 +2008,13 @@ class PaperBroker:
                 if side == "SELL" and status in {"SUBMITTED", "FILLED"}:
                     current = float(sell_available.get(symbol, 0.0) or 0.0)
                     sell_available[symbol] = max(0.0, current - float(submit_qty))
+                    if market_upper == "US":
+                        us_cash_available_krw += float(ref_price) * float(submit_qty) * float(fx_rate)
+                elif side == "BUY" and status in {"SUBMITTED", "FILLED"} and market_upper == "US":
+                    us_cash_available_krw = max(
+                        0.0,
+                        us_cash_available_krw - (float(ref_price) * float(submit_qty) * float(fx_rate)),
+                    )
 
                 if enable_daily_blacklist and status == "REJECTED":
                     err_text = self._collect_send_error_text(broker_resp)

@@ -1298,6 +1298,41 @@ class AgentLabOrchestrator:
                     "error_count": len(list(payload_obj.get("errors", []) or [])),
                     "best_effort": bool(payload_obj.get("best_effort", False)),
                 }
+        order_status_snapshot = self.paper_broker.fetch_order_status_snapshot(market_scope)
+        odno_status_lookup_ok: Dict[str, bool] = {}
+        odno_status_lookup_summary: Dict[str, Any] = {}
+        odno_status_by_market: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        status_markets_payload = order_status_snapshot.get("markets", {})
+        if isinstance(status_markets_payload, dict):
+            for mk, payload in status_markets_payload.items():
+                mk_upper = str(mk or "").strip().upper()
+                if mk_upper not in {"KR", "US"}:
+                    continue
+                payload_obj = payload if isinstance(payload, dict) else {}
+                mk_ok = bool(payload_obj.get("ok", False))
+                odno_status_lookup_ok[mk_upper] = mk_ok
+                rows_payload = list(payload_obj.get("rows", []) or [])
+                odno_status_lookup_summary[mk_upper] = {
+                    "ok": mk_ok,
+                    "row_count": len(rows_payload),
+                    "error_count": len(list(payload_obj.get("errors", []) or [])),
+                    "best_effort": bool(payload_obj.get("best_effort", False)),
+                }
+                for item in rows_payload:
+                    if not isinstance(item, dict):
+                        continue
+                    odno = str(item.get("broker_order_id", "")).strip()
+                    if not odno:
+                        continue
+                    key = (mk_upper, odno)
+                    odno_status_by_market[key] = {
+                        "is_open": item.get("is_open"),
+                        "is_filled_closed": bool(item.get("is_filled_closed", False)),
+                        "filled_quantity": float(item.get("filled_quantity", 0.0) or 0.0),
+                        "unfilled_quantity": float(item.get("unfilled_quantity", 0.0) or 0.0),
+                        "order_quantity": float(item.get("order_quantity", 0.0) or 0.0),
+                        "status_text": str(item.get("status_text", "") or ""),
+                    }
         odno_close_grace_sec = self._submitted_odno_close_grace_seconds()
         odno_priority_enabled = self._env_bool("AGENT_LAB_ODNO_STATUS_PRIORITY", True)
         filled_orders: List[Dict[str, Any]] = []
@@ -1320,25 +1355,77 @@ class AgentLabOrchestrator:
             odno_open: Optional[bool] = None
             if broker_order_id and lookup_ok:
                 odno_open = broker_order_id in open_order_ids_by_market.get(market, set())
+            odno_status = (
+                odno_status_by_market.get((market, broker_order_id), {})
+                if broker_order_id
+                else {}
+            )
+            odno_status_has = isinstance(odno_status, dict) and len(odno_status) > 0
+            odno_status_open = odno_status.get("is_open") if odno_status_has else None
+            odno_status_filled_qty = float(odno_status.get("filled_quantity", 0.0) or 0.0) if odno_status_has else 0.0
             key = (market, symbol)
             server_qty = float(server_map.get(key, 0.0) or 0.0)
             local_qty = float(local_map.get(key, 0.0) or 0.0)
             should_fill_delta = False
+            settle_qty = float(qty)
             if side == "BUY":
                 should_fill_delta = (server_qty - local_qty) >= (qty - 1e-9)
             elif side == "SELL":
                 should_fill_delta = (local_qty - server_qty) >= (qty - 1e-9)
             settlement_basis = "delta_fallback"
+            status_detail_applied = False
+
+            # US ODNO detail sync (best-effort): prefer explicit per-order close/fill state.
+            if market == "US" and broker_order_id and odno_status_has:
+                if odno_status_open is True:
+                    continue
+                if odno_status_filled_qty > 0:
+                    settle_qty = min(float(qty), float(max(0.0, odno_status_filled_qty)))
+                    should_fill_delta = settle_qty > 0
+                    settlement_basis = "odno_detail_filled"
+                    status_detail_applied = True
+                elif odno_status_open is False:
+                    broker_payload = self._decode_json_obj(row.get("broker_response_json"))
+                    broker_payload["odno_settlement"] = {
+                        "applied_at": now_iso(),
+                        "from_status": "SUBMITTED",
+                        "to_status": "REJECTED",
+                        "reason": "odno_detail_closed_without_fill",
+                        "odno": broker_order_id,
+                        "age_sec": None if age_sec is None else float(age_sec),
+                        "odno_priority_enabled": bool(odno_priority_enabled),
+                        "odno_detail": odno_status,
+                    }
+                    self.storage.update_paper_order_status_with_response(
+                        paper_order_id=paper_order_id,
+                        status="REJECTED",
+                        broker_response_json=broker_payload,
+                    )
+                    closed_orders.append(
+                        {
+                            "paper_order_id": paper_order_id,
+                            "market": market,
+                            "symbol": symbol,
+                            "side": side,
+                            "quantity": qty,
+                            "broker_order_id": broker_order_id,
+                            "age_sec": None if age_sec is None else float(age_sec),
+                            "reason": "odno_detail_closed_without_fill",
+                        }
+                    )
+                    closed_order_ids.add(paper_order_id)
+                    continue
 
             # ODNO-first mode:
             # - ODNO=open   => keep SUBMITTED regardless of quantity delta.
             # - ODNO=closed => settle only when delta proves fill, else close as rejected after grace.
-            if odno_priority_enabled and broker_order_id and lookup_ok:
+            if (not status_detail_applied) and odno_priority_enabled and broker_order_id and lookup_ok:
                 if odno_open is True:
                     continue
                 if odno_open is False:
                     if not should_fill_delta:
-                        if age_sec is not None and float(age_sec) >= float(odno_close_grace_sec):
+                        grace_sec = self._submitted_odno_close_grace_seconds_for_market(market)
+                        if age_sec is not None and float(age_sec) >= float(grace_sec):
                             broker_payload = self._decode_json_obj(row.get("broker_response_json"))
                             broker_payload["odno_settlement"] = {
                                 "applied_at": now_iso(),
@@ -1347,6 +1434,7 @@ class AgentLabOrchestrator:
                                 "reason": "odno_closed_without_fill_delta",
                                 "odno": broker_order_id,
                                 "age_sec": float(age_sec),
+                                "close_grace_sec": int(grace_sec),
                                 "odno_priority_enabled": True,
                             }
                             self.storage.update_paper_order_status_with_response(
@@ -1364,6 +1452,7 @@ class AgentLabOrchestrator:
                                     "broker_order_id": broker_order_id,
                                     "age_sec": float(age_sec),
                                     "reason": "odno_closed_without_fill_delta",
+                                    "close_grace_sec": int(grace_sec),
                                 }
                             )
                             closed_order_ids.add(paper_order_id)
@@ -1386,27 +1475,28 @@ class AgentLabOrchestrator:
             )
             if fx_rate <= 0:
                 fx_rate = 1.0
-            fill_value_krw = float(fill_price) * float(qty) * float(fx_rate)
+            fill_value_krw = float(fill_price) * float(settle_qty) * float(fx_rate)
             self.storage.insert_paper_fill(
                 paper_order_id=paper_order_id,
                 fill_price=float(fill_price),
-                fill_quantity=float(qty),
+                fill_quantity=float(settle_qty),
                 fill_value_krw=float(fill_value_krw),
                 fx_rate=float(fx_rate),
                 filled_at=now_iso(),
             )
             self.storage.update_paper_order_status(paper_order_id=paper_order_id, status="FILLED")
             if side == "BUY":
-                local_map[key] = local_qty + qty
+                local_map[key] = local_qty + settle_qty
             elif side == "SELL":
-                local_map[key] = max(0.0, local_qty - qty)
+                local_map[key] = max(0.0, local_qty - settle_qty)
             filled_orders.append(
                 {
                     "paper_order_id": paper_order_id,
                     "market": market,
                     "symbol": symbol,
                     "side": side,
-                    "quantity": qty,
+                    "quantity": settle_qty,
+                    "requested_quantity": qty,
                     "broker_order_id": broker_order_id,
                     "settlement_basis": settlement_basis,
                 }
@@ -1425,6 +1515,11 @@ class AgentLabOrchestrator:
             odno_open: Optional[bool] = None
             if broker_order_id and lookup_ok:
                 odno_open = broker_order_id in open_order_ids_by_market.get(market, set())
+            odno_status = (
+                odno_status_by_market.get((market, broker_order_id), {})
+                if broker_order_id
+                else {}
+            )
             age_sec = self._age_seconds_from_iso(str(row.get("submitted_at", "")))
             pending_orders.append(
                 {
@@ -1439,6 +1534,13 @@ class AgentLabOrchestrator:
                     "observed_at": now_iso_ts,
                     "odno_lookup_ok": lookup_ok,
                     "odno_open": odno_open,
+                    "odno_status_found": bool(isinstance(odno_status, dict) and len(odno_status) > 0),
+                    "odno_status_open": (odno_status.get("is_open") if isinstance(odno_status, dict) else None),
+                    "odno_status_filled_qty": (
+                        float(odno_status.get("filled_quantity", 0.0) or 0.0)
+                        if isinstance(odno_status, dict)
+                        else 0.0
+                    ),
                 }
             )
 
@@ -1454,6 +1556,11 @@ class AgentLabOrchestrator:
                 "ok": bool(open_orders_snapshot.get("ok", False)),
                 "markets": open_lookup_summary,
                 "errors": list(open_orders_snapshot.get("errors", []) or []),
+            },
+            "order_status_lookup": {
+                "ok": bool(order_status_snapshot.get("ok", False)),
+                "markets": odno_status_lookup_summary,
+                "errors": list(order_status_snapshot.get("errors", []) or []),
             },
         }
         if filled_orders:
@@ -1475,6 +1582,7 @@ class AgentLabOrchestrator:
                     "closed_count": len(closed_orders),
                     "closed_orders": closed_orders[:50],
                     "odno_close_grace_sec": int(odno_close_grace_sec),
+                    "us_odno_close_grace_sec": int(self._submitted_odno_close_grace_seconds_for_market("US")),
                 },
                 now_iso(),
             )
@@ -1513,6 +1621,17 @@ class AgentLabOrchestrator:
             value = int(float(os.getenv("AGENT_LAB_SUBMITTED_ODNO_CLOSE_GRACE_SEC", "300") or 300))
         except Exception:
             value = 300
+        return max(30, min(7200, value))
+
+    @classmethod
+    def _submitted_odno_close_grace_seconds_for_market(cls, market: str) -> int:
+        base = cls._submitted_odno_close_grace_seconds()
+        if str(market or "").strip().upper() != "US":
+            return int(base)
+        try:
+            value = int(float(os.getenv("AGENT_LAB_US_SUBMITTED_ODNO_CLOSE_GRACE_SEC", str(base)) or base))
+        except Exception:
+            value = int(base)
         return max(30, min(7200, value))
 
     @staticmethod
@@ -1563,6 +1682,11 @@ class AgentLabOrchestrator:
                 age_f = float(age)
             except Exception:
                 age_f = -1.0
+            # If ODNO detail already says "closed", stale alert is noise.
+            if bool(row.get("odno_status_found", False)) and row.get("odno_status_open") is False:
+                continue
+            if bool(row.get("odno_lookup_ok", False)) and row.get("odno_open") is False:
+                continue
             if age_f >= float(stale_sec):
                 stale_rows.append({**row, "age_sec": age_f})
         if not stale_rows:
