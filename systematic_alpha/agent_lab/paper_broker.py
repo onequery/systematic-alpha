@@ -8,6 +8,8 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Set
 from zoneinfo import ZoneInfo
 
+import requests
+
 from systematic_alpha.agent_lab.storage import AgentLabStorage
 from systematic_alpha.credentials import load_credentials
 from systematic_alpha.mojito_loader import import_mojito_module
@@ -556,7 +558,18 @@ class PaperBroker:
         for row in rows:
             broker_order_id = cls._pick_text_ci(
                 row,
-                ["ODNO", "odno", "ord_no", "ordno", "ORGN_ODNO", "orgn_odno"],
+                [
+                    "ODNO",
+                    "odno",
+                    "ord_no",
+                    "ordno",
+                    "ORGN_ODNO",
+                    "orgn_odno",
+                    "ovrs_ord_no",
+                    "OVRS_ORD_NO",
+                    "ord_sqn",
+                    "ORD_SQN",
+                ],
             ).strip()
             if not broker_order_id:
                 continue
@@ -568,7 +581,15 @@ class PaperBroker:
             side = cls._normalize_side_text(
                 cls._pick_text_ci(
                     row,
-                    ["SLL_BUY_DVSN_CD", "sll_buy_dvsn_cd", "sll_buy_dvsn_name", "side", "ord_dvsn"],
+                    [
+                        "SLL_BUY_DVSN_CD",
+                        "sll_buy_dvsn_cd",
+                        "sll_buy_dvsn_name",
+                        "SLL_BUY_DVSN_NAME",
+                        "side",
+                        "ord_dvsn",
+                        "ORD_DVSN",
+                    ],
                 )
             )
             qty = cls._pick_value(
@@ -580,6 +601,10 @@ class PaperBroker:
                     "rvse_cncl_qty",
                     "ord_psbl_qty",
                     "ord_psbl_qty1",
+                    "nccs_qty",
+                    "NCCS_QTY",
+                    "ft_ord_qty",
+                    "FT_ORD_QTY",
                     "qty",
                 ],
                 default=0.0,
@@ -596,6 +621,168 @@ class PaperBroker:
                 }
             )
         return out
+
+    @staticmethod
+    def _env_csv(name: str, default_values: List[str]) -> List[str]:
+        raw = str(os.getenv(name, "") or "").strip()
+        if not raw:
+            return list(default_values)
+        out: List[str] = []
+        seen: set[str] = set()
+        for token in raw.split(","):
+            item = str(token or "").strip()
+            if not item or item in seen:
+                continue
+            seen.add(item)
+            out.append(item)
+        return out or list(default_values)
+
+    def _fetch_open_orders_us_direct_exchange(self, exchange_code: str) -> Dict[str, Any]:
+        exchange_upper = str(exchange_code or "").strip().upper()
+        broker = self._get_broker("US", exchange_upper)
+        if broker is None:
+            return {
+                "ok": False,
+                "open_orders": [],
+                "errors": [f"{exchange_upper}:broker_unavailable"],
+                "best_effort": True,
+            }
+
+        base_url = str(getattr(broker, "base_url", "") or "").strip()
+        access_token = str(getattr(broker, "access_token", "") or "").strip()
+        app_key = str(getattr(broker, "api_key", "") or "").strip()
+        app_secret = str(getattr(broker, "api_secret", "") or "").strip()
+        cano = str(getattr(broker, "acc_no_prefix", "") or "").strip()
+        acnt_prdt_cd = str(getattr(broker, "acc_no_postfix", "") or "").strip()
+        is_mock = bool(getattr(broker, "mock", True))
+        if not (base_url and access_token and app_key and app_secret and cano and acnt_prdt_cd):
+            return {
+                "ok": False,
+                "open_orders": [],
+                "errors": [f"{exchange_upper}:broker_fields_missing"],
+                "best_effort": True,
+            }
+
+        timeout_sec = self._env_float("AGENT_LAB_US_OPEN_ORDER_TIMEOUT_SEC", 8.0, 1.0, 60.0)
+        max_pages = self._env_int("AGENT_LAB_US_OPEN_ORDER_MAX_PAGES", 1, 1, 10)
+        default_paths = ["/uapi/overseas-stock/v1/trading/inquire-nccs"]
+        default_tr_ids = ["VTTS3018R", "VTTT3018R"] if is_mock else ["TTTS3018R", "JTTT3018R"]
+        paths = self._env_csv("AGENT_LAB_US_OPEN_ORDER_PATHS", default_paths)
+        tr_ids = self._env_csv(
+            "AGENT_LAB_US_OPEN_ORDER_TR_IDS_MOCK" if is_mock else "AGENT_LAB_US_OPEN_ORDER_TR_IDS_REAL",
+            default_tr_ids,
+        )
+
+        out: Dict[str, Any] = {
+            "ok": False,
+            "open_orders": [],
+            "errors": [],
+            "attempts": [],
+            "best_effort": True,
+        }
+        seen_order_ids: set[str] = set()
+        for path in paths:
+            norm_path = str(path or "").strip()
+            if not norm_path:
+                continue
+            if not norm_path.startswith("/"):
+                norm_path = "/" + norm_path
+            url = f"{base_url}{norm_path}"
+            for tr_id in tr_ids:
+                tr = str(tr_id or "").strip()
+                if not tr:
+                    continue
+                ctx_fk200 = ""
+                ctx_nk200 = ""
+                got_success = False
+                for page in range(1, max_pages + 1):
+                    headers = {
+                        "content-type": "application/json",
+                        "authorization": access_token,
+                        "appKey": app_key,
+                        "appSecret": app_secret,
+                        "tr_id": tr,
+                    }
+                    params = {
+                        "CANO": cano,
+                        "ACNT_PRDT_CD": acnt_prdt_cd,
+                        "OVRS_EXCG_CD": exchange_upper,
+                        "SORT_SQN": "DS",
+                        "CTX_AREA_FK200": ctx_fk200,
+                        "CTX_AREA_NK200": ctx_nk200,
+                    }
+                    try:
+                        payload = self._call_with_rate_limit_retry(
+                            lambda u=url, h=dict(headers), p=dict(params): self._http_get_json(
+                                url=u,
+                                headers=h,
+                                params=p,
+                                timeout_sec=timeout_sec,
+                            ),
+                            op_name=f"US.{exchange_upper}.open_orders.{tr}.page{page}",
+                        )
+                    except Exception as exc:
+                        out["errors"].append(f"{exchange_upper}:{norm_path}:{tr}:{repr(exc)}")
+                        break
+                    if not isinstance(payload, dict):
+                        out["errors"].append(f"{exchange_upper}:{norm_path}:{tr}:invalid_payload_type")
+                        break
+                    api_err = self._api_error_text(payload)
+                    if api_err:
+                        out["errors"].append(f"{exchange_upper}:{norm_path}:{tr}:{api_err}")
+                        break
+
+                    got_success = True
+                    out["attempts"].append(
+                        {
+                            "exchange": exchange_upper,
+                            "path": norm_path,
+                            "tr_id": tr,
+                            "page": int(page),
+                            "msg_cd": str(payload.get("msg_cd", "") or ""),
+                            "msg1": str(payload.get("msg1", "") or ""),
+                        }
+                    )
+                    rows = self._parse_open_order_rows(market="US", exchange=exchange_upper, payload=payload)
+                    for row in rows:
+                        odno = str(row.get("broker_order_id", "")).strip()
+                        if not odno or odno in seen_order_ids:
+                            continue
+                        seen_order_ids.add(odno)
+                        out["open_orders"].append(row)
+
+                    tr_cont = str(payload.get("tr_cont", "") or "").strip().upper()
+                    next_fk = str(payload.get("ctx_area_fk200", "") or "").strip()
+                    next_nk = str(payload.get("ctx_area_nk200", "") or "").strip()
+                    if tr_cont in {"", "E"} or (not next_fk and not next_nk):
+                        break
+                    ctx_fk200 = next_fk
+                    ctx_nk200 = next_nk
+                    time.sleep(self._env_float("AGENT_LAB_US_OPEN_ORDER_PAGE_DELAY_SEC", 0.2, 0.0, 2.0))
+                if got_success:
+                    out["ok"] = True
+        return out
+
+    @staticmethod
+    def _http_get_json(
+        *,
+        url: str,
+        headers: Dict[str, Any],
+        params: Dict[str, Any],
+        timeout_sec: float,
+    ) -> Dict[str, Any]:
+        resp = requests.get(url, headers=headers, params=params, timeout=float(timeout_sec))
+        try:
+            payload = resp.json()
+        except Exception:
+            payload = {"rt_cd": "1", "msg_cd": "HTTP_JSON_PARSE_ERROR", "msg1": str(resp.text[:200])}
+        if not isinstance(payload, dict):
+            payload = {"output": payload}
+        payload["_http_status"] = int(resp.status_code)
+        tr_cont = resp.headers.get("tr_cont")
+        if tr_cont is not None:
+            payload["tr_cont"] = str(tr_cont)
+        return payload
 
     def _fetch_open_orders_for_target(self, market: str) -> Dict[str, Any]:
         market_upper = str(market or "").strip().upper()
@@ -619,6 +806,18 @@ class PaperBroker:
                 out["errors"].append(f"{exchange_code}:broker_unavailable")
                 continue
             exchange_ok = False
+            if market_upper == "US":
+                direct = self._fetch_open_orders_us_direct_exchange(exchange_code)
+                if bool(direct.get("ok", False)):
+                    out["open_orders"].extend(list(direct.get("open_orders", []) or []))
+                    exchange_ok = True
+                out["errors"].extend(list(direct.get("errors", []) or []))
+                # US direct REST is preferred; keep legacy call only as fallback.
+                allow_legacy = self._env_bool("AGENT_LAB_US_OPEN_ORDER_LEGACY_FALLBACK", False)
+                if exchange_ok or not allow_legacy:
+                    if exchange_ok:
+                        out["ok"] = True
+                    continue
             for idx, param in enumerate(param_candidates, start=1):
                 try:
                     payload = self._call_with_rate_limit_retry(

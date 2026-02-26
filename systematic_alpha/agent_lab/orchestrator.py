@@ -1299,6 +1299,7 @@ class AgentLabOrchestrator:
                     "best_effort": bool(payload_obj.get("best_effort", False)),
                 }
         odno_close_grace_sec = self._submitted_odno_close_grace_seconds()
+        odno_priority_enabled = self._env_bool("AGENT_LAB_ODNO_STATUS_PRIORITY", True)
         filled_orders: List[Dict[str, Any]] = []
         filled_order_ids: set[int] = set()
         closed_orders: List[Dict[str, Any]] = []
@@ -1322,44 +1323,56 @@ class AgentLabOrchestrator:
             key = (market, symbol)
             server_qty = float(server_map.get(key, 0.0) or 0.0)
             local_qty = float(local_map.get(key, 0.0) or 0.0)
-            should_fill = False
+            should_fill_delta = False
             if side == "BUY":
-                should_fill = (server_qty - local_qty) >= (qty - 1e-9)
+                should_fill_delta = (server_qty - local_qty) >= (qty - 1e-9)
             elif side == "SELL":
-                should_fill = (local_qty - server_qty) >= (qty - 1e-9)
-            # If order is no longer open on broker(ODNO closed), delta-based fill
-            # still takes precedence when server/local quantities prove a fill.
-            if not should_fill and broker_order_id and lookup_ok and (odno_open is False):
-                if market == "KR" and age_sec is not None and float(age_sec) >= float(odno_close_grace_sec):
-                    broker_payload = self._decode_json_obj(row.get("broker_response_json"))
-                    broker_payload["odno_settlement"] = {
-                        "applied_at": now_iso(),
-                        "from_status": "SUBMITTED",
-                        "to_status": "REJECTED",
-                        "reason": "odno_closed_without_fill_delta",
-                        "odno": broker_order_id,
-                        "age_sec": float(age_sec),
-                    }
-                    self.storage.update_paper_order_status_with_response(
-                        paper_order_id=paper_order_id,
-                        status="REJECTED",
-                        broker_response_json=broker_payload,
-                    )
-                    closed_orders.append(
-                        {
-                            "paper_order_id": paper_order_id,
-                            "market": market,
-                            "symbol": symbol,
-                            "side": side,
-                            "quantity": qty,
-                            "broker_order_id": broker_order_id,
-                            "age_sec": float(age_sec),
-                            "reason": "odno_closed_without_fill_delta",
-                        }
-                    )
-                    closed_order_ids.add(paper_order_id)
+                should_fill_delta = (local_qty - server_qty) >= (qty - 1e-9)
+            settlement_basis = "delta_fallback"
+
+            # ODNO-first mode:
+            # - ODNO=open   => keep SUBMITTED regardless of quantity delta.
+            # - ODNO=closed => settle only when delta proves fill, else close as rejected after grace.
+            if odno_priority_enabled and broker_order_id and lookup_ok:
+                if odno_open is True:
+                    continue
+                if odno_open is False:
+                    if not should_fill_delta:
+                        if age_sec is not None and float(age_sec) >= float(odno_close_grace_sec):
+                            broker_payload = self._decode_json_obj(row.get("broker_response_json"))
+                            broker_payload["odno_settlement"] = {
+                                "applied_at": now_iso(),
+                                "from_status": "SUBMITTED",
+                                "to_status": "REJECTED",
+                                "reason": "odno_closed_without_fill_delta",
+                                "odno": broker_order_id,
+                                "age_sec": float(age_sec),
+                                "odno_priority_enabled": True,
+                            }
+                            self.storage.update_paper_order_status_with_response(
+                                paper_order_id=paper_order_id,
+                                status="REJECTED",
+                                broker_response_json=broker_payload,
+                            )
+                            closed_orders.append(
+                                {
+                                    "paper_order_id": paper_order_id,
+                                    "market": market,
+                                    "symbol": symbol,
+                                    "side": side,
+                                    "quantity": qty,
+                                    "broker_order_id": broker_order_id,
+                                    "age_sec": float(age_sec),
+                                    "reason": "odno_closed_without_fill_delta",
+                                }
+                            )
+                            closed_order_ids.add(paper_order_id)
+                        continue
+                    settlement_basis = "odno_closed+delta"
+            elif not should_fill_delta:
                 continue
-            if not should_fill:
+
+            if not should_fill_delta:
                 continue
 
             limit_price = row.get("limit_price")
@@ -1395,7 +1408,7 @@ class AgentLabOrchestrator:
                     "side": side,
                     "quantity": qty,
                     "broker_order_id": broker_order_id,
-                    "settlement_basis": "delta+odno_closed" if odno_open is False else "delta",
+                    "settlement_basis": settlement_basis,
                 }
             )
             filled_order_ids.add(int(paper_order_id))
