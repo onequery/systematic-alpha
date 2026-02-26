@@ -649,13 +649,12 @@ class PaperBroker:
             }
 
         base_url = str(getattr(broker, "base_url", "") or "").strip()
-        access_token = str(getattr(broker, "access_token", "") or "").strip()
         app_key = str(getattr(broker, "api_key", "") or "").strip()
         app_secret = str(getattr(broker, "api_secret", "") or "").strip()
         cano = str(getattr(broker, "acc_no_prefix", "") or "").strip()
         acnt_prdt_cd = str(getattr(broker, "acc_no_postfix", "") or "").strip()
         is_mock = bool(getattr(broker, "mock", True))
-        if not (base_url and access_token and app_key and app_secret and cano and acnt_prdt_cd):
+        if not (base_url and app_key and app_secret and cano and acnt_prdt_cd):
             return {
                 "ok": False,
                 "open_orders": [],
@@ -696,13 +695,6 @@ class PaperBroker:
                 ctx_nk200 = ""
                 got_success = False
                 for page in range(1, max_pages + 1):
-                    headers = {
-                        "content-type": "application/json",
-                        "authorization": access_token,
-                        "appKey": app_key,
-                        "appSecret": app_secret,
-                        "tr_id": tr,
-                    }
                     params = {
                         "CANO": cano,
                         "ACNT_PRDT_CD": acnt_prdt_cd,
@@ -712,13 +704,32 @@ class PaperBroker:
                         "CTX_AREA_NK200": ctx_nk200,
                     }
                     try:
-                        payload = self._call_with_rate_limit_retry(
-                            lambda u=url, h=dict(headers), p=dict(params): self._http_get_json(
+                        def _request_page(
+                            *,
+                            u: str = url,
+                            p: Dict[str, Any] = dict(params),
+                            tr_id: str = tr,
+                            b: Any = broker,
+                            key: str = app_key,
+                            secret: str = app_secret,
+                        ) -> Dict[str, Any]:
+                            auth = str(getattr(b, "access_token", "") or "").strip()
+                            headers = {
+                                "content-type": "application/json",
+                                "authorization": auth,
+                                "appKey": key,
+                                "appSecret": secret,
+                                "tr_id": tr_id,
+                            }
+                            return self._http_get_json(
                                 url=u,
-                                headers=h,
+                                headers=headers,
                                 params=p,
                                 timeout_sec=timeout_sec,
-                            ),
+                            )
+
+                        payload = self._call_with_rate_limit_retry(
+                            _request_page,
                             op_name=f"US.{exchange_upper}.open_orders.{tr}.page{page}",
                         )
                     except Exception as exc:
@@ -929,6 +940,19 @@ class PaperBroker:
         )
 
     @staticmethod
+    def _is_token_expired_text(text: str) -> bool:
+        raw = str(text or "")
+        norm = raw.lower()
+        return (
+            ("egw00123" in norm)
+            or ("기간이 만료된 token" in raw)
+            or ("token 만료" in raw)
+            or ("expired token" in norm)
+            or ("invalid token" in norm)
+            or ("token expired" in norm)
+        )
+
+    @staticmethod
     def _is_transient_error_text(text: str) -> bool:
         raw = str(text or "")
         norm = raw.lower()
@@ -953,6 +977,71 @@ class PaperBroker:
     @classmethod
     def _is_rate_limited_payload(cls, payload: Any) -> bool:
         return cls._is_rate_limit_text(cls._api_error_text(payload))
+
+    def _refresh_broker_tokens(self, *, op_name: str, error_text: str) -> bool:
+        seen_ids: Set[int] = set()
+        brokers: List[Any] = []
+        for broker in self._brokers.values():
+            ident = id(broker)
+            if ident in seen_ids:
+                continue
+            seen_ids.add(ident)
+            brokers.append(broker)
+        if not brokers:
+            return False
+
+        old_tokens: Dict[int, str] = {}
+        for broker in brokers:
+            old_tokens[id(broker)] = str(getattr(broker, "access_token", "") or "")
+
+        issued = False
+        errors: List[str] = []
+        for broker in brokers:
+            issue_fn = getattr(broker, "issue_access_token", None)
+            if not callable(issue_fn):
+                continue
+            try:
+                issue_fn()
+                issued = True
+                break
+            except Exception as exc:
+                errors.append(f"issue:{repr(exc)}")
+
+        for broker in brokers:
+            load_fn = getattr(broker, "load_access_token", None)
+            if not callable(load_fn):
+                continue
+            try:
+                load_fn()
+            except Exception as exc:
+                errors.append(f"load:{repr(exc)}")
+
+        changed = False
+        for broker in brokers:
+            before = old_tokens.get(id(broker), "")
+            after = str(getattr(broker, "access_token", "") or "")
+            if after and after != before:
+                changed = True
+                break
+
+        ok = bool(issued or changed)
+        try:
+            self.storage.log_event(
+                "broker_token_refresh",
+                {
+                    "op": str(op_name),
+                    "ok": bool(ok),
+                    "issued": bool(issued),
+                    "changed": bool(changed),
+                    "broker_count": int(len(brokers)),
+                    "error": str(error_text)[:240],
+                    "errors": [str(err)[:180] for err in errors[:5]],
+                },
+                datetime.now().isoformat(timespec="seconds"),
+            )
+        except Exception:
+            pass
+        return ok
 
     @staticmethod
     def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -1005,21 +1094,35 @@ class PaperBroker:
         transient_base_delay = self._env_float("AGENT_LAB_BROKER_TRANSIENT_BACKOFF_SEC", 0.8, 0.0, 60.0)
         transient_mult = self._env_float("AGENT_LAB_BROKER_TRANSIENT_BACKOFF_MULT", 1.8, 1.0, 5.0)
         transient_max_delay = self._env_float("AGENT_LAB_BROKER_TRANSIENT_BACKOFF_MAX_SEC", 6.0, 0.1, 120.0)
+        token_refresh_retries = self._env_int("AGENT_LAB_BROKER_TOKEN_REFRESH_RETRIES", 1, 0, 3)
 
         rate_attempt = 0
         transient_attempt = 0
+        token_refresh_attempt = 0
         last_exc: Exception | None = None
         while True:
             try:
                 payload = fn()
+                api_err = self._api_error_text(payload)
+                if self._is_token_expired_text(api_err):
+                    if token_refresh_attempt < token_refresh_retries:
+                        token_refresh_attempt += 1
+                        if self._refresh_broker_tokens(op_name=op_name, error_text=api_err):
+                            continue
+                    raise RuntimeError(api_err)
                 if self._is_rate_limited_payload(payload):
-                    raise RuntimeError(self._api_error_text(payload))
+                    raise RuntimeError(api_err)
                 return payload
             except Exception as exc:
                 last_exc = exc
                 err_text = repr(exc)
+                is_token_expired = self._is_token_expired_text(err_text)
                 is_rate = self._is_rate_limit_text(err_text)
                 is_transient = self._is_transient_error_text(err_text)
+                if is_token_expired and token_refresh_attempt < token_refresh_retries:
+                    token_refresh_attempt += 1
+                    if self._refresh_broker_tokens(op_name=op_name, error_text=err_text):
+                        continue
                 if is_rate and rate_attempt < rate_retries:
                     rate_attempt += 1
                     delay = min(rate_max_delay, rate_base_delay * (rate_mult ** max(0, rate_attempt - 1)))
