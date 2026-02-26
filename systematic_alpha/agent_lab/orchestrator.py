@@ -3323,6 +3323,19 @@ class AgentLabOrchestrator:
             1 for row in submit_results if str((row or {}).get("status", "")).upper() == "REJECTED"
         )
         if rejected_count > 0:
+            rejected_lines: List[str] = []
+            for row in submit_results:
+                if str((row or {}).get("status", "")).upper() != "REJECTED":
+                    continue
+                symbol = str((row or {}).get("symbol", "")).strip().upper()
+                side = str((row or {}).get("side", "")).strip().upper()
+                qty = float((row or {}).get("quantity", 0.0) or 0.0)
+                reason = str((row or {}).get("reject_reason", "")).strip()
+                side_text = "매수" if side == "BUY" else ("매도" if side == "SELL" else side)
+                if not reason:
+                    reason = "사유 미상"
+                rejected_lines.append(f"{side_text} {symbol} x{qty:.0f} => {reason}")
+            top_reasons = rejected_lines[:3]
             self.storage.log_event(
                 "broker_api_error",
                 {
@@ -3331,16 +3344,23 @@ class AgentLabOrchestrator:
                     "market": market,
                     "session_date": yyyymmdd,
                     "rejected_count": rejected_count,
+                    "rejected_reasons": top_reasons,
                 },
                 now_iso(),
             )
-            self._notify(
-                "[AgentLab] 주문 실행 오류\n"
-                f"시장={market}\n"
-                f"제안ID={proposal_id}\n"
+            msg_lines = [
+                "[AgentLab] 주문 실행 오류",
+                f"시장={market}",
+                f"제안ID={proposal_id}",
                 f"거부_주문수={rejected_count}",
-                    event="broker_api_error",
-                )
+            ]
+            if top_reasons:
+                msg_lines.append("거부_사유(최대3건):")
+                msg_lines.extend([f"- {line}" for line in top_reasons])
+            self._notify(
+                "\n".join(msg_lines),
+                event="broker_api_error",
+            )
         symbol_name_map = self._load_symbol_name_map(market, yyyymmdd)
         sync_post: Optional[Dict[str, Any]] = None
         if self._unified_shadow_mode():

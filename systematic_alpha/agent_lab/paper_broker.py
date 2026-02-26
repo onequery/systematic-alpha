@@ -156,18 +156,47 @@ class PaperBroker:
                     chunks.append(str(rr))
         return " | ".join(chunks)
 
+    @classmethod
+    def _extract_reject_reason(cls, send_result: Dict[str, Any]) -> str:
+        if not isinstance(send_result, dict):
+            return ""
+        reason = str(send_result.get("reason", "") or "").strip()
+        attempts = send_result.get("attempts")
+        if reason == "all_exchange_attempts_failed" and isinstance(attempts, list):
+            attempt_reasons: List[str] = []
+            for row in attempts:
+                if not isinstance(row, dict):
+                    continue
+                rr = str(row.get("reason", "") or "").strip()
+                if rr:
+                    attempt_reasons.append(rr)
+            if attempt_reasons:
+                reason = "; ".join(attempt_reasons[:2])
+        if not reason:
+            reason = cls._collect_send_error_text(send_result)
+        return str(reason or "").strip()
+
     def _has_recent_sell_submission(self, market: str, symbol: str, lookback_sec: int) -> bool:
         if int(lookback_sec) <= 0:
             return False
+        include_filled = self._env_bool("AGENT_LAB_SELL_REPEAT_GUARD_INCLUDE_FILLED", False)
+        statuses = ["SUBMITTED"]
+        if include_filled:
+            statuses.append("FILLED")
+        placeholders = ",".join(["?"] * len(statuses))
         rows = self.storage.query_all(
-            """
+            f"""
             SELECT side, status, submitted_at
             FROM paper_orders
-            WHERE market = ? AND symbol = ? AND status IN ('SUBMITTED', 'FILLED')
+            WHERE market = ? AND symbol = ? AND status IN ({placeholders})
             ORDER BY submitted_at DESC
             LIMIT 1
             """,
-            (str(market or "").strip().upper(), str(symbol or "").strip().upper()),
+            (
+                str(market or "").strip().upper(),
+                str(symbol or "").strip().upper(),
+                *statuses,
+            ),
         )
         if not rows:
             return False
@@ -1549,6 +1578,7 @@ class PaperBroker:
                     "reference_price": ref_price,
                     "quantity": float(submit_qty),
                     "fx_rate": fx_rate,
+                    "reject_reason": self._extract_reject_reason(broker_resp) if status == "REJECTED" else "",
                 }
             )
         return results
