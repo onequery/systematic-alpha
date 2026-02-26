@@ -1481,6 +1481,17 @@ class AgentLabOrchestrator:
         return out
 
     @staticmethod
+    def _env_bool(name: str, default: bool) -> bool:
+        raw = str(os.getenv(name, "") or "").strip().lower()
+        if not raw:
+            return bool(default)
+        if raw in {"1", "true", "yes", "y", "on"}:
+            return True
+        if raw in {"0", "false", "no", "n", "off"}:
+            return False
+        return bool(default)
+
+    @staticmethod
     def _submitted_alert_stale_seconds() -> int:
         try:
             value = int(float(os.getenv("AGENT_LAB_SUBMITTED_STALE_ALERT_SEC", "180") or 180))
