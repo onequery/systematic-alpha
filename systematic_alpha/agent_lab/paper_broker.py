@@ -99,17 +99,32 @@ class PaperBroker:
 
     def _load_daily_untradable_symbols(self, market: str, session_date: str) -> set[str]:
         key = self._daily_untradable_meta_key(market, session_date)
-        raw = self.storage.get_system_meta(key, "[]")
+        # storage.get_system_meta() already JSON-decodes values when possible.
+        # So `raw` can be a Python list (most common), not only a JSON string.
+        raw = self.storage.get_system_meta(key, [])
         out: set[str] = set()
-        try:
-            data = json.loads(str(raw or "[]"))
-        except Exception:
-            data = []
+        data: Any = raw
+        if isinstance(data, str):
+            text = data.strip()
+            if text:
+                try:
+                    data = json.loads(text)
+                except Exception:
+                    data = [text]
+            else:
+                data = []
+        if isinstance(data, tuple):
+            data = list(data)
         if isinstance(data, list):
-            for item in data:
-                sym = str(item or "").strip().upper()
-                if sym:
-                    out.add(sym)
+            iterable = data
+        elif data is None:
+            iterable = []
+        else:
+            iterable = [data]
+        for item in iterable:
+            sym = str(item or "").strip().upper()
+            if sym:
+                out.add(sym)
         return out
 
     def _save_daily_untradable_symbols(self, market: str, session_date: str, symbols: set[str]) -> None:
