@@ -72,6 +72,10 @@ def parse_args() -> argparse.Namespace:
     p_reconcile.add_argument("--close-status", type=str, default="REJECTED")
     p_reconcile.add_argument("--reason", type=str, default="manual_reconcile_submitted")
 
+    p_rebase = sub.add_parser("rebase-local-ledger")
+    p_rebase.add_argument("--market", type=str, choices=["KR", "US", "ALL", "kr", "us", "all"], default="ALL")
+    p_rebase.add_argument("--apply", action="store_true")
+
     p_cutover = sub.add_parser("cutover-reset")
     p_cutover.add_argument("--require-flat", action="store_true")
     p_cutover.add_argument("--archive", action="store_true")
@@ -190,6 +194,11 @@ def main() -> None:
                 apply=bool(args.apply),
                 close_status=str(args.close_status),
                 reason=str(args.reason),
+            )
+        elif cmd == "rebase-local-ledger":
+            payload = orchestrator.rebase_local_ledger_from_server(
+                market=str(args.market).upper(),
+                apply=bool(args.apply),
             )
         elif cmd == "cutover-reset":
             payload = orchestrator.cutover_reset(

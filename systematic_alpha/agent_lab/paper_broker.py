@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import json
 import os
+import re
 import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Set
@@ -253,6 +254,31 @@ class PaperBroker:
                     exchange=self._exchange_label(market_upper, exchange_code),
                     mock=True,
                 )
+            self._brokers[key] = broker
+            return broker
+        except Exception:
+            return None
+
+    def _get_us_all_broker(self):
+        """
+        Broker for US total-account balance query.
+        This helps when per-exchange mock payloads are sparse/inconsistent.
+        """
+        key = "US:ALL"
+        if key in self._brokers:
+            return self._brokers[key]
+        self._load_creds()
+        if not self._creds:
+            return None
+        try:
+            mojito = import_mojito_module()
+            broker = mojito.KoreaInvestment(
+                api_key=self._creds["key"],
+                api_secret=self._creds["secret"],
+                acc_no=self._creds["acc_no"],
+                exchange="미국전체",
+                mock=True,
+            )
             self._brokers[key] = broker
             return broker
         except Exception:
@@ -1373,6 +1399,17 @@ class PaperBroker:
         return ""
 
     @staticmethod
+    def _sanitize_error_text(text: str) -> str:
+        raw = str(text or "")
+        if not raw:
+            return ""
+        # Prevent account number leakage in query strings/logs.
+        out = re.sub(r"(?i)(CANO=)[^&\\s]+", r"\1***", raw)
+        out = re.sub(r'(?i)("CANO"\\s*:\\s*")[^"]+', r"\1***", out)
+        out = re.sub(r"(?i)('CANO'\\s*:\\s*')[^']+", r"\1***", out)
+        return out
+
+    @staticmethod
     def _is_rate_limit_text(text: str) -> bool:
         raw = str(text or "")
         norm = raw.lower()
@@ -1559,7 +1596,7 @@ class PaperBroker:
                 return payload
             except Exception as exc:
                 last_exc = exc
-                err_text = repr(exc)
+                err_text = self._sanitize_error_text(repr(exc))
                 is_token_expired = self._is_token_expired_text(err_text)
                 is_rate = self._is_rate_limit_text(err_text)
                 is_transient = self._is_transient_error_text(err_text)
@@ -1642,7 +1679,16 @@ class PaperBroker:
                 return payload
             return {}
         except Exception as exc:
-            last_error = repr(exc)
+            last_error = self._sanitize_error_text(repr(exc))
+
+        # Rate-limit/token/transient failures should not degrade into
+        # zero-quantity fallback snapshots; fail fast and let caller retry later.
+        if (
+            self._is_rate_limit_text(last_error)
+            or self._is_token_expired_text(last_error)
+            or self._is_transient_error_text(last_error)
+        ):
+            raise RuntimeError(f"fetch_balance:{last_error}")
 
         fallback_errors: List[str] = [f"fetch_balance:{last_error}"]
         candidates: List[Dict[str, Any]] = []
@@ -1658,16 +1704,122 @@ class PaperBroker:
                         fallback_errors.append(f"fetch_present_balance({foreign_currency}):{api_err}")
                         continue
                     norm1, norm2 = self._normalize_oversea_payload(payload)
-                    if norm1 or norm2:
+                    has_positive_qty = any(
+                        self._pick_value(
+                            row,
+                            ["cblc_qty13", "ovrs_cblc_qty", "hldg_qty", "ord_psbl_qty1", "ord_psbl_qty", "qty"],
+                            default=0.0,
+                        )
+                        > 0.0
+                        for row in norm1
+                        if isinstance(row, dict)
+                    )
+                    has_summary = any(
+                        self._pick_value(
+                            row,
+                            [
+                                "tot_evlu_amt",
+                                "evlu_amt_smtl_amt",
+                                "frcr_drwg_psbl_amt_1",
+                                "nxdy_frcr_drwg_psbl_amt",
+                                "wdrw_psbl_tot_amt",
+                            ],
+                            default=0.0,
+                        )
+                        > 0.0
+                        for row in norm2
+                        if isinstance(row, dict)
+                    )
+                    # Accept fallback only when it contains usable quantity rows,
+                    # or pure-summary payload without position rows.
+                    if has_positive_qty or (not norm1 and has_summary):
                         candidates.append(payload)
+                    else:
+                        fallback_errors.append(
+                            f"fetch_present_balance({foreign_currency}):invalid_zero_qty_snapshot"
+                        )
             except Exception as exc:
-                fallback_errors.append(f"fetch_present_balance({foreign_currency}):{repr(exc)}")
+                fallback_errors.append(
+                    f"fetch_present_balance({foreign_currency}):{self._sanitize_error_text(repr(exc))}"
+                )
 
         if candidates:
             picked = candidates[0]
             picked["_fallback_source"] = "fetch_present_balance"
             picked["_fallback_errors"] = fallback_errors
             return picked
+
+        raise RuntimeError("; ".join(fallback_errors))
+
+    def _fetch_kr_balance_with_fallback(self, broker: Any) -> Dict[str, Any]:
+        """
+        Primary: fetch_balance()
+        Fallback: fetch_balance_domestic() pagination path when SDK-level parsing
+        raises KeyError (e.g. missing output1/output2 in intermittent payloads).
+        """
+        try:
+            payload = self._call_with_rate_limit_retry(
+                lambda: broker.fetch_balance(),
+                op_name="KR.fetch_balance",
+            )
+            if isinstance(payload, dict):
+                return payload
+            return {}
+        except Exception as exc:
+            last_error = self._sanitize_error_text(repr(exc))
+
+        fallback_errors: List[str] = [f"fetch_balance:{last_error}"]
+        try:
+            page = self._call_with_rate_limit_retry(
+                lambda: broker.fetch_balance_domestic(),
+                op_name="KR.fetch_balance_domestic.0",
+            )
+            if not isinstance(page, dict):
+                raise RuntimeError("fetch_balance_domestic:non_dict_payload")
+            api_err = self._api_error_text(page)
+            if api_err and ("output1" not in page) and ("output2" not in page):
+                raise RuntimeError(api_err)
+
+            merged: Dict[str, Any] = {
+                "output1": [],
+                "output2": [],
+                "rt_cd": str(page.get("rt_cd", "")),
+                "msg_cd": str(page.get("msg_cd", "")),
+                "msg1": str(page.get("msg1", "")),
+            }
+            first_out1 = page.get("output1", [])
+            first_out2 = page.get("output2", [])
+            if isinstance(first_out1, list):
+                merged["output1"].extend(first_out1)
+            elif isinstance(first_out1, dict):
+                merged["output1"].append(first_out1)
+            if isinstance(first_out2, list):
+                merged["output2"].extend(first_out2)
+            elif isinstance(first_out2, dict):
+                merged["output2"].append(first_out2)
+
+            while str(page.get("tr_cont", "")).strip().upper() == "M":
+                fk100 = str(page.get("ctx_area_fk100", "") or "")
+                nk100 = str(page.get("ctx_area_nk100", "") or "")
+                page = self._call_with_rate_limit_retry(
+                    lambda fk=fk100, nk=nk100: broker.fetch_balance_domestic(fk, nk),
+                    op_name="KR.fetch_balance_domestic.page",
+                )
+                if not isinstance(page, dict):
+                    break
+                out1 = page.get("output1", [])
+                out2 = page.get("output2", [])
+                if isinstance(out1, list):
+                    merged["output1"].extend(out1)
+                elif isinstance(out1, dict):
+                    merged["output1"].append(out1)
+                if isinstance(out2, list):
+                    merged["output2"].extend(out2)
+                elif isinstance(out2, dict):
+                    merged["output2"].append(out2)
+            return merged
+        except Exception as exc:
+            fallback_errors.append(f"fetch_balance_domestic:{self._sanitize_error_text(repr(exc))}")
 
         raise RuntimeError("; ".join(fallback_errors))
 
@@ -1785,7 +1937,7 @@ class PaperBroker:
     def _fetch_us_snapshot_all_exchanges(self) -> Dict[str, Any]:
         errors: List[str] = []
         snapshots: List[Dict[str, Any]] = []
-        spacing = self._env_float("AGENT_LAB_US_BALANCE_EXCHANGE_SPACING_SEC", 0.25, 0.0, 10.0)
+        spacing = self._env_float("AGENT_LAB_US_BALANCE_EXCHANGE_SPACING_SEC", 1.0, 0.0, 10.0)
         for exchange_code in self._exchange_candidates("US"):
             broker = self._get_broker("US", exchange_code)
             if broker is None:
@@ -1796,9 +1948,25 @@ class PaperBroker:
                 parsed = self._parse_balance_oversea(payload if isinstance(payload, dict) else {})
                 snapshots.append({"exchange": exchange_code, "payload": payload, "parsed": parsed})
             except Exception as exc:
-                errors.append(f"{exchange_code}:{repr(exc)}")
+                errors.append(f"{exchange_code}:{self._sanitize_error_text(repr(exc))}")
             if spacing > 0:
                 time.sleep(spacing)
+
+        # Additional all-market snapshot (OVRS_EXCG_CD=NASD path in mojito for "미국전체")
+        # to reduce per-exchange sparsity in mock responses.
+        use_all_market = self._env_bool("AGENT_LAB_US_BALANCE_INCLUDE_ALL_MARKET", True)
+        if use_all_market:
+            broker_all = self._get_us_all_broker()
+            if broker_all is None:
+                errors.append("USALL:broker_unavailable")
+            else:
+                try:
+                    payload_all = self._fetch_us_balance_with_fallback(broker_all)
+                    parsed_all = self._parse_balance_oversea(payload_all if isinstance(payload_all, dict) else {})
+                    snapshots.append({"exchange": "USALL", "payload": payload_all, "parsed": parsed_all})
+                except Exception as exc:
+                    errors.append(f"USALL:{self._sanitize_error_text(repr(exc))}")
+
         if not snapshots:
             raise RuntimeError("; ".join(errors) if errors else "US:all_exchange_snapshot_failed")
         merged = self._merge_us_exchange_snapshots(snapshots)
@@ -1831,6 +1999,9 @@ class PaperBroker:
             try:
                 if mk == "US":
                     parsed = self._fetch_us_snapshot_all_exchanges()
+                elif mk == "KR":
+                    payload = self._fetch_kr_balance_with_fallback(broker)
+                    parsed = self._parse_balance_domestic(payload if isinstance(payload, dict) else {})
                 else:
                     payload = self._call_with_rate_limit_retry(
                         lambda: broker.fetch_balance(),

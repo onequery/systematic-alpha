@@ -221,6 +221,11 @@ class AgentLabOrchestrator:
             return enabled[0]
         return "ALL"
 
+    @staticmethod
+    def _sync_server_authoritative() -> bool:
+        # Default-on: execution/state should follow broker server snapshot first.
+        return _truthy(os.getenv("AGENT_LAB_SYNC_SERVER_AUTHORITATIVE", "1"))
+
     def _is_market_open_now(self, market: str, now_utc: Optional[datetime] = None) -> Tuple[bool, str]:
         market_upper = str(market).strip().upper()
         if market_upper == "KR":
@@ -2005,6 +2010,36 @@ class AgentLabOrchestrator:
             or ("rate limit" in norm)
         )
 
+    def _filter_closed_market_fetch_errors(
+        self,
+        *,
+        market_scope: str,
+        errors: List[Any],
+        fetched_markets: Dict[str, Any],
+    ) -> Tuple[List[str], List[str]]:
+        scope = str(market_scope or "ALL").strip().upper()
+        if scope != "ALL":
+            return [str(x) for x in (errors or [])], []
+        if not _truthy(os.getenv("AGENT_LAB_SYNC_TOLERATE_CLOSED_MARKET_FETCH_FAIL", "1")):
+            return [str(x) for x in (errors or [])], []
+        if not isinstance(fetched_markets, dict) or len(fetched_markets) == 0:
+            return [str(x) for x in (errors or [])], []
+
+        kept: List[str] = []
+        ignored: List[str] = []
+        for raw in list(errors or []):
+            err = str(raw)
+            head = err.split(":", 1)[0].strip().upper()
+            if head not in {"KR", "US"}:
+                kept.append(err)
+                continue
+            is_open, _ = self._is_market_open_now(head)
+            if is_open:
+                kept.append(err)
+            else:
+                ignored.append(err)
+        return kept, ignored
+
     def _reconcile_positions(
         self,
         *,
@@ -2061,6 +2096,17 @@ class AgentLabOrchestrator:
             "blocked": False,
             "errors": list(fetched.get("errors", []) or []),
         }
+        filtered_errors, ignored_errors = self._filter_closed_market_fetch_errors(
+            market_scope=market_scope,
+            errors=list(payload.get("errors", []) or []),
+            fetched_markets=fetched.get("markets", {}) if isinstance(fetched, dict) else {},
+        )
+        if ignored_errors:
+            payload["errors_ignored_closed_market"] = list(ignored_errors)
+        payload["errors"] = list(filtered_errors)
+        if (not bool(payload.get("ok", False))) and len(payload["errors"]) == 0 and len(fetched.get("markets", {}) or {}) > 0:
+            payload["ok"] = True
+            payload["reason"] = "closed_market_fetch_ignored"
         fetched_age = self._age_seconds_from_iso(str(payload.get("fetched_at", "")))
         if fetched_age is not None:
             payload["fetched_age_sec"] = round(float(fetched_age), 3)
@@ -2110,7 +2156,26 @@ class AgentLabOrchestrator:
         if notify:
             self._maybe_alert_stale_submitted_orders(market_scope=market_scope, settlement=settlement)
         local_positions = self._local_positions_from_fills(market_scope)
-        matched, detail = self._reconcile_positions(server_positions=server_positions, local_positions=local_positions)
+        matched_local, detail = self._reconcile_positions(server_positions=server_positions, local_positions=local_positions)
+        server_authoritative = self._sync_server_authoritative()
+        matched = bool(matched_local)
+        if server_authoritative:
+            # Keep drift visibility but do not block execution on local-ledger lag/mismatch.
+            matched = True
+            if not bool(matched_local):
+                payload["server_drift_count"] = int(detail.get("mismatch_count", 0) or 0)
+                payload["server_drift_detail"] = detail
+                self.storage.log_event(
+                    "sync_drift_server_authoritative",
+                    {
+                        "market_scope": market_scope,
+                        "strict": strict_flag,
+                        "mismatch_count": int(detail.get("mismatch_count", 0) or 0),
+                        "detail": detail,
+                    },
+                    now_iso(),
+                )
+        payload["server_authoritative_mode"] = bool(server_authoritative)
         payload["matched"] = bool(matched)
         payload["snapshot_id"] = int(snapshot_id)
         payload["cash_krw"] = float(fetched.get("cash_krw", 0.0) or 0.0)
@@ -2294,6 +2359,263 @@ class AgentLabOrchestrator:
             self._notify("\n".join(lines), event="broker_api_error")
         return payload
 
+    def rebase_local_ledger_from_server(
+        self,
+        *,
+        market: str = "ALL",
+        apply: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Server-authoritative ledger cleanup:
+        - Refresh account snapshot from broker.
+        - Rebuild local paper_orders/paper_fills baseline from server positions.
+        This removes stale/incorrect historical fills from execution-state reconciliation.
+        """
+        scope = str(market or "ALL").strip().upper()
+        if scope not in {"KR", "US", "ALL"}:
+            scope = "ALL"
+        target_markets = ["KR", "US"] if scope == "ALL" else [scope]
+        requested_apply = bool(apply)
+
+        sync_before = self.sync_account(
+            market=scope,
+            strict=False,
+            notify=False,
+            track_streak=False,
+        )
+        snapshot_id = int(sync_before.get("snapshot_id", 0) or 0)
+        snapshot_source = "sync_account"
+        stale_snapshot_used = False
+        if snapshot_id <= 0:
+            allow_stale = _truthy(os.getenv("AGENT_LAB_LEDGER_REBASE_ALLOW_STALE_SNAPSHOT", "1"))
+            try:
+                max_stale_age_sec = int(float(os.getenv("AGENT_LAB_LEDGER_REBASE_MAX_SNAPSHOT_AGE_SEC", "86400") or 86400))
+            except Exception:
+                max_stale_age_sec = 86400
+            latest = self.storage.get_latest_account_snapshot(scope)
+            if allow_stale and isinstance(latest, dict):
+                latest_id = int(latest.get("snapshot_id", 0) or 0)
+                latest_age = self._age_seconds_from_iso(str(latest.get("created_at", "")))
+                if latest_id > 0 and latest_age is not None and float(latest_age) <= float(max_stale_age_sec):
+                    snapshot_id = latest_id
+                    snapshot_source = "latest_cached_snapshot"
+                    stale_snapshot_used = True
+        if snapshot_id <= 0:
+            payload = {
+                "market_scope": scope,
+                "requested_apply": requested_apply,
+                "applied": False,
+                "blocked": True,
+                "reason": "sync_snapshot_missing",
+                "sync_before": sync_before,
+                "generated_at": now_iso(),
+            }
+            self.storage.log_event("local_ledger_rebase_failed", payload, now_iso())
+            return payload
+
+        server_positions_all = self.storage.list_account_positions_by_snapshot(snapshot_id)
+        server_positions = [
+            row for row in list(server_positions_all or [])
+            if str(row.get("market", "")).strip().upper() in set(target_markets)
+        ]
+        server_rows = []
+        for row in server_positions:
+            market_key = str(row.get("market", "")).strip().upper()
+            symbol = str(row.get("symbol", "")).strip().upper()
+            qty = float(row.get("quantity", 0.0) or 0.0)
+            avg_krw = float(row.get("avg_price_krw", 0.0) or 0.0)
+            if not market_key or not symbol or qty <= 0:
+                continue
+            server_rows.append(
+                {
+                    "market": market_key,
+                    "symbol": symbol,
+                    "quantity": qty,
+                    "avg_price_krw": max(0.0, avg_krw),
+                }
+            )
+
+        local_before = self._local_positions_from_fills(scope)
+        matched_before, detail_before = self._reconcile_positions(
+            server_positions=[
+                {
+                    "market": x["market"],
+                    "symbol": x["symbol"],
+                    "quantity": x["quantity"],
+                    "avg_price": x["avg_price_krw"],
+                }
+                for x in server_rows
+            ],
+            local_positions=local_before,
+        )
+
+        placeholders = ",".join("?" for _ in target_markets)
+        order_rows = self.storage.query_all(
+            f"""
+            SELECT paper_order_id
+            FROM paper_orders
+            WHERE agent_id = ?
+              AND market IN ({placeholders})
+            ORDER BY paper_order_id ASC
+            """,
+            (self.UNIFIED_EXECUTOR_AGENT_ID, *target_markets),
+        )
+        order_ids = [int(row.get("paper_order_id")) for row in list(order_rows or [])]
+        fills_to_delete = 0
+        if order_ids:
+            ph_ids = ",".join("?" for _ in order_ids)
+            row = self.storage.query_one(
+                f"SELECT COUNT(1) AS cnt FROM paper_fills WHERE paper_order_id IN ({ph_ids})",
+                tuple(order_ids),
+            ) or {}
+            fills_to_delete = int(row.get("cnt", 0) or 0)
+
+        payload: Dict[str, Any] = {
+            "market_scope": scope,
+            "requested_apply": requested_apply,
+            "applied": False,
+            "sync_before": sync_before,
+            "snapshot_id": snapshot_id,
+            "snapshot_source": snapshot_source,
+            "stale_snapshot_used": bool(stale_snapshot_used),
+            "target_markets": target_markets,
+            "server_positions_count": len(server_rows),
+            "local_positions_before_count": len(local_before),
+            "mismatch_before_count": int(detail_before.get("mismatch_count", 0) or 0),
+            "matched_before": bool(matched_before),
+            "delete_candidate_orders": len(order_ids),
+            "delete_candidate_fills": int(fills_to_delete),
+            "generated_at": now_iso(),
+        }
+
+        if not requested_apply:
+            payload["dry_run"] = True
+            self.storage.log_event("local_ledger_rebase_dryrun", payload, now_iso())
+            return payload
+
+        self._ensure_unified_executor_agent()
+        active = self.storage.get_active_strategy(self.UNIFIED_EXECUTOR_AGENT_ID)
+        if active is None:
+            payload["blocked"] = True
+            payload["reason"] = "unified_strategy_missing"
+            self.storage.log_event("local_ledger_rebase_failed", payload, now_iso())
+            return payload
+
+        if order_ids:
+            ph_ids = ",".join("?" for _ in order_ids)
+            self.storage.execute(
+                f"DELETE FROM paper_fills WHERE paper_order_id IN ({ph_ids})",
+                tuple(order_ids),
+            )
+            self.storage.execute(
+                f"DELETE FROM paper_orders WHERE paper_order_id IN ({ph_ids})",
+                tuple(order_ids),
+            )
+
+        inserted_orders = 0
+        inserted_fills = 0
+        proposals_by_market: Dict[str, int] = {}
+        baseline_at = now_iso()
+        strategy_version_id = int(active["strategy_version_id"])
+        for row in server_rows:
+            market_key = str(row.get("market", "")).strip().upper()
+            symbol = str(row.get("symbol", "")).strip().upper()
+            qty = float(row.get("quantity", 0.0) or 0.0)
+            avg_price_krw = float(row.get("avg_price_krw", 0.0) or 0.0)
+            if not market_key or not symbol or qty <= 0:
+                continue
+            proposal_id = proposals_by_market.get(market_key)
+            if proposal_id is None:
+                proposal_id = self.storage.insert_order_proposal(
+                    proposal_uuid=str(uuid.uuid4()),
+                    agent_id=self.UNIFIED_EXECUTOR_AGENT_ID,
+                    market=market_key,
+                    session_date=self._session_date_now(market_key),
+                    strategy_version_id=strategy_version_id,
+                    status=PROPOSAL_STATUS_EXECUTED,
+                    blocked_reason="",
+                    orders=[],
+                    rationale="server_authoritative_ledger_baseline_rebase",
+                    created_at=baseline_at,
+                    updated_at=baseline_at,
+                )
+                proposals_by_market[market_key] = int(proposal_id)
+
+            broker_payload = {
+                "server_authoritative_rebase": True,
+                "snapshot_id": int(snapshot_id),
+                "market": market_key,
+                "symbol": symbol,
+                "quantity": float(qty),
+                "avg_price_krw": float(avg_price_krw),
+                "baseline_at": baseline_at,
+            }
+            paper_order_id = self.storage.insert_paper_order(
+                proposal_id=int(proposal_id),
+                agent_id=self.UNIFIED_EXECUTOR_AGENT_ID,
+                market=market_key,
+                symbol=symbol,
+                side="BUY",
+                order_type="MARKET",
+                quantity=float(qty),
+                limit_price=None,
+                reference_price=float(max(0.0, avg_price_krw)),
+                status="FILLED",
+                broker_order_id=f"BASELINE-{snapshot_id}-{market_key}-{symbol}",
+                broker_response_json=broker_payload,
+                submitted_at=baseline_at,
+            )
+            fill_price = float(max(0.0, avg_price_krw))
+            fill_value_krw = float(fill_price * float(qty))
+            self.storage.insert_paper_fill(
+                paper_order_id=int(paper_order_id),
+                fill_price=fill_price,
+                fill_quantity=float(qty),
+                fill_value_krw=float(fill_value_krw),
+                fx_rate=1.0,
+                filled_at=baseline_at,
+            )
+            inserted_orders += 1
+            inserted_fills += 1
+
+        local_after = self._local_positions_from_fills(scope)
+        matched_after, detail_after = self._reconcile_positions(
+            server_positions=[
+                {
+                    "market": x["market"],
+                    "symbol": x["symbol"],
+                    "quantity": x["quantity"],
+                    "avg_price": x["avg_price_krw"],
+                }
+                for x in server_rows
+            ],
+            local_positions=local_after,
+        )
+        payload.update(
+            {
+                "applied": True,
+                "blocked": False,
+                "deleted_orders": len(order_ids),
+                "deleted_fills": int(fills_to_delete),
+                "inserted_baseline_orders": int(inserted_orders),
+                "inserted_baseline_fills": int(inserted_fills),
+                "local_positions_after_count": len(local_after),
+                "mismatch_after_count": int(detail_after.get("mismatch_count", 0) or 0),
+                "matched_after": bool(matched_after),
+                "detail_after": detail_after,
+            }
+        )
+        self.storage.log_event("local_ledger_rebased_server_snapshot", payload, now_iso())
+        self._notify(
+            "[AgentLab] 로컬 체결 원장 서버 기준 정리 완료\n"
+            f"시장범위={scope}\n"
+            f"삭제=주문 {len(order_ids)}건 / 체결 {int(fills_to_delete)}건\n"
+            f"기준_스냅샷={snapshot_id}\n"
+            f"정리후_불일치={int(detail_after.get('mismatch_count', 0) or 0)}건",
+            event="broker_api_error",
+        )
+        return payload
+
     def _latest_account_context(self, market_scope: str = "ALL") -> Dict[str, Any]:
         latest = self.storage.get_latest_account_snapshot(str(market_scope).upper())
         if latest is None:
@@ -2326,10 +2648,26 @@ class AgentLabOrchestrator:
                     "unrealized_pnl_krw": 0.0,
                 }
             )
+        cash_by_market: Dict[str, float] = {}
+        payload = latest.get("payload", {})
+        if isinstance(payload, dict):
+            markets = payload.get("markets", {})
+            if isinstance(markets, dict):
+                for mk, row in markets.items():
+                    market_key = str(mk or "").strip().upper()
+                    if market_key not in {"KR", "US"}:
+                        continue
+                    if not isinstance(row, dict):
+                        continue
+                    try:
+                        cash_by_market[market_key] = max(0.0, float(row.get("cash_krw", 0.0) or 0.0))
+                    except Exception:
+                        continue
         return {
             "cash_krw": float(latest.get("cash_krw", 0.0) or 0.0),
             "equity_krw": float(latest.get("equity_krw", 0.0) or 0.0),
             "positions": out_positions,
+            "cash_by_market_krw": cash_by_market,
             "snapshot_id": snapshot_id,
         }
 
@@ -2358,6 +2696,8 @@ class AgentLabOrchestrator:
         shared_cash_krw: float,
         shared_positions: List[Dict[str, Any]],
         usdkrw: float,
+        market_buy_budget_cap_krw: Optional[float] = None,
+        market_cash_cap_krw: Optional[float] = None,
     ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         by_symbol_side: Dict[Tuple[str, str], Dict[str, Any]] = {}
         total_weight = sum(float(x.get("weight", 0.0) or 0.0) for x in intents)
@@ -2457,8 +2797,26 @@ class AgentLabOrchestrator:
                 }
             )
 
-        # Cash cap for BUY legs
-        budget_krw = max(0.0, float(shared_cash_krw) + est_sell_proceeds)
+        # Cash cap for BUY legs.
+        shared_cash_cap = max(0.0, float(shared_cash_krw))
+        allocation_cap = float("inf")
+        if market_buy_budget_cap_krw is not None:
+            try:
+                allocation_cap = max(0.0, float(market_buy_budget_cap_krw))
+            except Exception:
+                allocation_cap = float("inf")
+        market_cash_cap = float("inf")
+        if market_cash_cap_krw is not None:
+            try:
+                market_cash_cap = max(0.0, float(market_cash_cap_krw))
+            except Exception:
+                market_cash_cap = float("inf")
+        budget_krw = min(
+            shared_cash_cap + est_sell_proceeds,
+            allocation_cap + est_sell_proceeds,
+            market_cash_cap + est_sell_proceeds,
+        )
+        budget_krw = max(0.0, float(budget_krw))
         buys = [row for row in out_orders if str(row.get("side", "")).upper() == "BUY"]
         sells = [row for row in out_orders if str(row.get("side", "")).upper() == "SELL"]
         buys.sort(key=lambda x: float(x.get("recommendation_score", 0.0) or 0.0), reverse=True)
@@ -2489,6 +2847,9 @@ class AgentLabOrchestrator:
             "kept_orders": len(merged),
             "dropped": dropped,
             "est_sell_proceeds_krw": est_sell_proceeds,
+            "buy_budget_shared_cash_krw": shared_cash_cap,
+            "buy_budget_market_cap_krw": None if math.isinf(allocation_cap) else allocation_cap,
+            "buy_budget_market_cash_cap_krw": None if math.isinf(market_cash_cap) else market_cash_cap,
             "remaining_buy_budget_krw": budget_krw,
         }
         return merged, detail
@@ -2726,6 +3087,16 @@ class AgentLabOrchestrator:
         shared_cash = float(account_ctx.get("cash_krw", 0.0) or 0.0)
         shared_equity = float(account_ctx.get("equity_krw", 0.0) or 0.0)
         shared_positions = list(account_ctx.get("positions", []) or [])
+        cash_by_market = account_ctx.get("cash_by_market_krw", {})
+        market_cash_cap_krw: Optional[float] = None
+        if isinstance(cash_by_market, dict):
+            market_cash_raw = cash_by_market.get(str(market).upper())
+            if market_cash_raw is not None:
+                try:
+                    market_cash_cap_krw = max(0.0, float(market_cash_raw))
+                except Exception:
+                    market_cash_cap_krw = None
+        available_cash_for_market = shared_cash if market_cash_cap_krw is None else min(shared_cash, market_cash_cap_krw)
         shared_ledger = {
             "cash_krw": shared_cash,
             "equity_krw": shared_equity,
@@ -2755,6 +3126,7 @@ class AgentLabOrchestrator:
 
         shadow_rows: List[Dict[str, Any]] = []
         intents_for_agg: List[Dict[str, Any]] = []
+        market_buy_caps: List[float] = []
         for agent in agents:
             agent_id = str(agent["agent_id"])
             profile = profile_from_agent_row(agent)
@@ -2767,6 +3139,10 @@ class AgentLabOrchestrator:
                 yyyymmdd=effective_session_date,
                 ledger=shared_ledger,
             )
+            try:
+                market_buy_caps.append(max(0.0, float(cross_market_plan.get("buy_budget_cap_krw", 0.0) or 0.0)))
+            except Exception:
+                pass
             agent_signal_payload = self._build_agent_specific_payload(
                 base_payload=base_payload,
                 agent_id=agent_id,
@@ -2778,7 +3154,7 @@ class AgentLabOrchestrator:
                 market=market,
                 session_payload=agent_signal_payload,
                 params=active_params,
-                available_cash_krw=shared_cash,
+                available_cash_krw=available_cash_for_market,
                 current_positions=shared_positions,
                 usdkrw_rate=usdkrw,
                 market_budget_cap_krw=float(cross_market_plan.get("buy_budget_cap_krw", 0.0) or 0.0),
@@ -2792,7 +3168,7 @@ class AgentLabOrchestrator:
             decision = self.risk.evaluate(
                 status_code=str(signal["status_code"]),
                 allocated_capital_krw=max(1.0, shared_equity),
-                available_cash_krw=shared_cash,
+                available_cash_krw=available_cash_for_market,
                 day_return_pct=0.0,
                 week_return_pct=0.0,
                 current_exposure_krw=float(market_exposure),
@@ -2917,12 +3293,15 @@ class AgentLabOrchestrator:
                 },
                 now_iso(),
             )
+        market_buy_budget_cap_krw = min(market_buy_caps) if market_buy_caps else None
         merged_orders, agg_detail = self._aggregate_shadow_orders(
             market=market,
             intents=intents_for_agg,
             shared_cash_krw=shared_cash,
             shared_positions=shared_positions,
             usdkrw=usdkrw,
+            market_buy_budget_cap_krw=market_buy_budget_cap_krw,
+            market_cash_cap_krw=market_cash_cap_krw,
         )
         unified_active = self.registry.get_active_strategy(self.UNIFIED_EXECUTOR_AGENT_ID)
         unified_status = PROPOSAL_STATUS_APPROVED if merged_orders else PROPOSAL_STATUS_BLOCKED

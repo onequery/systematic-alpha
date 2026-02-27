@@ -169,12 +169,14 @@ RUN_STAMP="$(TZ=Asia/Seoul date +%Y%m%d_%H%M%S)"
 OUT_BASE="$ROOT_DIR/out/$MARKET_LC/$RUN_DATE"
 LOG_DIR="$ROOT_DIR/logs/$MARKET_LC/$RUN_DATE"
 RESULTS_DIR="$OUT_BASE/results"
+RUNTIME_DIR="$ROOT_DIR/state/agent_lab/runtime"
 
-mkdir -p "$OUT_BASE" "$LOG_DIR" "$RESULTS_DIR"
+mkdir -p "$OUT_BASE" "$LOG_DIR" "$RESULTS_DIR" "$RUNTIME_DIR"
 
 OUTPUT_JSON="$RESULTS_DIR/${MARKET_LC}_daily_${RUN_STAMP}.json"
 LOG_FILE="$LOG_DIR/${MARKET_LC}_daily_${RUN_STAMP}.log"
 RUN_START_EPOCH="$(date +%s)"
+DAILY_LOCK_FILE="$RUNTIME_DIR/daily_run_${MARKET_LC}.lock"
 
 CMD=(
   "$PYTHON_BIN" -u main.py
@@ -238,11 +240,43 @@ notify_daily_patch_end() {
   send_telegram_notice "$msg"
 }
 
+acquire_daily_lock() {
+  if [[ -f "$DAILY_LOCK_FILE" ]]; then
+    local old_pid=""
+    old_pid="$(awk -F= '/^pid=/{print $2; exit}' "$DAILY_LOCK_FILE" | tr -d '[:space:]')"
+    if [[ -n "$old_pid" ]] && kill -0 "$old_pid" 2>/dev/null; then
+      return 1
+    fi
+    rm -f "$DAILY_LOCK_FILE" 2>/dev/null || true
+  fi
+
+  {
+    echo "pid=$$"
+    echo "market=$MARKET"
+    echo "run_date=$RUN_DATE"
+    echo "run_stamp=$RUN_STAMP"
+    echo "started_at_kst=$(TZ=Asia/Seoul date '+%Y-%m-%dT%H:%M:%S%z')"
+    echo "log_file=$LOG_FILE"
+  } > "$DAILY_LOCK_FILE"
+}
+
+release_daily_lock() {
+  rm -f "$DAILY_LOCK_FILE" 2>/dev/null || true
+}
+
 on_script_exit() {
   local rc=$?
   trap - EXIT
+  release_daily_lock
   notify_daily_patch_end "$rc"
 }
+
+if ! acquire_daily_lock; then
+  {
+    echo "[run_daily_wsl] skipped duplicate run: lock is active ($DAILY_LOCK_FILE)"
+  } | tee -a "$LOG_FILE"
+  exit 0
+fi
 
 trap on_script_exit EXIT
 

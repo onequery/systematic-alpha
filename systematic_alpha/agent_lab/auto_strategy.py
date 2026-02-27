@@ -124,6 +124,86 @@ class AutoStrategyDaemon:
             int(float(os.getenv("AGENT_LAB_SHADOW_RETENTION_DAYS", "90") or 90)),
         )
 
+    def _daily_run_lock_path(self, market: str) -> Path:
+        mk = str(market or "").strip().lower()
+        return self.project_root / "state" / "agent_lab" / "runtime" / f"daily_run_{mk}.lock"
+
+    def _daily_run_guard(self, market: str) -> Dict[str, Any]:
+        lock_path = self._daily_run_lock_path(market)
+        info: Dict[str, Any] = {
+            "market": str(market or "").upper(),
+            "lock_path": str(lock_path),
+            "exists": lock_path.exists(),
+            "active": False,
+            "pid": None,
+            "stale_cleared": False,
+        }
+        if not lock_path.exists():
+            return info
+        try:
+            raw = lock_path.read_text(encoding="utf-8", errors="ignore")
+        except Exception as exc:
+            info["read_error"] = repr(exc)
+            # Lock cannot be read: fail closed to prevent overlap.
+            info["active"] = True
+            return info
+
+        meta: Dict[str, str] = {}
+        for line in raw.splitlines():
+            if "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            key = str(k).strip()
+            if not key:
+                continue
+            meta[key] = str(v).strip()
+        info["meta"] = meta
+
+        pid: Optional[int] = None
+        try:
+            raw_pid = str(meta.get("pid", "")).strip()
+            if raw_pid:
+                pid = int(raw_pid)
+        except Exception:
+            pid = None
+        info["pid"] = pid
+
+        if pid is not None and pid > 0:
+            alive = False
+            try:
+                os.kill(pid, 0)
+                alive = True
+            except PermissionError:
+                alive = True
+            except OSError:
+                alive = False
+            if alive:
+                info["active"] = True
+                return info
+            try:
+                lock_path.unlink(missing_ok=True)
+                info["stale_cleared"] = True
+            except Exception as exc:
+                info["clear_error"] = repr(exc)
+                info["active"] = True
+            return info
+
+        try:
+            age_sec = max(0.0, time.time() - float(lock_path.stat().st_mtime))
+        except Exception:
+            age_sec = 0.0
+        info["age_sec"] = round(age_sec, 3)
+        if age_sec <= 6 * 3600:
+            info["active"] = True
+            return info
+        try:
+            lock_path.unlink(missing_ok=True)
+            info["stale_cleared"] = True
+        except Exception as exc:
+            info["clear_error"] = repr(exc)
+            info["active"] = True
+        return info
+
     def close(self) -> None:
         self.orchestrator.close()
         self.storage.close()
@@ -1355,13 +1435,23 @@ class AutoStrategyDaemon:
     ) -> Dict[str, Any]:
         market = str(market).upper()
         expected_session_date = self._session_date_for_market(market, now_kst)
+        daily_guard = self._daily_run_guard(market)
+        daily_run_active = bool(daily_guard.get("active", False))
         refresh_enabled = market_open and (
             self._max_freedom_mode() or _truthy(os.getenv("AGENT_LAB_INTRADAY_SIGNAL_REFRESH", "1"))
+        ) and (not daily_run_active)
+        daily_blocked = bool(market_open and daily_run_active)
+        lock_meta = daily_guard.get("meta", {})
+        lock_pid = daily_guard.get("pid")
+        lock_started = (
+            str(lock_meta.get("started_at_kst", "-")) if isinstance(lock_meta, dict) else "-"
         )
+        lock_log = str(lock_meta.get("log_file", "-")) if isinstance(lock_meta, dict) else "-"
+        lock_age = daily_guard.get("age_sec")
         payload: Dict[str, Any] = {
             "market": market,
             "executed_at_kst": now_kst.isoformat(),
-            "mode": "observe" if market_open else "afterhours_observe",
+            "mode": "observe+daily_guard" if daily_blocked else ("observe" if market_open else "afterhours_observe"),
             "market_open": bool(market_open),
             "expected_session_date": expected_session_date,
             "session_date": "",
@@ -1373,7 +1463,16 @@ class AutoStrategyDaemon:
             "propose_triggered": False,
             "propose_ok": False,
             "sync_blocked": bool(sync_blocked),
+            "daily_run_active": bool(daily_run_active),
+            "daily_run_lock_path": str(daily_guard.get("lock_path", "")),
+            "daily_run_lock_exists": bool(daily_guard.get("exists", False)),
+            "daily_run_lock_pid": int(lock_pid) if isinstance(lock_pid, int) else None,
+            "daily_run_lock_started_at": lock_started,
+            "daily_run_lock_log_file": lock_log,
+            "daily_run_lock_age_sec": float(lock_age) if isinstance(lock_age, (int, float)) else None,
         }
+        if daily_blocked:
+            payload["refresh_skip_reason"] = "daily_run_in_progress"
         require_refresh_success = market_open and _truthy(
             os.getenv("AGENT_LAB_INTRADAY_REQUIRE_REFRESH_SUCCESS", "1")
         )
@@ -1445,7 +1544,7 @@ class AutoStrategyDaemon:
         payload["refresh_blocked"] = refresh_blocked
 
         # Optional advanced mode: re-run propose cycle during regular sessions only.
-        propose_enabled = (not sync_blocked) and market_open and (
+        propose_enabled = (not sync_blocked) and (not daily_blocked) and market_open and (
             self._max_freedom_mode() or _truthy(os.getenv("AGENT_LAB_INTRADAY_MONITOR_PROPOSE", "1"))
         )
         if (
@@ -1487,6 +1586,9 @@ class AutoStrategyDaemon:
                 payload["propose_skip_reason"] = "missing_signal_for_session"
             else:
                 payload["propose_skip_reason"] = f"signal_status_not_ok:{signal_status_raw}"
+        elif daily_blocked and market_open:
+            payload["propose_triggered"] = False
+            payload["propose_skip_reason"] = "daily_run_in_progress"
         elif sync_blocked and market_open:
             payload["propose_triggered"] = False
             payload["propose_skip_reason"] = "sync_blocked"

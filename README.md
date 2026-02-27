@@ -60,6 +60,8 @@ pip install -r requirements.txt
   - 데몬/주문 경로에서 서버 계좌와 로컬 상태 불일치 시 주문을 차단합니다.
 - `AGENT_LAB_SYNC_MISMATCH_BLOCK=1`
   - 불일치 시 즉시 차단 + Action required 알림을 보냅니다.
+- `AGENT_LAB_SYNC_SERVER_AUTHORITATIVE=1`
+  - 서버 스냅샷을 단일 진실원천으로 사용합니다. 로컬 체결 이력과 드리프트가 있어도 서버 기준으로 진행하고, 드리프트는 별도 이벤트로 기록합니다.
 - `AGENT_LAB_EVENT_BATCH_ENABLED=1`
   - 일반 이벤트는 30분 배치 요약으로 전송합니다.
 - `AGENT_LAB_EVENT_BATCH_MINUTES=30`
