@@ -578,6 +578,20 @@ class AutoStrategyDaemon:
                 "blocked": False,
                 "reason": "legacy_execution_mode",
             }
+        active_daily_markets: List[str] = []
+        for mk in ("KR", "US"):
+            guard = self._daily_run_guard(mk)
+            if bool(guard.get("active", False)):
+                active_daily_markets.append(mk)
+        if active_daily_markets:
+            return {
+                "ok": True,
+                "matched": True,
+                "blocked": False,
+                "reason": "daily_run_in_progress",
+                "skipped": True,
+                "active_daily_markets": active_daily_markets,
+            }
         strict = _truthy(os.getenv("AGENT_LAB_SYNC_STRICT", "1"))
         sync_scope = self.orchestrator._execution_sync_scope()
         return self.orchestrator.sync_account(market=sync_scope, strict=strict)

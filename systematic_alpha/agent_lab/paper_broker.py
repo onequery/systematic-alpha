@@ -10,6 +10,10 @@ from typing import Any, Dict, List, Optional, Set
 from zoneinfo import ZoneInfo
 
 import requests
+try:
+    import fcntl  # type: ignore
+except Exception:  # pragma: no cover - non-posix environments
+    fcntl = None  # type: ignore
 
 from systematic_alpha.agent_lab.storage import AgentLabStorage
 from systematic_alpha.credentials import load_credentials
@@ -1566,6 +1570,62 @@ class PaperBroker:
             return round(max(0.0001, out), 4)
         return None
 
+    def _broker_runtime_dir(self) -> str:
+        override = str(os.getenv("AGENT_LAB_BROKER_RUNTIME_DIR", "") or "").strip()
+        if override:
+            runtime_dir = override
+        else:
+            try:
+                runtime_dir = str(self.storage.db_path.parent / "runtime")
+            except Exception:
+                runtime_dir = os.path.join("state", "agent_lab", "runtime")
+        os.makedirs(runtime_dir, exist_ok=True)
+        return runtime_dir
+
+    def _call_with_global_api_serialization(self, fn: Any, *, op_name: str) -> Any:
+        enabled = self._env_bool("AGENT_LAB_BROKER_GLOBAL_SERIALIZE", True)
+        min_interval = self._env_float("AGENT_LAB_BROKER_GLOBAL_MIN_INTERVAL_SEC", 1.2, 0.0, 30.0)
+        if not enabled or fcntl is None:
+            return fn()
+
+        runtime_dir = self._broker_runtime_dir()
+        lock_path = os.path.join(runtime_dir, "broker_api_global.lock")
+        stamp_path = os.path.join(runtime_dir, "broker_api_global_last_ts.txt")
+        lock_fh = None
+        try:
+            lock_fh = open(lock_path, "a+", encoding="utf-8")
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+
+            if min_interval > 0:
+                last_ts = 0.0
+                try:
+                    raw = open(stamp_path, "r", encoding="utf-8").read().strip()
+                    if raw:
+                        last_ts = float(raw)
+                except Exception:
+                    last_ts = 0.0
+                elapsed = max(0.0, time.time() - last_ts)
+                wait_sec = max(0.0, float(min_interval) - elapsed)
+                if wait_sec > 0:
+                    time.sleep(wait_sec)
+
+            return fn()
+        finally:
+            try:
+                with open(stamp_path, "w", encoding="utf-8") as fh:
+                    fh.write(f"{time.time():.6f}\n")
+            except Exception:
+                pass
+            if lock_fh is not None:
+                try:
+                    fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+                except Exception:
+                    pass
+                try:
+                    lock_fh.close()
+                except Exception:
+                    pass
+
     def _call_with_rate_limit_retry(self, fn: Any, *, op_name: str) -> Any:
         rate_retries = self._env_int("AGENT_LAB_BROKER_RATE_LIMIT_RETRIES", 2, 0, 10)
         rate_base_delay = self._env_float("AGENT_LAB_BROKER_RATE_LIMIT_BACKOFF_SEC", 1.2, 0.0, 60.0)
@@ -1583,7 +1643,7 @@ class PaperBroker:
         last_exc: Exception | None = None
         while True:
             try:
-                payload = fn()
+                payload = self._call_with_global_api_serialization(fn, op_name=op_name)
                 api_err = self._api_error_text(payload)
                 if self._is_token_expired_text(api_err):
                     if token_refresh_attempt < token_refresh_retries:
