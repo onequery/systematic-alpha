@@ -24,7 +24,7 @@ class PaperBroker:
     def __init__(self, storage: AgentLabStorage):
         self.storage = storage
         self.execution_mode = str(os.getenv("AGENT_LAB_EXECUTION_MODE", "mojito_mock")).strip().lower()
-        self.us_exchange = str(os.getenv("AGENT_LAB_US_EXCHANGE", "NASD")).strip().upper() or "NASD"
+        self.us_exchange = str(os.getenv("AGENT_LAB_US_EXCHANGE", "NYSE")).strip().upper() or "NYSE"
         self._brokers: Dict[str, Any] = {}
         self._creds_loaded = False
         self._creds: Dict[str, Any] = {}
@@ -54,14 +54,23 @@ class PaperBroker:
     def _exchange_candidates(self, market: str) -> List[str]:
         if market.upper() == "KR":
             return ["KR"]
-        ordered = [self._normalize_us_exchange(self.us_exchange), "NASD", "NYSE", "AMEX"]
+        configured = self._env_csv(
+            "AGENT_LAB_US_EXCHANGE_CANDIDATES",
+            ["NYSE", "AMEX"],
+        )
+        allowed = {"NASD", "NYSE", "AMEX"}
         out: List[str] = []
         seen = set()
-        for ex in ordered:
+        for raw in configured:
+            ex = self._normalize_us_exchange(raw)
+            if ex not in allowed:
+                continue
             if ex in seen:
                 continue
             seen.add(ex)
             out.append(ex)
+        if not out:
+            out = ["NYSE", "AMEX"]
         return out
 
     def _exchange_label(self, market: str, us_exchange_code: str = "") -> str:
@@ -1637,6 +1646,35 @@ class PaperBroker:
         transient_max_delay = self._env_float("AGENT_LAB_BROKER_TRANSIENT_BACKOFF_MAX_SEC", 6.0, 0.1, 120.0)
         token_refresh_retries = self._env_int("AGENT_LAB_BROKER_TOKEN_REFRESH_RETRIES", 1, 0, 3)
 
+        op = str(op_name or "").strip()
+        if op.startswith("US.fetch_balance") or op.startswith("US.fetch_present_balance"):
+            # US balance sync is especially sensitive to burst retries. Use
+            # slower and fewer retries than global defaults to avoid retry storms.
+            rate_retries = min(
+                rate_retries,
+                self._env_int("AGENT_LAB_US_BALANCE_RATE_LIMIT_RETRIES", 2, 0, 10),
+            )
+            transient_retries = min(
+                transient_retries,
+                self._env_int("AGENT_LAB_US_BALANCE_TRANSIENT_RETRIES", 1, 0, 10),
+            )
+            rate_base_delay = max(
+                rate_base_delay,
+                self._env_float("AGENT_LAB_US_BALANCE_RATE_LIMIT_BACKOFF_SEC", 2.5, 0.0, 120.0),
+            )
+            rate_max_delay = max(
+                rate_max_delay,
+                self._env_float("AGENT_LAB_US_BALANCE_RATE_LIMIT_BACKOFF_MAX_SEC", 25.0, 0.1, 300.0),
+            )
+            transient_base_delay = max(
+                transient_base_delay,
+                self._env_float("AGENT_LAB_US_BALANCE_TRANSIENT_BACKOFF_SEC", 1.5, 0.0, 120.0),
+            )
+            transient_max_delay = max(
+                transient_max_delay,
+                self._env_float("AGENT_LAB_US_BALANCE_TRANSIENT_BACKOFF_MAX_SEC", 20.0, 0.1, 300.0),
+            )
+
         rate_attempt = 0
         transient_attempt = 0
         token_refresh_attempt = 0
@@ -1997,41 +2035,109 @@ class PaperBroker:
     def _fetch_us_snapshot_all_exchanges(self) -> Dict[str, Any]:
         errors: List[str] = []
         snapshots: List[Dict[str, Any]] = []
+        required_exchanges = list(self._exchange_candidates("US"))
+        successful_required: Set[str] = set()
+        exchange_results: Dict[str, Dict[str, Any]] = {}
         spacing = self._env_float("AGENT_LAB_US_BALANCE_EXCHANGE_SPACING_SEC", 1.0, 0.0, 10.0)
-        for exchange_code in self._exchange_candidates("US"):
+        rate_limit_cooldown_sec = self._env_float(
+            "AGENT_LAB_US_BALANCE_RATE_LIMIT_COOLDOWN_SEC",
+            8.0,
+            0.0,
+            120.0,
+        )
+        for exchange_code in required_exchanges:
+            ex_payload: Dict[str, Any] = {
+                "exchange": exchange_code,
+                "required": True,
+                "ok": False,
+                "error": "",
+                "position_count": 0,
+            }
             broker = self._get_broker("US", exchange_code)
             if broker is None:
-                errors.append(f"{exchange_code}:broker_unavailable")
+                err = "broker_unavailable"
+                errors.append(f"{exchange_code}:{err}")
+                ex_payload["error"] = err
+                exchange_results[exchange_code] = ex_payload
                 continue
             try:
                 payload = self._fetch_us_balance_with_fallback(broker)
                 parsed = self._parse_balance_oversea(payload if isinstance(payload, dict) else {})
                 snapshots.append({"exchange": exchange_code, "payload": payload, "parsed": parsed})
+                successful_required.add(exchange_code)
+                ex_payload["ok"] = True
+                ex_payload["position_count"] = int(
+                    sum(
+                        1
+                        for row in list(parsed.get("positions", []) or [])
+                        if isinstance(row, dict) and float(row.get("quantity", 0.0) or 0.0) > 0
+                    )
+                )
             except Exception as exc:
-                errors.append(f"{exchange_code}:{self._sanitize_error_text(repr(exc))}")
+                err = self._sanitize_error_text(repr(exc))
+                errors.append(f"{exchange_code}:{err}")
+                ex_payload["error"] = err
+                if self._is_rate_limit_text(err) and rate_limit_cooldown_sec > 0:
+                    time.sleep(rate_limit_cooldown_sec)
+            exchange_results[exchange_code] = ex_payload
             if spacing > 0:
                 time.sleep(spacing)
 
         # Additional all-market snapshot (OVRS_EXCG_CD=NASD path in mojito for "미국전체")
         # to reduce per-exchange sparsity in mock responses.
-        use_all_market = self._env_bool("AGENT_LAB_US_BALANCE_INCLUDE_ALL_MARKET", True)
+        use_all_market = self._env_bool("AGENT_LAB_US_BALANCE_INCLUDE_ALL_MARKET", False)
         if use_all_market:
+            ex_payload_all: Dict[str, Any] = {
+                "exchange": "USALL",
+                "required": False,
+                "ok": False,
+                "error": "",
+                "position_count": 0,
+            }
             broker_all = self._get_us_all_broker()
             if broker_all is None:
-                errors.append("USALL:broker_unavailable")
+                err = "broker_unavailable"
+                errors.append(f"USALL:{err}")
+                ex_payload_all["error"] = err
             else:
                 try:
                     payload_all = self._fetch_us_balance_with_fallback(broker_all)
                     parsed_all = self._parse_balance_oversea(payload_all if isinstance(payload_all, dict) else {})
                     snapshots.append({"exchange": "USALL", "payload": payload_all, "parsed": parsed_all})
+                    ex_payload_all["ok"] = True
+                    ex_payload_all["position_count"] = int(
+                        sum(
+                            1
+                            for row in list(parsed_all.get("positions", []) or [])
+                            if isinstance(row, dict) and float(row.get("quantity", 0.0) or 0.0) > 0
+                        )
+                    )
                 except Exception as exc:
-                    errors.append(f"USALL:{self._sanitize_error_text(repr(exc))}")
+                    err = self._sanitize_error_text(repr(exc))
+                    errors.append(f"USALL:{err}")
+                    ex_payload_all["error"] = err
+            exchange_results["USALL"] = ex_payload_all
 
         if not snapshots:
             raise RuntimeError("; ".join(errors) if errors else "US:all_exchange_snapshot_failed")
+        require_all = self._env_bool("AGENT_LAB_US_BALANCE_REQUIRE_ALL_EXCHANGES", True)
+        missing_required = [x for x in required_exchanges if x not in successful_required]
+        if require_all and missing_required:
+            detail = {
+                "required_exchanges": required_exchanges,
+                "successful_required": sorted(successful_required),
+                "missing_required": missing_required,
+                "exchange_results": exchange_results,
+                "errors": errors,
+            }
+            raise RuntimeError(f"us_incomplete_snapshot:{json.dumps(detail, ensure_ascii=False)}")
         merged = self._merge_us_exchange_snapshots(snapshots)
         merged["raw_errors"] = errors
         merged["exchange_count"] = len(snapshots)
+        merged["required_exchanges"] = required_exchanges
+        merged["successful_required"] = sorted(successful_required)
+        merged["all_required_exchanges_ok"] = len(missing_required) == 0
+        merged["exchange_results"] = exchange_results
         return merged
 
     def fetch_account_snapshot(self, market: str = "ALL") -> Dict[str, Any]:

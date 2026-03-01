@@ -1153,7 +1153,7 @@ class AutoStrategyDaemon:
         kr_universe_size = int(float(os.getenv("AGENT_LAB_INTRADAY_KR_UNIVERSE_SIZE", "300") or 300))
         us_universe_size = int(float(os.getenv("AGENT_LAB_INTRADAY_US_UNIVERSE_SIZE", "500") or 500))
         rest_sleep = float(os.getenv("AGENT_LAB_INTRADAY_REST_SLEEP", "0.08") or 0.08)
-        us_exchange = str(os.getenv("AGENT_LAB_US_EXCHANGE", "NASD")).strip().upper() or "NASD"
+        us_exchange = str(os.getenv("AGENT_LAB_US_EXCHANGE", "NYSE")).strip().upper() or "NYSE"
         prefetch = self._run_intraday_prefetch(
             market=market,
             run_date=run_date,

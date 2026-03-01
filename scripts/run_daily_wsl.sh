@@ -112,7 +112,7 @@ send_telegram_notice() {
 
 PYTHON_BIN="$(resolve_python_bin)"
 MARKET="KR"
-US_EXCHANGE="NASD"
+US_EXCHANGE="NYSE"
 COLLECT_SECONDS=600
 FINAL_PICKS=3
 PRE_CANDIDATES=40
@@ -128,7 +128,7 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     --exchange)
-      US_EXCHANGE="${2:-NASD}"
+      US_EXCHANGE="${2:-NYSE}"
       shift 2
       ;;
     --collect-seconds)

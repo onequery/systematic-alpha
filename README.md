@@ -67,6 +67,21 @@ pip install -r requirements.txt
 - `AGENT_LAB_EVENT_BATCH_MINUTES=30`
 - `AGENT_LAB_EVENT_BATCH_MAX_ITEMS=30`
 
+US 동기화/거래소 정책:
+- `AGENT_LAB_US_EXCHANGE_CANDIDATES=NYSE,AMEX`
+  - US 주문/잔고 동기화 대상 거래소를 NYSE/AMEX로 고정합니다.
+  - 이유: KIS 모의투자에서 NASD/USALL 응답이 호출마다 부분집합으로 흔들리는 사례(중복/누락)가 반복되어, 동기화 안정성과 실행 일관성을 우선합니다.
+- `AGENT_LAB_US_BALANCE_INCLUDE_ALL_MARKET=0`
+  - `USALL` 보조 조회를 비활성화합니다(NASD 계열 불안정 응답 영향 차단).
+- `AGENT_LAB_US_BALANCE_REQUIRE_ALL_EXCHANGES=1`
+  - 설정된 거래소(`AGENT_LAB_US_EXCHANGE_CANDIDATES`) 스냅샷이 모두 성공해야 US 동기화 성공으로 처리합니다.
+- `AGENT_LAB_US_DAYORNIGHT_CALL_SPACING_SEC=0.4`
+  - `dayornight -> inquire-balance` 연쇄 호출 사이 최소 간격(초)입니다.
+- `AGENT_LAB_US_BALANCE_EXCHANGE_SPACING_SEC=2.0`
+  - 거래소 순회 간 최소 간격(초)입니다.
+- `AGENT_LAB_US_BALANCE_RATE_LIMIT_RETRIES=2`, `AGENT_LAB_US_BALANCE_RATE_LIMIT_BACKOFF_SEC=2.5`
+  - US 잔고 동기화 전용 rate-limit 재시도/백오프를 보수적으로 제한합니다.
+
 정규장 시간 강제(거래 안전장치):
 - `AGENT_LAB_ENFORCE_MARKET_HOURS=1`이면 KR(09:00~15:35 KST), US(09:30~16:05 ET) 외 시간에는 주문 제안/실행을 차단합니다.
 
