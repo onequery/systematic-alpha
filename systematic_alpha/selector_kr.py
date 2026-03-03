@@ -360,7 +360,11 @@ class DayTradingSelector:
 
         ranked: List[Tuple[str, str, float]] = []
         total = len(scan_codes)
-        progress_every = max(50, self.config.stage1_log_interval * 10)
+        progress_every = max(20, self.config.stage1_log_interval)
+        print(
+            f"[universe] KR liquidity scan start: total={total}, progress_every={progress_every}",
+            flush=True,
+        )
         for idx, code in enumerate(scan_codes, start=1):
             try:
                 prev = self.fetch_prev_day_stats(code)
@@ -866,15 +870,118 @@ class DayTradingSelector:
     def build_stage1_candidates(
         self, codes: List[str], names: Dict[str, str]
     ) -> List[Stage1Candidate]:
-        return self._build_candidates_with_thresholds(
-            codes=codes,
-            names=names,
-            min_change_pct=self.config.min_change_pct,
-            min_gap_pct=self.config.min_gap_pct,
-            min_prev_turnover=self.config.min_prev_turnover,
-            limit=self.config.pre_candidates,
-            record_scan=True,
+        """
+        Stage1 gate removed: objective pool (liquidity top-N) is promoted directly
+        to final candidates with best-effort snapshot hydration.
+        """
+        candidates: List[Stage1Candidate] = []
+        scan_rows: List[Dict[str, Any]] = []
+        total = len(codes)
+        progress_every = max(1, self.config.stage1_log_interval)
+        limit = max(1, int(self.config.pre_candidates))
+
+        for idx, code in enumerate(codes, start=1):
+            scan_row: Dict[str, Any] = {
+                "scan_index": idx,
+                "code": code,
+                "name": names.get(code, ""),
+                "current_price": None,
+                "open_price": None,
+                "change_pct": None,
+                "gap_pct": None,
+                "prev_close": None,
+                "prev_day_volume": None,
+                "prev_day_turnover": None,
+                "pass_change": None,
+                "pass_gap": None,
+                "pass_prev_turnover": None,
+                "passed_stage1": True,
+                "skip_reason": "",
+                "min_change_pct": self.config.min_change_pct,
+                "min_gap_pct": self.config.min_gap_pct,
+                "min_prev_turnover": self.config.min_prev_turnover,
+                "long_only": self.config.long_only,
+                "mode": "stage1_removed_top_liquidity",
+            }
+
+            try:
+                prev = self.fetch_prev_day_stats(code)
+                if prev is None or prev.prev_close <= 0:
+                    scan_row["passed_stage1"] = False
+                    scan_row["skip_reason"] = "no_prev_day_stats"
+                    scan_rows.append(scan_row)
+                    continue
+
+                snap = self.fetch_price_snapshot(code)
+                current_price = prev.prev_close
+                open_price = prev.prev_close
+                change_pct = 0.0
+                if snap is not None:
+                    snap_name = str(snap.get("name") or "").strip()
+                    if snap_name and not scan_row.get("name"):
+                        scan_row["name"] = snap_name
+                    snap_price = to_float(snap.get("price"))
+                    snap_open = to_float(snap.get("open"))
+                    snap_change = to_float(snap.get("change_pct"))
+                    if snap_price is not None and snap_price > 0:
+                        current_price = snap_price
+                    if snap_open is not None and snap_open > 0:
+                        open_price = snap_open
+                    else:
+                        open_price = current_price
+                    if snap_change is not None:
+                        change_pct = snap_change
+                    elif prev.prev_close > 0:
+                        change_pct = ((current_price - prev.prev_close) / prev.prev_close) * 100.0
+                else:
+                    scan_row["skip_reason"] = "no_price_snapshot_fallback_prev_close"
+                    if prev.prev_close > 0:
+                        change_pct = ((current_price - prev.prev_close) / prev.prev_close) * 100.0
+
+                gap_pct = ((open_price - prev.prev_close) / prev.prev_close) * 100.0 if prev.prev_close > 0 else 0.0
+
+                scan_row["current_price"] = current_price
+                scan_row["open_price"] = open_price
+                scan_row["change_pct"] = change_pct
+                scan_row["gap_pct"] = gap_pct
+                scan_row["prev_close"] = prev.prev_close
+                scan_row["prev_day_volume"] = prev.prev_volume
+                scan_row["prev_day_turnover"] = prev.prev_turnover
+                scan_row["pass_prev_turnover"] = prev.prev_turnover > 0
+                scan_rows.append(scan_row)
+
+                candidates.append(
+                    Stage1Candidate(
+                        code=code,
+                        name=str(scan_row.get("name", "") or ""),
+                        current_price=current_price,
+                        open_price=open_price,
+                        current_change_pct=change_pct,
+                        gap_pct=gap_pct,
+                        prev_close=prev.prev_close,
+                        prev_day_volume=prev.prev_volume,
+                        prev_day_turnover=prev.prev_turnover,
+                    )
+                )
+            finally:
+                if idx % progress_every == 0 or idx == total:
+                    pct = (idx / total * 100.0) if total > 0 else 100.0
+                    print(
+                        f"[candidate] scanned={idx}/{total} ({pct:.1f}%), selected={len(candidates)}",
+                        flush=True,
+                    )
+                if self.config.rest_sleep_sec > 0:
+                    time.sleep(self.config.rest_sleep_sec)
+
+        candidates.sort(key=lambda c: c.prev_day_turnover, reverse=True)
+        self.last_stage1_scan = scan_rows
+        selected = candidates[:limit]
+        print(
+            f"[candidate] selected={len(selected)}/{len(candidates)} "
+            "(basis=liquidity_top_pool, stage1=disabled)",
+            flush=True,
         )
+        return selected
 
     def build_fallback_candidates(
         self,

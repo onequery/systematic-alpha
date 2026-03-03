@@ -106,6 +106,10 @@ if [[ ! "$LOG_PROFILE" =~ ^[A-Za-z0-9_-]+$ ]]; then
   LOG_PROFILE="trader"
 fi
 
+ts_pipe() {
+  TZ=Asia/Seoul awk '{ printf("[%s] %s\n", strftime("%Y-%m-%d %H:%M:%S KST"), $0); fflush(); }'
+}
+
 export TRADER_PROFILE="$PROFILE"
 
 PYTHON_BIN="$(resolve_python_bin)"
@@ -164,6 +168,6 @@ fi
   echo "[run_trader_wsl] started $(TZ=Asia/Seoul date '+%F %T %Z')"
   echo "[run_trader_wsl] python: $PYTHON_BIN"
   echo "[run_trader_wsl] command: $PYTHON_BIN -m systematic_alpha.trader.cli --project-root $ROOT_DIR ${ARGS[*]}"
-} | tee -a "$LOG_FILE"
+} | ts_pipe | tee -a "$LOG_FILE"
 
-"$PYTHON_BIN" -m systematic_alpha.trader.cli --project-root "$ROOT_DIR" "${ARGS[@]}" 2>&1 | tee -a "$LOG_FILE"
+"$PYTHON_BIN" -m systematic_alpha.trader.cli --project-root "$ROOT_DIR" "${ARGS[@]}" 2>&1 | ts_pipe | tee -a "$LOG_FILE"
