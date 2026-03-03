@@ -175,6 +175,10 @@ def precompute_market(
     universe_file: Optional[str] = None,
 ) -> Dict[str, Any]:
     mk = str(market).upper()
+    market_slug = str(mk).lower()
+    session_root = cfg.out_dir / market_slug / trade_date
+    results_path = session_root / "results" / f"{market_slug}_daily_{trade_date}.json"
+    analytics_dir = session_root / "analytics"
     started_at = _now_iso()
     universe_source = "file" if universe_file else "objective"
 
@@ -183,7 +187,13 @@ def precompute_market(
     rows: List[Dict[str, Any]] = []
     filter_payload: Dict[str, Any]
     try:
-        selector = make_selector(cfg=cfg, market=mk, universe_file=universe_file)
+        selector = make_selector(
+            cfg=cfg,
+            market=mk,
+            universe_file=universe_file,
+            output_json_path=str(results_path),
+            analytics_dir=str(analytics_dir),
+        )
         codes, names = selector.load_universe()
         stage1 = selector.build_stage1_candidates(codes, names)
         max_candidates = int(cfg.candidates_max_kr if mk == "KR" else cfg.candidates_max_us)

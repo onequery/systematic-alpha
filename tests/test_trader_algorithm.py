@@ -6,8 +6,10 @@ from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
+from zoneinfo import ZoneInfo
 
-from systematic_alpha.trader.cli import _snapshot_budget
+from systematic_alpha.trader.config import load_trader_config
+from systematic_alpha.trader.cli import _ensure_daily_bootstrap, _snapshot_budget
 from systematic_alpha.trader.execution import execute_entry_intents
 from systematic_alpha.trader.realtime import SignalIntent, _watch_symbols, collect_breakout_intents
 from systematic_alpha.trader.scheduler import ET, us_liquidation_plan
@@ -315,6 +317,76 @@ class TraderAlgorithmTests(unittest.TestCase):
         self.assertTrue(result.blocked)
         self.assertEqual("broker_fetch_failed", result.reason)
         self.assertTrue(any(err.startswith("US:") for err in result.errors))
+
+    def test_midday_bootstrap_runs_catchup_when_precompute_and_budget_missing(self) -> None:
+        trade_date = "20260303"
+        cfg = SimpleNamespace(strict_sync=True, per_trade_ratio=0.12)
+        telegram = _DummyTelegram()
+        sync_service = _FakeSyncService(
+            [
+                SyncResult(
+                    market_scope="ALL",
+                    strict=True,
+                    ok=True,
+                    blocked=False,
+                    reason="",
+                    errors=[],
+                    cash_krw=500000.0,
+                    equity_krw=500000.0,
+                    positions=[],
+                    snapshot_id=99,
+                )
+            ]
+        )
+        now = datetime(2026, 3, 3, 13, 0, 0, tzinfo=ZoneInfo("Asia/Seoul"))
+
+        with mock.patch(
+            "systematic_alpha.trader.cli.precompute_all_markets",
+            return_value={"trade_date": trade_date, "results": []},
+        ) as mocked_pre:
+            with mock.patch(
+                "systematic_alpha.trader.cli.precompute_window",
+                return_value=(now.replace(hour=8, minute=5), now.replace(hour=8, minute=33)),
+            ):
+                with mock.patch(
+                    "systematic_alpha.trader.cli.budget_snapshot_time",
+                    return_value=now.replace(hour=8, minute=40),
+                ):
+                    with mock.patch(
+                        "systematic_alpha.trader.cli.is_market_open",
+                        side_effect=lambda market: str(market).upper() == "KR",
+                    ):
+                        result = _ensure_daily_bootstrap(
+                            cfg=cfg,
+                            storage=self.storage,
+                            sync=sync_service,
+                            telegram=telegram,
+                            now_kst_dt=now,
+                            trade_date=trade_date,
+                        )
+
+        self.assertTrue(result["ran_precompute"])
+        self.assertTrue(result["ran_budget_snapshot"])
+        mocked_pre.assert_called_once()
+        self.assertEqual("1", str(self.storage.get_meta(f"precompute_done:{trade_date}", "0")))
+        self.assertIsNotNone(self.storage.get_day_budget(trade_date))
+
+    def test_profile_paths_are_separated_for_test_profile(self) -> None:
+        with mock.patch.dict(
+            "os.environ",
+            {
+                "TRADER_PROFILE": "test",
+                "TELEGRAM_ENABLED": "0",
+                "TELEGRAM_BOT_TOKEN": "",
+                "TELEGRAM_CHAT_ID": "",
+            },
+            clear=False,
+        ):
+            cfg = load_trader_config(self.root)
+        self.assertEqual("test", cfg.profile)
+        self.assertEqual(self.root / "state" / "trader_test", cfg.state_dir)
+        self.assertEqual(self.root / "out" / "trader_test", cfg.out_dir)
+        self.assertEqual(self.root / "logs" / "trader_test", cfg.logs_dir)
 
 
 if __name__ == "__main__":

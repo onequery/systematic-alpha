@@ -57,10 +57,19 @@ def refresh_market_prices(
     trade_date: str,
 ) -> Dict[str, Any]:
     mk = str(market).upper()
+    market_slug = str(mk).lower()
+    session_root = cfg.out_dir / market_slug / trade_date
+    output_json_path = session_root / "results" / f"{market_slug}_refresh_{trade_date}.json"
+    analytics_dir = session_root / "analytics"
     symbol_sets = _watch_symbols(storage, mk, trade_date)
     watch_list = sorted(symbol_sets["watch"])
     try:
-        selector = make_selector(cfg=cfg, market=mk)
+        selector = make_selector(
+            cfg=cfg,
+            market=mk,
+            output_json_path=str(output_json_path),
+            analytics_dir=str(analytics_dir),
+        )
     except Exception as exc:
         return {
             "market": mk,

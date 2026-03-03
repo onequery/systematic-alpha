@@ -15,7 +15,7 @@ except Exception:
 from systematic_alpha.credentials import load_credentials
 from systematic_alpha.helpers import to_float
 from systematic_alpha.mojito_loader import import_mojito_module
-from systematic_alpha.trader.config import TraderConfig
+from systematic_alpha.trader.config import TraderConfig, state_dir_from_cfg
 from systematic_alpha.trader.storage import TraderStorage
 
 
@@ -111,7 +111,7 @@ class AccountSyncService:
         self._creds_loaded = False
         self._creds: Dict[str, str] = {}
 
-        runtime_dir = self.config.project_root / "state" / "trader" / "runtime"
+        runtime_dir = state_dir_from_cfg(self.config) / "runtime"
         runtime_dir.mkdir(parents=True, exist_ok=True)
         self._lock_path = runtime_dir / "broker_global.lock"
 

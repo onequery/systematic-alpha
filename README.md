@@ -44,6 +44,9 @@ KIS OpenAPI 모의투자용 자동매매 엔진입니다.
 
 # 데몬 실행
 ./scripts/run_trader_wsl.sh --action daemon
+
+# 테스트/검증 실행(로그는 logs/trader_test/*로 분리)
+./scripts/run_trader_test_wsl.sh --action status
 ```
 
 ## 크론 작업
@@ -62,7 +65,30 @@ KIS OpenAPI 모의투자용 자동매매 엔진입니다.
 ```bash
 ./scripts/monitor_trader_wsl.sh --once
 ./scripts/monitor_trader_wsl.sh
+
+# 테스트 로그 모니터링
+./scripts/monitor_trader_wsl.sh --log-profile trader_test --once
+# 테스트 DB + 로그 모니터링
+./scripts/monitor_trader_wsl.sh --profile test --once
 ```
+
+## 로그 분리
+- 운영 로그: `logs/trader/<YYYYMMDD>/...`
+- 테스트 로그: `logs/trader_test/<YYYYMMDD>/...`
+- `run_trader_wsl.sh`에서 `--log-profile`로 경로를 명시할 수 있습니다.
+  - 예: `./scripts/run_trader_wsl.sh --log-profile trader_test --action sync-account --market US`
+
+## 상태/산출물 분리(Profile)
+- 운영 기본 프로파일: `prod`
+  - DB: `state/trader/trader.sqlite`
+  - 산출물: `out/trader/...`
+  - 로그: `logs/trader/...`
+- 테스트 프로파일: `test`
+  - DB: `state/trader_test/trader.sqlite`
+  - 산출물: `out/trader_test/...`
+  - 로그: `logs/trader_test/...`
+- 지정 실행 예시:
+  - `./scripts/run_trader_wsl.sh --profile test --log-profile trader_test --action status`
 
 ## 컷오버/리셋
 ```bash
@@ -71,4 +97,3 @@ KIS OpenAPI 모의투자용 자동매매 엔진입니다.
 ```
 
 아카이브 경로: `archive/cutover_trader_<timestamp>/`
-

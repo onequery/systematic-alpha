@@ -41,6 +41,8 @@ DATE_ARG=""
 PHASE="manual"
 STRICT=1
 POLL_SECONDS=""
+PROFILE="${TRADER_PROFILE:-prod}"
+LOG_PROFILE="${TRADER_LOG_PROFILE:-}"
 EXTRA_ARGS=()
 
 while [[ $# -gt 0 ]]; do
@@ -73,6 +75,14 @@ while [[ $# -gt 0 ]]; do
       POLL_SECONDS="${2:-}"
       shift 2
       ;;
+    --profile)
+      PROFILE="${2:-prod}"
+      shift 2
+      ;;
+    --log-profile)
+      LOG_PROFILE="${2:-trader}"
+      shift 2
+      ;;
     *)
       EXTRA_ARGS+=("$1")
       shift
@@ -80,10 +90,28 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+if [[ ! "$PROFILE" =~ ^[A-Za-z0-9_-]+$ ]]; then
+  PROFILE="prod"
+fi
+
+if [[ -z "$LOG_PROFILE" ]]; then
+  if [[ "$PROFILE" == "prod" || "$PROFILE" == "main" || "$PROFILE" == "default" ]]; then
+    LOG_PROFILE="trader"
+  else
+    LOG_PROFILE="trader_${PROFILE}"
+  fi
+fi
+
+if [[ ! "$LOG_PROFILE" =~ ^[A-Za-z0-9_-]+$ ]]; then
+  LOG_PROFILE="trader"
+fi
+
+export TRADER_PROFILE="$PROFILE"
+
 PYTHON_BIN="$(resolve_python_bin)"
 RUN_DATE="$(TZ=Asia/Seoul date +%Y%m%d)"
 RUN_STAMP="$(TZ=Asia/Seoul date +%Y%m%d_%H%M%S)"
-LOG_DIR="$ROOT_DIR/logs/trader/$RUN_DATE"
+LOG_DIR="$ROOT_DIR/logs/$LOG_PROFILE/$RUN_DATE"
 mkdir -p "$LOG_DIR"
 LOG_FILE="$LOG_DIR/trader_${ACTION//-/_}_${RUN_STAMP}.log"
 
@@ -139,4 +167,3 @@ fi
 } | tee -a "$LOG_FILE"
 
 "$PYTHON_BIN" -m systematic_alpha.trader.cli --project-root "$ROOT_DIR" "${ARGS[@]}" 2>&1 | tee -a "$LOG_FILE"
-

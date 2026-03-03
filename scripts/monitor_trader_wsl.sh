@@ -9,6 +9,8 @@ INTERVAL=3
 ONCE=0
 TAIL_LINES=20
 EVENT_LIMIT=20
+PROFILE="prod"
+LOG_PROFILE=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -32,6 +34,14 @@ while [[ $# -gt 0 ]]; do
       MODE="${2:-dashboard}"
       shift 2
       ;;
+    --profile)
+      PROFILE="${2:-prod}"
+      shift 2
+      ;;
+    --log-profile)
+      LOG_PROFILE="${2:-trader}"
+      shift 2
+      ;;
     *)
       echo "unknown option: $1" >&2
       exit 2
@@ -39,13 +49,35 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-DB_PATH="$ROOT_DIR/state/trader/trader.sqlite"
+if [[ ! "$PROFILE" =~ ^[A-Za-z0-9_-]+$ ]]; then
+  PROFILE="prod"
+fi
+
+if [[ -z "$LOG_PROFILE" ]]; then
+  if [[ "$PROFILE" == "prod" || "$PROFILE" == "main" || "$PROFILE" == "default" ]]; then
+    LOG_PROFILE="trader"
+  else
+    LOG_PROFILE="trader_${PROFILE}"
+  fi
+fi
+
+if [[ ! "$LOG_PROFILE" =~ ^[A-Za-z0-9_-]+$ ]]; then
+  LOG_PROFILE="trader"
+fi
+
+if [[ "$PROFILE" == "prod" || "$PROFILE" == "main" || "$PROFILE" == "default" ]]; then
+  DB_PATH="$ROOT_DIR/state/trader/trader.sqlite"
+else
+  DB_PATH="$ROOT_DIR/state/trader_${PROFILE}/trader.sqlite"
+fi
 
 print_dashboard() {
   clear
   echo "[monitor_trader_wsl] $(TZ=Asia/Seoul date '+%F %T %Z')"
   echo "root=$ROOT_DIR"
   echo "mode=$MODE interval=${INTERVAL}s tail_lines=$TAIL_LINES event_limit=$EVENT_LIMIT"
+  echo "profile=$PROFILE"
+  echo "log_profile=$LOG_PROFILE"
   echo
   echo "== Processes =="
   ps -ef | grep -E "run_trader_wsl\\.sh --action daemon|systematic_alpha\\.trader\\.cli .* daemon" | grep -v grep || true
@@ -63,7 +95,7 @@ print_dashboard() {
   fi
   echo
   echo "== Recent Trader Logs =="
-  ls -1dt "$ROOT_DIR"/logs/trader/* 2>/dev/null | head -n 1 | while read -r latest_dir; do
+  ls -1dt "$ROOT_DIR"/logs/"$LOG_PROFILE"/* 2>/dev/null | head -n 1 | while read -r latest_dir; do
     find "$latest_dir" -maxdepth 1 -type f | sort | tail -n 2 | while read -r f; do
       echo "-- $f"
       tail -n "$TAIL_LINES" "$f"
@@ -80,4 +112,3 @@ while true; do
   print_dashboard
   sleep "$INTERVAL"
 done
-

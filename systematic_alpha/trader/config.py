@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List
@@ -58,9 +59,63 @@ def _text_env(name: str, default: str = "") -> str:
     return str(os.getenv(name, default) or default).strip()
 
 
+def normalize_profile(raw: str) -> str:
+    text = str(raw or "").strip().lower()
+    if not text:
+        return "prod"
+    text = re.sub(r"[^a-z0-9_-]+", "_", text)
+    text = text.strip("_")
+    if not text:
+        return "prod"
+    return text
+
+
+def profile_suffix(profile: str) -> str:
+    name = normalize_profile(profile)
+    if name in {"prod", "main", "default"}:
+        return ""
+    return f"_{name}"
+
+
+def profile_dir(root: Path, bucket: str, profile: str) -> Path:
+    suffix = profile_suffix(profile)
+    return Path(root) / str(bucket) / f"trader{suffix}"
+
+
+def state_dir_from_cfg(cfg: object) -> Path:
+    val = getattr(cfg, "state_dir", None)
+    if val:
+        return Path(val)
+    root = Path(getattr(cfg, "project_root", "."))
+    profile = normalize_profile(str(getattr(cfg, "profile", "prod")))
+    return profile_dir(root, "state", profile)
+
+
+def out_dir_from_cfg(cfg: object) -> Path:
+    val = getattr(cfg, "out_dir", None)
+    if val:
+        return Path(val)
+    root = Path(getattr(cfg, "project_root", "."))
+    profile = normalize_profile(str(getattr(cfg, "profile", "prod")))
+    return profile_dir(root, "out", profile)
+
+
+def logs_dir_from_cfg(cfg: object) -> Path:
+    val = getattr(cfg, "logs_dir", None)
+    if val:
+        return Path(val)
+    root = Path(getattr(cfg, "project_root", "."))
+    profile = normalize_profile(str(getattr(cfg, "profile", "prod")))
+    return profile_dir(root, "logs", profile)
+
+
 @dataclass(frozen=True)
 class TraderConfig:
     project_root: Path
+    profile: str
+    state_dir: Path
+    out_dir: Path
+    logs_dir: Path
 
     execution_mode: str
     enabled_markets: List[str]
@@ -130,6 +185,10 @@ class TraderConfig:
 def load_trader_config(project_root: str | Path = ".") -> TraderConfig:
     root = Path(project_root).resolve()
     load_env_stack(root, files=("config/trader.config", ".env"))
+    profile = normalize_profile(_text_env("TRADER_PROFILE", "prod"))
+    state_dir = profile_dir(root, "state", profile)
+    out_dir = profile_dir(root, "out", profile)
+    logs_dir = profile_dir(root, "logs", profile)
 
     token = _text_env("TELEGRAM_BOT_TOKEN", "")
     if token.lower().startswith("bot"):
@@ -148,6 +207,10 @@ def load_trader_config(project_root: str | Path = ".") -> TraderConfig:
 
     return TraderConfig(
         project_root=root,
+        profile=profile,
+        state_dir=state_dir,
+        out_dir=out_dir,
+        logs_dir=logs_dir,
         execution_mode=_text_env("TRADER_EXECUTION_MODE", "mojito_mock").lower(),
         enabled_markets=enabled_markets,
         us_sync_exchanges=us_sync_exchanges,

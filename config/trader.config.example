@@ -3,6 +3,7 @@
 # Secrets must stay in .env.
 
 TRADER_EXECUTION_MODE=mojito_mock
+TRADER_PROFILE=prod
 TRADER_ORDER_ENABLED_MARKETS=KR,US
 
 # Strategy: Larry Williams breakout
@@ -62,4 +63,3 @@ TRADER_ENTRY_COOLDOWN_MINUTES=10
 # Telegram
 TELEGRAM_ENABLED=1
 TELEGRAM_DISABLE_NOTIFICATION=0
-

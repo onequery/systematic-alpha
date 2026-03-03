@@ -71,7 +71,7 @@ def generate_daily_report(
     }
     storage.upsert_daily_report(trade_date, payload)
 
-    out_dir = cfg.project_root / "out" / "trader" / trade_date
+    out_dir = cfg.out_dir / trade_date
     _ensure_dir(out_dir)
     json_path = out_dir / f"session_close_report_{trade_date}.json"
     md_path = out_dir / f"session_close_report_{trade_date}.md"
@@ -99,4 +99,3 @@ def generate_daily_report(
         f"평가자산={payload['account']['equity_krw']:.0f}"
     )
     return payload
-

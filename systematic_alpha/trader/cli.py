@@ -16,8 +16,10 @@ from systematic_alpha.trader.precompute import precompute_all_markets, precomput
 from systematic_alpha.trader.realtime import collect_breakout_intents, refresh_market_prices
 from systematic_alpha.trader.report import generate_daily_report
 from systematic_alpha.trader.scheduler import (
+    budget_snapshot_time,
     is_market_open,
     liquidation_phase,
+    precompute_window,
     should_run_budget_snapshot,
     should_run_precompute,
     trade_date_et,
@@ -54,9 +56,9 @@ def _parse_markets(value: str) -> List[str]:
 
 def _ensure_trader_paths(cfg: TraderConfig) -> Dict[str, Path]:
     paths = {
-        "state": cfg.project_root / "state" / "trader",
-        "out": cfg.project_root / "out" / "trader",
-        "logs": cfg.project_root / "logs" / "trader",
+        "state": cfg.state_dir,
+        "out": cfg.out_dir,
+        "logs": cfg.logs_dir,
     }
     for path in paths.values():
         path.mkdir(parents=True, exist_ok=True)
@@ -65,7 +67,7 @@ def _ensure_trader_paths(cfg: TraderConfig) -> Dict[str, Path]:
 
 def _build_runtime(cfg: TraderConfig):
     _ensure_trader_paths(cfg)
-    db_path = cfg.project_root / "state" / "trader" / "trader.sqlite"
+    db_path = cfg.state_dir / "trader.sqlite"
     storage = TraderStorage(db_path)
     telegram = TelegramClient(cfg)
     sync = AccountSyncService(cfg, storage)
@@ -106,6 +108,92 @@ def _snapshot_budget(
     )
     storage.log_event("budget_snapshot_captured", payload)
     return {"ok": True, **payload}
+
+
+def _ensure_daily_bootstrap(
+    *,
+    cfg: TraderConfig,
+    storage: TraderStorage,
+    sync: AccountSyncService,
+    telegram: TelegramClient,
+    now_kst_dt: datetime,
+    trade_date: str,
+) -> Dict[str, object]:
+    precompute_key = f"precompute_done:{trade_date}"
+    precompute_done = str(storage.get_meta(precompute_key, "0")) == "1"
+    budget_done = storage.get_day_budget(trade_date) is not None
+
+    pre_start, pre_end = precompute_window(cfg, now_kst_dt)
+    snap_time = budget_snapshot_time(cfg, now_kst_dt)
+    any_market_open = bool(is_market_open("KR") or is_market_open("US"))
+
+    trigger = ""
+    if any_market_open:
+        trigger = "market_open"
+    elif now_kst_dt >= pre_end:
+        trigger = "after_precompute_window"
+    elif now_kst_dt >= snap_time:
+        trigger = "after_budget_snapshot_time"
+
+    ran_precompute = False
+    ran_budget_snapshot = False
+
+    if (not precompute_done) and (any_market_open or now_kst_dt >= pre_end):
+        result = precompute_all_markets(cfg=cfg, storage=storage, trade_date=trade_date)
+        storage.upsert_meta(precompute_key, "1")
+        storage.log_event(
+            "precompute_catchup_done",
+            {"trade_date": trade_date, "trigger": trigger or "catchup", "result": result},
+        )
+        telegram.send(
+            "[이벤트] [Trader] 사전 계산 지연 보정 실행\n"
+            f"일자={trade_date}\n"
+            f"트리거={trigger or 'catchup'}"
+        )
+        ran_precompute = True
+
+    if (not budget_done) and (any_market_open or now_kst_dt >= snap_time):
+        budget = _snapshot_budget(cfg=cfg, storage=storage, sync=sync, trade_date=trade_date)
+        if budget.get("ok"):
+            storage.log_event(
+                "budget_snapshot_catchup",
+                {
+                    "trade_date": trade_date,
+                    "trigger": trigger or "catchup",
+                    "cash_krw": float(budget.get("cash_krw", 0.0) or 0.0),
+                    "budget_per_trade": float(budget.get("budget_per_trade", 0.0) or 0.0),
+                },
+            )
+            telegram.send(
+                "[이벤트] [Trader] 일일 예산 지연 보정\n"
+                f"일자={trade_date}\n"
+                f"총현금={float(budget.get('cash_krw', 0.0) or 0.0):.0f}\n"
+                f"1회예산={float(budget.get('budget_per_trade', 0.0) or 0.0):.0f}"
+            )
+        else:
+            storage.log_event(
+                "budget_snapshot_catchup_failed",
+                {
+                    "trade_date": trade_date,
+                    "trigger": trigger or "catchup",
+                    "reason": budget.get("reason"),
+                    "errors": budget.get("errors", []),
+                },
+            )
+            telegram.send(
+                "[Action required] [Trader] 예산 스냅샷 지연 보정 실패\n"
+                f"일자={trade_date}\n"
+                f"사유={budget.get('reason')}\n"
+                f"오류={budget.get('errors')}"
+            )
+        ran_budget_snapshot = True
+
+    return {
+        "trade_date": trade_date,
+        "trigger": trigger or "none",
+        "ran_precompute": ran_precompute,
+        "ran_budget_snapshot": ran_budget_snapshot,
+    }
 
 
 def _run_market_cycle(
@@ -175,10 +263,14 @@ def _archive_and_reset(cfg: TraderConfig) -> Dict[str, object]:
         cfg.project_root / "logs" / "agent_lab",
         cfg.project_root / "logs" / "kr",
         cfg.project_root / "logs" / "us",
-        cfg.project_root / "state" / "trader",
-        cfg.project_root / "out" / "trader",
-        cfg.project_root / "logs" / "trader",
     ]
+    for bucket in ("state", "out", "logs"):
+        base = cfg.project_root / bucket
+        if not base.exists():
+            continue
+        for path in base.glob("trader*"):
+            move_targets.append(path)
+
     moved = []
     for src in move_targets:
         if not src.exists():
@@ -197,7 +289,7 @@ def _archive_and_reset(cfg: TraderConfig) -> Dict[str, object]:
             moved.append({"from": str(file), "to": str(dst)})
 
     _ensure_trader_paths(cfg)
-    storage = TraderStorage(cfg.project_root / "state" / "trader" / "trader.sqlite")
+    storage = TraderStorage(cfg.state_dir / "trader.sqlite")
     storage.log_event("cutover_reset", {"archive_root": str(archive_root), "moved_count": len(moved)})
     storage.close()
     return {"archive_root": str(archive_root), "moved": moved}
@@ -214,6 +306,17 @@ def _daemon_loop(cfg: TraderConfig) -> int:
         while True:
             now = datetime.now(KST)
             date_kst = trade_date_kst()
+
+            catchup = _ensure_daily_bootstrap(
+                cfg=cfg,
+                storage=storage,
+                sync=sync,
+                telegram=telegram,
+                now_kst_dt=now,
+                trade_date=date_kst,
+            )
+            if catchup.get("ran_precompute") or catchup.get("ran_budget_snapshot"):
+                storage.log_event("daily_bootstrap_catchup", catchup)
 
             if should_run_precompute(cfg, now):
                 mark_key = f"precompute_done:{date_kst}"
