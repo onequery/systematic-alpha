@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import csv
 import os
 import time
 from datetime import datetime
+from pathlib import Path
 from statistics import mean
 from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
@@ -19,6 +21,68 @@ KST = ZoneInfo("Asia/Seoul")
 
 def _now_iso() -> str:
     return datetime.now(KST).isoformat(timespec="seconds")
+
+
+def expected_candidate_count(cfg: TraderConfig, market: str) -> int:
+    mk = str(market or "").upper()
+    try:
+        value = cfg.candidates_max_kr if mk == "KR" else cfg.candidates_max_us
+        return max(1, int(value))
+    except Exception:
+        return 20
+
+
+def final_candidate_cache_path(cfg: TraderConfig, market: str, trade_date: str) -> Path:
+    mk = str(market or "").upper()
+    slug = str(mk).lower()
+    return cfg.out_dir / slug / trade_date / "cache" / f"{slug}_final_candidates.csv"
+
+
+def final_candidate_cache_count(path: Path) -> int:
+    csv_path = Path(path)
+    if not csv_path.exists():
+        return 0
+    try:
+        with csv_path.open("r", encoding="utf-8", newline="") as fh:
+            reader = csv.DictReader(fh)
+            return sum(1 for row in reader if str(row.get("symbol", "")).strip())
+    except Exception:
+        return 0
+
+
+def _write_final_candidate_cache(path: Path, rows: List[Dict[str, Any]]) -> None:
+    csv_path = Path(path)
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = [
+        "trade_date",
+        "market",
+        "candidate_rank",
+        "symbol",
+        "name",
+        "today_open",
+        "prev_high",
+        "prev_low",
+        "breakout_price",
+        "last_price",
+    ]
+    with csv_path.open("w", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(
+                {
+                    "trade_date": row.get("trade_date", ""),
+                    "market": row.get("market", ""),
+                    "candidate_rank": row.get("candidate_rank", 0),
+                    "symbol": row.get("symbol", ""),
+                    "name": row.get("name", ""),
+                    "today_open": row.get("today_open", ""),
+                    "prev_high": row.get("prev_high", ""),
+                    "prev_low": row.get("prev_low", ""),
+                    "breakout_price": row.get("breakout_price", ""),
+                    "last_price": row.get("last_price", ""),
+                }
+            )
 
 
 def _parse_ohlcv_rows(raw_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -389,6 +453,7 @@ def precompute_market(
     status = "OK"
     detail: Dict[str, Any] = {"market": mk}
     rows: List[Dict[str, Any]] = []
+    candidate_cache_path = final_candidate_cache_path(cfg, mk, trade_date)
     filter_payload: Dict[str, Any]
     try:
         selector = make_selector(
@@ -409,6 +474,7 @@ def precompute_market(
             trade_date=trade_date,
             breakout_k=cfg.k,
         )
+        _write_final_candidate_cache(candidate_cache_path, rows)
         storage.clear_candidate_flags(trade_date, mk)
         storage.upsert_symbol_plan_rows(rows)
 
@@ -434,12 +500,19 @@ def precompute_market(
             {
                 "universe_count": len(codes),
                 "candidate_count": len(rows),
+                "candidate_cache_path": str(candidate_cache_path),
+                "candidate_cache_count": int(final_candidate_cache_count(candidate_cache_path)),
+                "candidate_required_count": int(expected_candidate_count(cfg, mk)),
                 "index_filter": filter_payload,
             }
         )
     except Exception as exc:
         status = "ERROR"
         detail["error"] = repr(exc)
+        try:
+            candidate_cache_path.unlink(missing_ok=True)
+        except Exception:
+            pass
         rows = []
 
     finished_at = _now_iso()

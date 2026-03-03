@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import os
 import time
 from datetime import datetime
 from pathlib import Path
@@ -44,7 +45,78 @@ class DayTradingSelector:
         self._price_cache: Dict[str, Optional[Dict[str, Any]]] = {}
         self._daily_bars_cache: Dict[str, List[Dict[str, Any]]] = {}
         self.last_stage1_scan: List[Dict[str, Any]] = []
+        self._api_diag_counts: Dict[str, int] = {}
+        self._api_diag_samples: List[Dict[str, str]] = []
+        self._api_diag_last_by_code: Dict[str, str] = {}
+        self._rate_limit_retries = max(
+            0, int(float(os.getenv("TRADER_RATE_LIMIT_RETRIES", "3") or 3))
+        )
+        self._rate_limit_backoff_sec = max(
+            0.1, float(os.getenv("TRADER_RATE_LIMIT_BACKOFF_SEC", "2.0") or 2.0)
+        )
+        self._rate_limit_backoff_max_sec = max(
+            0.1, float(os.getenv("TRADER_RATE_LIMIT_BACKOFF_MAX_SEC", "20.0") or 20.0)
+        )
         self._load_prev_stats_cache()
+
+    @staticmethod
+    def _payload_api_error(payload: Any) -> str:
+        if not isinstance(payload, dict):
+            return ""
+        rt_cd = str(payload.get("rt_cd", "") or "").strip()
+        msg_cd = str(payload.get("msg_cd", "") or "").strip()
+        msg1 = str(payload.get("msg1", "") or "").strip()
+        if rt_cd and rt_cd != "0":
+            out = [f"rt_cd={rt_cd}"]
+            if msg_cd:
+                out.append(f"msg_cd={msg_cd}")
+            if msg1:
+                out.append(f"msg1={msg1}")
+            return ", ".join(out)
+        return ""
+
+    @staticmethod
+    def _is_rate_limited_error(text: str) -> bool:
+        t = str(text or "").lower()
+        return ("egw00201" in t) or ("초당 거래건수를 초과" in t) or ("rate limit" in t)
+
+    def _record_api_diag(self, key: str, code: str, detail: str = "") -> None:
+        self._api_diag_counts[key] = self._api_diag_counts.get(key, 0) + 1
+        if detail:
+            self._api_diag_last_by_code[str(code)] = str(detail)[:500]
+            if len(self._api_diag_samples) < 60:
+                self._api_diag_samples.append(
+                    {
+                        "key": str(key),
+                        "code": str(code),
+                        "detail": str(detail)[:500],
+                    }
+                )
+
+    def _latest_api_diag_for(self, code: str) -> str:
+        return str(self._api_diag_last_by_code.get(str(code), "") or "")
+
+    def _log_api_call(
+        self,
+        *,
+        kind: str,
+        code: str,
+        status: str,
+        attempt: int,
+        detail: str = "",
+    ) -> None:
+        msg = (
+            f"[api-call] market=KR kind={kind} code={code} attempt={attempt} status={status}"
+        )
+        if detail:
+            msg += f" detail={detail}"
+        print(msg, flush=True)
+
+    def get_api_diagnostics(self) -> Dict[str, Any]:
+        return {
+            "counts": dict(self._api_diag_counts),
+            "sample_errors": list(self._api_diag_samples),
+        }
 
     def _session_root_dir(self) -> Path:
         if self.config.output_json_path:
@@ -70,6 +142,9 @@ class DayTradingSelector:
 
     def _liquidity_cache_path(self) -> Path:
         return self._cache_dir() / "kr_universe_liquidity.csv"
+
+    def _valid_universe_cache_path(self) -> Path:
+        return self._cache_dir() / "kr_valid_universe.csv"
 
     def _benchmark_universe_cache_path(self) -> Path:
         return self._cache_dir() / "kr_benchmark_universe.csv"
@@ -172,11 +247,12 @@ class DayTradingSelector:
         self._write_prev_stats_cache(unique_codes)
         return success, total
 
-    def _read_liquidity_cache(self, path: Path) -> Tuple[List[str], Dict[str, str]]:
+    def _read_liquidity_cache(self, path: Path) -> Tuple[List[str], Dict[str, str], Dict[str, float]]:
         codes: List[str] = []
         names: Dict[str, str] = {}
+        turnovers: Dict[str, float] = {}
         if not path.exists():
-            return codes, names
+            return codes, names, turnovers
         try:
             with path.open("r", encoding="utf-8", newline="") as f:
                 reader = csv.DictReader(f)
@@ -190,9 +266,12 @@ class DayTradingSelector:
                     name = str(row.get("name", "")).strip()
                     if name:
                         names[code] = name
+                    turnover = to_float(row.get("prev_turnover"))
+                    if turnover is not None and turnover > 0:
+                        turnovers[code] = turnover
         except Exception:
-            return [], {}
-        return codes, names
+            return [], {}, {}
+        return codes, names, turnovers
 
     def _write_liquidity_cache(self, path: Path, rows: List[Tuple[str, str, float]]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -201,6 +280,64 @@ class DayTradingSelector:
             writer.writerow(["code", "name", "prev_turnover"])
             for code, name, turnover in rows:
                 writer.writerow([code, name, f"{turnover:.0f}"])
+
+    def _read_valid_universe_cache(self, path: Path) -> List[Tuple[str, str, PrevDayStats]]:
+        rows: List[Tuple[str, str, PrevDayStats]] = []
+        if not path.exists():
+            return rows
+        try:
+            with path.open("r", encoding="utf-8", newline="") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    code = normalize_code(row.get("code", "")).strip()
+                    if len(code) != 6 or not code.isdigit():
+                        continue
+                    prev_close = to_float(row.get("prev_close"))
+                    prev_volume = to_float(row.get("prev_volume"))
+                    prev_turnover = to_float(row.get("prev_turnover"))
+                    prev_day_change_pct = to_float(row.get("prev_day_change_pct"))
+                    if prev_close is None or prev_close <= 0:
+                        continue
+                    if prev_volume is None:
+                        prev_volume = 0.0
+                    if prev_turnover is None or prev_turnover <= 0:
+                        continue
+                    rows.append(
+                        (
+                            code,
+                            str(row.get("name", "") or "").strip(),
+                            PrevDayStats(
+                                prev_close=float(prev_close),
+                                prev_volume=float(prev_volume),
+                                prev_turnover=float(prev_turnover),
+                                prev_day_change_pct=prev_day_change_pct,
+                            ),
+                        )
+                    )
+        except Exception:
+            return []
+        return rows
+
+    def _write_valid_universe_cache(self, path: Path, rows: List[Tuple[str, str, PrevDayStats]]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(
+                ["code", "name", "prev_close", "prev_volume", "prev_turnover", "prev_day_change_pct"]
+            )
+            for code, name, stats in rows:
+                writer.writerow(
+                    [
+                        code,
+                        name,
+                        f"{stats.prev_close:.8f}",
+                        f"{stats.prev_volume:.8f}",
+                        f"{stats.prev_turnover:.8f}",
+                        ""
+                        if stats.prev_day_change_pct is None
+                        else f"{stats.prev_day_change_pct:.8f}",
+                    ]
+                )
 
     def _read_benchmark_universe_cache(self, path: Path) -> Tuple[List[str], Dict[str, str], int, int]:
         codes: List[str] = []
@@ -337,21 +474,29 @@ class DayTradingSelector:
         source_codes, source_names = self._load_kr_benchmark_universe()
         source_code_set = set(source_codes)
         cache_path = self._liquidity_cache_path()
-        cached_codes, cached_names = self._read_liquidity_cache(cache_path)
+        valid_cache_path = self._valid_universe_cache_path()
+        valid_rows = self._read_valid_universe_cache(valid_cache_path)
+        valid_by_code: Dict[str, Tuple[str, PrevDayStats]] = {
+            code: (name, stats) for code, name, stats in valid_rows
+        }
+        cached_codes, cached_names, cached_turnovers = self._read_liquidity_cache(cache_path)
         if not cached_codes:
             legacy_path = self._legacy_liquidity_cache_path()
             if legacy_path.exists():
-                cached_codes, cached_names = self._read_liquidity_cache(legacy_path)
-        cached_codes = [code for code in cached_codes if code in source_code_set]
+                cached_codes, cached_names, cached_turnovers = self._read_liquidity_cache(legacy_path)
+        cached_codes = [code for code in cached_codes if code in source_code_set and code in valid_by_code]
         if cached_codes and len(cached_codes) >= liquidity_top_n:
             target = min(liquidity_top_n, len(cached_codes))
             selected_codes = cached_codes[:target]
             selected_names = {
                 code: source_names.get(code, cached_names.get(code, "")) for code in selected_codes
             }
+            for code in selected_codes:
+                _, stats = valid_by_code[code]
+                self._daily_cache[code] = stats
             print(
                 f"[universe] KR objective pool from cache: {target}/{len(cached_codes)} "
-                "(basis=prev_day_turnover_rank, source=KOSPI200+KOSDAQ150)",
+                "(basis=valid_prev_day_stats+prev_day_turnover_rank, source=KOSPI200+KOSDAQ150)",
                 flush=True,
             )
             return selected_codes, selected_names
@@ -359,31 +504,46 @@ class DayTradingSelector:
         scan_codes = source_codes
 
         ranked: List[Tuple[str, str, float]] = []
+        valid_for_cache: List[Tuple[str, str, PrevDayStats]] = []
         total = len(scan_codes)
-        progress_every = max(20, self.config.stage1_log_interval)
+        progress_every = 1
         print(
-            f"[universe] KR liquidity scan start: total={total}, progress_every={progress_every}",
+            f"[universe] KR validity scan start: total={total}, progress_every={progress_every}",
             flush=True,
         )
         for idx, code in enumerate(scan_codes, start=1):
             try:
                 prev = self.fetch_prev_day_stats(code)
-                if prev is None or prev.prev_turnover <= 0:
+                if prev is None or prev.prev_close <= 0 or prev.prev_turnover <= 0:
                     continue
-                ranked.append((code, source_names.get(code, ""), prev.prev_turnover))
+                name = source_names.get(code, "")
+                ranked.append((code, name, prev.prev_turnover))
+                valid_for_cache.append((code, name, prev))
             finally:
                 if idx % progress_every == 0 or idx == total:
                     pct = (idx / total * 100.0) if total > 0 else 100.0
                     print(
-                        f"[universe] liquidity-scan={idx}/{total} ({pct:.1f}%), ranked={len(ranked)}",
+                        f"[universe] validity-scan={idx}/{total} ({pct:.1f}%), valid={len(valid_for_cache)}, ranked_buffer={len(ranked)}",
                         flush=True,
                     )
                 if self.config.rest_sleep_sec > 0:
                     time.sleep(self.config.rest_sleep_sec)
 
+        if valid_for_cache:
+            self._write_valid_universe_cache(valid_cache_path, valid_for_cache)
+            print(
+                f"[universe] KR valid universe cached: {len(valid_for_cache)} ({valid_cache_path})",
+                flush=True,
+            )
+        print(f"[universe] KR liquidity rank sort start: valid={len(ranked)}", flush=True)
         ranked.sort(key=lambda item: item[2], reverse=True)
+        print(f"[universe] KR liquidity rank sort done: ranked={len(ranked)}", flush=True)
         if ranked:
             self._write_liquidity_cache(cache_path, ranked)
+            print(
+                f"[universe] KR liquidity cache saved: {len(ranked)} ({cache_path})",
+                flush=True,
+            )
 
         target = min(liquidity_top_n, len(ranked))
         selected = ranked[:target]
@@ -391,7 +551,7 @@ class DayTradingSelector:
         selected_names = {code: name for code, name, _ in selected if name}
         print(
             f"[universe] KR objective pool built: {len(selected_codes)}/{len(ranked)} "
-            f"(basis=prev_day_turnover_rank, top_n={liquidity_top_n}, scanned={len(scan_codes)}, source=KOSPI200+KOSDAQ150)",
+            f"(basis=valid_prev_day_stats+prev_day_turnover_rank, top_n={liquidity_top_n}, scanned={len(scan_codes)}, source=KOSPI200+KOSDAQ150)",
             flush=True,
         )
         return selected_codes, selected_names
@@ -436,13 +596,81 @@ class DayTradingSelector:
         if code in self._daily_cache:
             return self._daily_cache[code]
 
-        try:
-            resp = self.broker.fetch_ohlcv_recent30(code, timeframe="D", adj_price=True)
-        except Exception:
-            self._daily_cache[code] = None
-            return None
+        rows: List[Dict[str, Any]] = []
+        final_err = ""
+        for attempt in range(self._rate_limit_retries + 1):
+            resp: Dict[str, Any]
+            self._log_api_call(
+                kind="fetch_prev_day_stats",
+                code=code,
+                attempt=attempt + 1,
+                status="start",
+            )
+            try:
+                resp = self.broker.fetch_ohlcv_recent30(code, timeframe="D", adj_price=True)
+            except Exception as exc:
+                err_text = repr(exc)
+                final_err = err_text
+                self._record_api_diag("fetch_prev_day_exception", code, err_text)
+                self._log_api_call(
+                    kind="fetch_prev_day_stats",
+                    code=code,
+                    attempt=attempt + 1,
+                    status="exception",
+                    detail=err_text,
+                )
+                if self._is_rate_limited_error(err_text) and attempt < self._rate_limit_retries:
+                    sleep_sec = min(
+                        self._rate_limit_backoff_max_sec,
+                        self._rate_limit_backoff_sec * (2**attempt),
+                    )
+                    self._log_api_call(
+                        kind="fetch_prev_day_stats",
+                        code=code,
+                        attempt=attempt + 1,
+                        status="retry_backoff",
+                        detail=f"{sleep_sec:.2f}s",
+                    )
+                    time.sleep(sleep_sec)
+                    continue
+                self._daily_cache[code] = None
+                return None
 
-        rows = latest_list_of_dict(resp if isinstance(resp, dict) else {})
+            err = self._payload_api_error(resp if isinstance(resp, dict) else {})
+            if err:
+                final_err = err
+                self._record_api_diag("fetch_prev_day_api_error", code, err)
+                if self._is_rate_limited_error(err):
+                    self._record_api_diag("fetch_prev_day_rate_limited", code, err)
+            rows = latest_list_of_dict(resp if isinstance(resp, dict) else {})
+            self._log_api_call(
+                kind="fetch_prev_day_stats",
+                code=code,
+                attempt=attempt + 1,
+                status="response",
+                detail=f"rows={len(rows)} err={err or '-'}",
+            )
+            if rows:
+                break
+            self._record_api_diag("fetch_prev_day_empty_rows", code, err or "empty_rows")
+            if err and self._is_rate_limited_error(err) and attempt < self._rate_limit_retries:
+                sleep_sec = min(
+                    self._rate_limit_backoff_max_sec,
+                    self._rate_limit_backoff_sec * (2**attempt),
+                )
+                self._log_api_call(
+                    kind="fetch_prev_day_stats",
+                    code=code,
+                    attempt=attempt + 1,
+                    status="retry_backoff",
+                    detail=f"{sleep_sec:.2f}s",
+                )
+                time.sleep(sleep_sec)
+                continue
+            break
+
+        if not rows and final_err:
+            self._record_api_diag("fetch_prev_day_final_error", code, final_err)
         parsed_rows: List[Tuple[str, float, float, float, Optional[float]]] = []
         for row in rows:
             date_key = pick_first(
@@ -468,6 +696,7 @@ class DayTradingSelector:
             parsed_rows.append((date, close, volume, turnover, day_change_pct))
 
         if not parsed_rows:
+            self._record_api_diag("fetch_prev_day_no_parsed_rows", code, "parsed_rows=0")
             self._daily_cache[code] = None
             return None
 
@@ -475,6 +704,7 @@ class DayTradingSelector:
         past_rows = [row for row in parsed_rows if row[0] < self.today_kst]
         target_rows = past_rows if past_rows else parsed_rows
         if not target_rows:
+            self._record_api_diag("fetch_prev_day_no_target_rows", code, "target_rows=0")
             self._daily_cache[code] = None
             return None
 
@@ -497,39 +727,126 @@ class DayTradingSelector:
         if use_cache and code in self._price_cache:
             return self._price_cache[code]
 
-        try:
-            resp = self.broker.fetch_price(code)
-        except Exception:
-            self._price_cache[code] = None
-            return None
+        final_err = ""
+        for attempt in range(self._rate_limit_retries + 1):
+            self._log_api_call(
+                kind="fetch_price_snapshot",
+                code=code,
+                attempt=attempt + 1,
+                status="start",
+            )
+            try:
+                resp = self.broker.fetch_price(code)
+            except Exception as exc:
+                err_text = repr(exc)
+                final_err = err_text
+                self._record_api_diag("fetch_price_exception", code, err_text)
+                self._log_api_call(
+                    kind="fetch_price_snapshot",
+                    code=code,
+                    attempt=attempt + 1,
+                    status="exception",
+                    detail=err_text,
+                )
+                if self._is_rate_limited_error(err_text) and attempt < self._rate_limit_retries:
+                    sleep_sec = min(
+                        self._rate_limit_backoff_max_sec,
+                        self._rate_limit_backoff_sec * (2**attempt),
+                    )
+                    self._log_api_call(
+                        kind="fetch_price_snapshot",
+                        code=code,
+                        attempt=attempt + 1,
+                        status="retry_backoff",
+                        detail=f"{sleep_sec:.2f}s",
+                    )
+                    time.sleep(sleep_sec)
+                    continue
+                self._price_cache[code] = None
+                return None
 
-        output = first_dict(resp if isinstance(resp, dict) else {})
-        if not output:
-            self._price_cache[code] = None
-            return None
+            err = self._payload_api_error(resp if isinstance(resp, dict) else {})
+            if err:
+                final_err = err
+                self._record_api_diag("fetch_price_api_error", code, err)
+                if self._is_rate_limited_error(err):
+                    self._record_api_diag("fetch_price_rate_limited", code, err)
+            output = first_dict(resp if isinstance(resp, dict) else {})
+            self._log_api_call(
+                kind="fetch_price_snapshot",
+                code=code,
+                attempt=attempt + 1,
+                status="response",
+                detail=f"has_output={int(bool(output))} err={err or '-'}",
+            )
+            if not output:
+                self._record_api_diag("fetch_price_empty_payload", code, err or "empty_payload")
+                if err and self._is_rate_limited_error(err) and attempt < self._rate_limit_retries:
+                    sleep_sec = min(
+                        self._rate_limit_backoff_max_sec,
+                        self._rate_limit_backoff_sec * (2**attempt),
+                    )
+                    self._log_api_call(
+                        kind="fetch_price_snapshot",
+                        code=code,
+                        attempt=attempt + 1,
+                        status="retry_backoff",
+                        detail=f"{sleep_sec:.2f}s",
+                    )
+                    time.sleep(sleep_sec)
+                    continue
+                self._price_cache[code] = None
+                return None
 
-        price = to_float(pick_first(output, ("stck_prpr", "stck_clpr", "last")))
-        open_price = to_float(pick_first(output, ("stck_oprc", "open", "oprc")))
-        change_pct = to_float(pick_first(output, ("prdy_ctrt", "change_rate", "chg_rt")))
-        acml_volume = to_float(pick_first(output, ("acml_vol", "volume")))
-        low_price = to_float(pick_first(output, ("stck_lwpr", "low")))
-        stock_name_raw = pick_first(output, ("hts_kor_isnm", "prdt_name", "name", "stck_name"))
-        stock_name = str(stock_name_raw).strip() if stock_name_raw else ""
+            price = to_float(pick_first(output, ("stck_prpr", "stck_clpr", "last")))
+            open_price = to_float(pick_first(output, ("stck_oprc", "open", "oprc")))
+            change_pct = to_float(pick_first(output, ("prdy_ctrt", "change_rate", "chg_rt")))
+            acml_volume = to_float(pick_first(output, ("acml_vol", "volume")))
+            low_price = to_float(pick_first(output, ("stck_lwpr", "low")))
+            stock_name_raw = pick_first(output, ("hts_kor_isnm", "prdt_name", "name", "stck_name"))
+            stock_name = str(stock_name_raw).strip() if stock_name_raw else ""
 
-        if price is None:
-            self._price_cache[code] = None
-            return None
+            if price is None:
+                self._record_api_diag("fetch_price_no_price_field", code, err or "price_missing")
+                if err and self._is_rate_limited_error(err) and attempt < self._rate_limit_retries:
+                    sleep_sec = min(
+                        self._rate_limit_backoff_max_sec,
+                        self._rate_limit_backoff_sec * (2**attempt),
+                    )
+                    self._log_api_call(
+                        kind="fetch_price_snapshot",
+                        code=code,
+                        attempt=attempt + 1,
+                        status="retry_backoff",
+                        detail=f"{sleep_sec:.2f}s",
+                    )
+                    time.sleep(sleep_sec)
+                    continue
+                self._price_cache[code] = None
+                return None
 
-        snapshot = {
-            "price": price,
-            "open": open_price,
-            "change_pct": change_pct,
-            "acml_volume": acml_volume,
-            "low_price": low_price,
-            "name": stock_name,
-        }
-        self._price_cache[code] = snapshot
-        return snapshot
+            snapshot = {
+                "price": price,
+                "open": open_price,
+                "change_pct": change_pct,
+                "acml_volume": acml_volume,
+                "low_price": low_price,
+                "name": stock_name,
+            }
+            self._price_cache[code] = snapshot
+            self._log_api_call(
+                kind="fetch_price_snapshot",
+                code=code,
+                attempt=attempt + 1,
+                status="ok",
+                detail=f"price={price}",
+            )
+            return snapshot
+
+        if final_err:
+            self._record_api_diag("fetch_price_final_error", code, final_err)
+        self._price_cache[code] = None
+        return None
 
     def _pass_change_threshold(self, change_pct: Optional[float], threshold: float) -> bool:
         if change_pct is None:
@@ -905,16 +1222,32 @@ class DayTradingSelector:
             }
 
             try:
-                prev = self.fetch_prev_day_stats(code)
-                if prev is None or prev.prev_close <= 0:
+                print(f"[candidate-api] code={code} step=prev_day_stats cache-check start", flush=True)
+                prev = self._daily_cache.get(code)
+                if prev is None or prev.prev_close <= 0 or prev.prev_turnover <= 0:
                     scan_row["passed_stage1"] = False
-                    scan_row["skip_reason"] = "no_prev_day_stats"
+                    scan_row["skip_reason"] = "invalid_prev_day_stats_cache"
+                    print(
+                        f"[candidate-api] code={code} step=prev_day_stats fail reason=invalid_prev_day_stats_cache",
+                        flush=True,
+                    )
                     scan_rows.append(scan_row)
                     continue
+                print(
+                    f"[candidate-api] code={code} step=prev_day_stats cache-hit prev_close={prev.prev_close:.4f} prev_turnover={prev.prev_turnover:.0f}",
+                    flush=True,
+                )
 
+                print(
+                    f"[candidate-api] code={code} step=price_snapshot start",
+                    flush=True,
+                )
                 snap = self.fetch_price_snapshot(code)
-                current_price = prev.prev_close
-                open_price = prev.prev_close
+                prev_close = float(prev.prev_close)
+                prev_volume = float(prev.prev_volume)
+                prev_turnover = float(prev.prev_turnover)
+                current_price = prev_close
+                open_price = prev_close
                 change_pct = 0.0
                 if snap is not None:
                     snap_name = str(snap.get("name") or "").strip()
@@ -931,23 +1264,35 @@ class DayTradingSelector:
                         open_price = current_price
                     if snap_change is not None:
                         change_pct = snap_change
-                    elif prev.prev_close > 0:
-                        change_pct = ((current_price - prev.prev_close) / prev.prev_close) * 100.0
+                    elif prev_close > 0:
+                        change_pct = ((current_price - prev_close) / prev_close) * 100.0
+                    print(
+                        f"[candidate-api] code={code} step=price_snapshot ok price={current_price:.4f} open={open_price:.4f} change_pct={change_pct:.4f}",
+                        flush=True,
+                    )
                 else:
                     scan_row["skip_reason"] = "no_price_snapshot_fallback_prev_close"
-                    if prev.prev_close > 0:
-                        change_pct = ((current_price - prev.prev_close) / prev.prev_close) * 100.0
+                    print(
+                        f"[candidate-api] code={code} step=price_snapshot fail reason=no_price_snapshot_fallback_prev_close diag={self._latest_api_diag_for(code)}",
+                        flush=True,
+                    )
+                    if prev_close > 0:
+                        change_pct = ((current_price - prev_close) / prev_close) * 100.0
 
-                gap_pct = ((open_price - prev.prev_close) / prev.prev_close) * 100.0 if prev.prev_close > 0 else 0.0
+                if current_price <= 0:
+                    current_price = prev_close
+                if open_price <= 0:
+                    open_price = prev_close
+                gap_pct = ((open_price - prev_close) / prev_close) * 100.0 if prev_close > 0 else 0.0
 
                 scan_row["current_price"] = current_price
                 scan_row["open_price"] = open_price
                 scan_row["change_pct"] = change_pct
                 scan_row["gap_pct"] = gap_pct
-                scan_row["prev_close"] = prev.prev_close
-                scan_row["prev_day_volume"] = prev.prev_volume
-                scan_row["prev_day_turnover"] = prev.prev_turnover
-                scan_row["pass_prev_turnover"] = prev.prev_turnover > 0
+                scan_row["prev_close"] = prev_close
+                scan_row["prev_day_volume"] = prev_volume
+                scan_row["prev_day_turnover"] = prev_turnover
+                scan_row["pass_prev_turnover"] = True
                 scan_rows.append(scan_row)
 
                 candidates.append(
@@ -958,9 +1303,9 @@ class DayTradingSelector:
                         open_price=open_price,
                         current_change_pct=change_pct,
                         gap_pct=gap_pct,
-                        prev_close=prev.prev_close,
-                        prev_day_volume=prev.prev_volume,
-                        prev_day_turnover=prev.prev_turnover,
+                        prev_close=prev_close,
+                        prev_day_volume=prev_volume,
+                        prev_day_turnover=prev_turnover,
                     )
                 )
             finally:
@@ -981,6 +1326,14 @@ class DayTradingSelector:
             "(basis=liquidity_top_pool, stage1=disabled)",
             flush=True,
         )
+        api_diag = self.get_api_diagnostics()
+        if api_diag.get("counts"):
+            print(f"[candidate-api-summary] counts={api_diag['counts']}", flush=True)
+            for sample in list(api_diag.get("sample_errors", []))[:5]:
+                print(
+                    f"[candidate-api-sample] code={sample.get('code')} key={sample.get('key')} detail={sample.get('detail')}",
+                    flush=True,
+                )
         return selected
 
     def build_fallback_candidates(

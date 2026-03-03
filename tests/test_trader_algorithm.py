@@ -345,25 +345,29 @@ class TraderAlgorithmTests(unittest.TestCase):
             return_value={"trade_date": trade_date, "results": []},
         ) as mocked_pre:
             with mock.patch(
-                "systematic_alpha.trader.cli.precompute_window",
-                return_value=(now.replace(hour=8, minute=5), now.replace(hour=8, minute=33)),
+                "systematic_alpha.trader.cli._compute_precompute_done_from_cache",
+                side_effect=[(False, []), (True, [])],
             ):
                 with mock.patch(
-                    "systematic_alpha.trader.cli.budget_snapshot_time",
-                    return_value=now.replace(hour=8, minute=40),
+                    "systematic_alpha.trader.cli.precompute_window",
+                    return_value=(now.replace(hour=8, minute=5), now.replace(hour=8, minute=33)),
                 ):
                     with mock.patch(
-                        "systematic_alpha.trader.cli.is_market_open",
-                        side_effect=lambda market: str(market).upper() == "KR",
+                        "systematic_alpha.trader.cli.budget_snapshot_time",
+                        return_value=now.replace(hour=8, minute=40),
                     ):
-                        result = _ensure_daily_bootstrap(
-                            cfg=cfg,
-                            storage=self.storage,
-                            sync=sync_service,
-                            telegram=telegram,
-                            now_kst_dt=now,
-                            trade_date=trade_date,
-                        )
+                        with mock.patch(
+                            "systematic_alpha.trader.cli.is_market_open",
+                            side_effect=lambda market: str(market).upper() == "KR",
+                        ):
+                            result = _ensure_daily_bootstrap(
+                                cfg=cfg,
+                                storage=self.storage,
+                                sync=sync_service,
+                                telegram=telegram,
+                                now_kst_dt=now,
+                                trade_date=trade_date,
+                            )
 
         self.assertTrue(result["ran_precompute"])
         self.assertTrue(result["ran_budget_snapshot"])

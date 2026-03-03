@@ -2,6 +2,7 @@
 
 import csv
 import importlib
+import os
 import time
 from datetime import datetime
 from pathlib import Path
@@ -85,6 +86,19 @@ class USDayTradingSelector:
         self._symbol_exchange_hint: Dict[str, str] = {}
         self._api_diag_counts: Dict[str, int] = {}
         self._api_diag_samples: List[Dict[str, str]] = []
+        self._api_diag_last_by_code: Dict[str, str] = {}
+        self._rate_limit_retries = max(
+            0, int(float(os.getenv("TRADER_RATE_LIMIT_RETRIES", "3") or 3))
+        )
+        self._rate_limit_backoff_sec = max(
+            0.1, float(os.getenv("TRADER_RATE_LIMIT_BACKOFF_SEC", "2.0") or 2.0)
+        )
+        self._rate_limit_backoff_max_sec = max(
+            0.1, float(os.getenv("TRADER_RATE_LIMIT_BACKOFF_MAX_SEC", "20.0") or 20.0)
+        )
+        self._us_exchange_spacing_sec = max(
+            0.0, float(os.getenv("TRADER_US_EXCHANGE_SPACING_SEC", "2.0") or 2.0)
+        )
         self.broker = self._get_broker_for_exchange(self._preferred_exchange_code)
         self.today_us = datetime.now(ZoneInfo("America/New_York")).strftime("%Y%m%d")
         self.today_kst = datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y%m%d")
@@ -143,6 +157,8 @@ class USDayTradingSelector:
 
     def _record_api_diag(self, key: str, code: str, detail: str = "") -> None:
         self._api_diag_counts[key] = self._api_diag_counts.get(key, 0) + 1
+        if detail:
+            self._api_diag_last_by_code[str(code)] = str(detail)[:500]
         if detail and len(self._api_diag_samples) < 60:
             self._api_diag_samples.append(
                 {
@@ -151,6 +167,31 @@ class USDayTradingSelector:
                     "detail": detail[:500],
                 }
             )
+
+    @staticmethod
+    def _is_rate_limited_error(text: str) -> bool:
+        t = str(text or "").lower()
+        return ("egw00201" in t) or ("초당 거래건수를 초과" in t) or ("rate limit" in t)
+
+    def _latest_api_diag_for(self, code: str) -> str:
+        return str(self._api_diag_last_by_code.get(str(code), "") or "")
+
+    def _log_api_call(
+        self,
+        *,
+        kind: str,
+        code: str,
+        status: str,
+        attempt: int,
+        exchange: str = "",
+        detail: str = "",
+    ) -> None:
+        msg = f"[api-call] market=US kind={kind} code={code} attempt={attempt} status={status}"
+        if exchange:
+            msg += f" exchange={exchange}"
+        if detail:
+            msg += f" detail={detail}"
+        print(msg, flush=True)
 
     @staticmethod
     def _fetch_price_detail_oversea_compatible(broker: Any, code: str) -> Dict[str, Any]:
@@ -223,6 +264,9 @@ class USDayTradingSelector:
 
     def _liquidity_cache_path(self) -> Path:
         return self._cache_dir() / "us_universe_liquidity.csv"
+
+    def _valid_universe_cache_path(self) -> Path:
+        return self._cache_dir() / "us_valid_universe.csv"
 
     def _prev_stats_cache_path(self) -> Path:
         return self._cache_dir() / "us_prev_day_stats.csv"
@@ -369,12 +413,13 @@ class USDayTradingSelector:
                 writer.writerow([symbol, names.get(symbol, "")])
 
     @staticmethod
-    def _read_liquidity_cache(path: Path) -> Tuple[List[str], Dict[str, str]]:
+    def _read_liquidity_cache(path: Path) -> Tuple[List[str], Dict[str, str], Dict[str, float]]:
         symbols: List[str] = []
         names: Dict[str, str] = {}
+        turnovers: Dict[str, float] = {}
         seen = set()
         if not path.exists():
-            return symbols, names
+            return symbols, names, turnovers
         try:
             with path.open("r", encoding="utf-8", newline="") as f:
                 reader = csv.DictReader(f)
@@ -387,9 +432,12 @@ class USDayTradingSelector:
                     name = str(row.get("name", "")).strip()
                     if name:
                         names[symbol] = name
+                    turnover = to_float(row.get("prev_turnover"))
+                    if turnover is not None and turnover > 0:
+                        turnovers[symbol] = turnover
         except Exception:
-            return [], {}
-        return symbols, names
+            return [], {}, {}
+        return symbols, names, turnovers
 
     @staticmethod
     def _write_liquidity_cache(path: Path, rows: List[Tuple[str, str, float]]) -> None:
@@ -399,6 +447,66 @@ class USDayTradingSelector:
             writer.writerow(["symbol", "name", "prev_turnover"])
             for symbol, name, turnover in rows:
                 writer.writerow([symbol, name, f"{turnover:.0f}"])
+
+    @staticmethod
+    def _read_valid_universe_cache(path: Path) -> List[Tuple[str, str, PrevDayStats]]:
+        rows: List[Tuple[str, str, PrevDayStats]] = []
+        if not path.exists():
+            return rows
+        try:
+            with path.open("r", encoding="utf-8", newline="") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    symbol = normalize_symbol(row.get("symbol", ""))
+                    if not symbol:
+                        continue
+                    prev_close = to_float(row.get("prev_close"))
+                    prev_volume = to_float(row.get("prev_volume"))
+                    prev_turnover = to_float(row.get("prev_turnover"))
+                    prev_day_change_pct = to_float(row.get("prev_day_change_pct"))
+                    if prev_close is None or prev_close <= 0:
+                        continue
+                    if prev_volume is None:
+                        prev_volume = 0.0
+                    if prev_turnover is None or prev_turnover <= 0:
+                        continue
+                    rows.append(
+                        (
+                            symbol,
+                            str(row.get("name", "") or "").strip(),
+                            PrevDayStats(
+                                prev_close=float(prev_close),
+                                prev_volume=float(prev_volume),
+                                prev_turnover=float(prev_turnover),
+                                prev_day_change_pct=prev_day_change_pct,
+                            ),
+                        )
+                    )
+        except Exception:
+            return []
+        return rows
+
+    @staticmethod
+    def _write_valid_universe_cache(path: Path, rows: List[Tuple[str, str, PrevDayStats]]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(
+                ["symbol", "name", "prev_close", "prev_volume", "prev_turnover", "prev_day_change_pct"]
+            )
+            for symbol, name, stats in rows:
+                writer.writerow(
+                    [
+                        symbol,
+                        name,
+                        f"{stats.prev_close:.8f}",
+                        f"{stats.prev_volume:.8f}",
+                        f"{stats.prev_turnover:.8f}",
+                        ""
+                        if stats.prev_day_change_pct is None
+                        else f"{stats.prev_day_change_pct:.8f}",
+                    ]
+                )
 
     def _fetch_sp500_remote(self) -> Tuple[List[str], Dict[str, str]]:
         try:
@@ -470,18 +578,27 @@ class USDayTradingSelector:
             )
 
         liquidity_cache_path = self._liquidity_cache_path()
-        cached_symbols, cached_names = self._read_liquidity_cache(liquidity_cache_path)
+        valid_cache_path = self._valid_universe_cache_path()
+        valid_rows = self._read_valid_universe_cache(valid_cache_path)
+        valid_by_symbol: Dict[str, Tuple[str, PrevDayStats]] = {
+            symbol: (name, stats) for symbol, name, stats in valid_rows
+        }
+        cached_symbols, cached_names, cached_turnovers = self._read_liquidity_cache(liquidity_cache_path)
         if not cached_symbols:
             legacy_liq_path = self._legacy_liquidity_cache_path()
             if legacy_liq_path.exists():
-                cached_symbols, cached_names = self._read_liquidity_cache(legacy_liq_path)
+                cached_symbols, cached_names, cached_turnovers = self._read_liquidity_cache(legacy_liq_path)
+        cached_symbols = [symbol for symbol in cached_symbols if symbol in valid_by_symbol]
         if cached_symbols:
             target = min(liquidity_top_n, len(cached_symbols))
             selected_symbols = cached_symbols[:target]
             selected_names = {symbol: cached_names.get(symbol, "") for symbol in selected_symbols}
+            for symbol in selected_symbols:
+                _, stats = valid_by_symbol[symbol]
+                self._daily_cache[symbol] = stats
             print(
                 f"[universe] US objective pool from cache: {target}/{len(cached_symbols)} "
-                f"(basis=prev_day_turnover_rank)",
+                f"(basis=valid_prev_day_stats+prev_day_turnover_rank)",
                 flush=True,
             )
             return selected_symbols, selected_names
@@ -489,31 +606,46 @@ class USDayTradingSelector:
         scan_symbols = remote_symbols
 
         ranked: List[Tuple[str, str, float]] = []
+        valid_for_cache: List[Tuple[str, str, PrevDayStats]] = []
         total = len(scan_symbols)
-        progress_every = max(20, self.config.stage1_log_interval)
+        progress_every = 1
         print(
-            f"[universe] US liquidity scan start: total={total}, progress_every={progress_every}",
+            f"[universe] US validity scan start: total={total}, progress_every={progress_every}",
             flush=True,
         )
         for idx, symbol in enumerate(scan_symbols, start=1):
             try:
                 prev = self.fetch_prev_day_stats(symbol)
-                if prev is None or prev.prev_turnover <= 0:
+                if prev is None or prev.prev_close <= 0 or prev.prev_turnover <= 0:
                     continue
-                ranked.append((symbol, remote_names.get(symbol, ""), prev.prev_turnover))
+                name = remote_names.get(symbol, "")
+                ranked.append((symbol, name, prev.prev_turnover))
+                valid_for_cache.append((symbol, name, prev))
             finally:
                 if idx % progress_every == 0 or idx == total:
                     pct = (idx / total * 100.0) if total > 0 else 100.0
                     print(
-                        f"[universe] liquidity-scan={idx}/{total} ({pct:.1f}%), ranked={len(ranked)}",
+                        f"[universe] validity-scan={idx}/{total} ({pct:.1f}%), valid={len(valid_for_cache)}, ranked_buffer={len(ranked)}",
                         flush=True,
                     )
                 if self.config.rest_sleep_sec > 0:
                     time.sleep(self.config.rest_sleep_sec)
 
+        if valid_for_cache:
+            self._write_valid_universe_cache(valid_cache_path, valid_for_cache)
+            print(
+                f"[universe] US valid universe cached: {len(valid_for_cache)} ({valid_cache_path})",
+                flush=True,
+            )
+        print(f"[universe] US liquidity rank sort start: valid={len(ranked)}", flush=True)
         ranked.sort(key=lambda item: item[2], reverse=True)
+        print(f"[universe] US liquidity rank sort done: ranked={len(ranked)}", flush=True)
         if ranked:
             self._write_liquidity_cache(liquidity_cache_path, ranked)
+            print(
+                f"[universe] US liquidity cache saved: {len(ranked)} ({liquidity_cache_path})",
+                flush=True,
+            )
 
         target = min(liquidity_top_n, len(ranked))
         selected = ranked[:target]
@@ -521,7 +653,7 @@ class USDayTradingSelector:
         selected_names = {symbol: name for symbol, name, _ in selected if name}
         print(
             f"[universe] US objective pool built: {len(selected_symbols)}/{len(ranked)} "
-            f"(basis=prev_day_turnover_rank, top_n={liquidity_top_n}, scanned={len(scan_symbols)}, source=remote:{SP500_SOURCE_URL})",
+            f"(basis=valid_prev_day_stats+prev_day_turnover_rank, top_n={liquidity_top_n}, scanned={len(scan_symbols)}, source=remote:{SP500_SOURCE_URL})",
             flush=True,
         )
         return selected_symbols, selected_names
@@ -704,49 +836,131 @@ class USDayTradingSelector:
             broker = self._get_broker_for_exchange(exchange_code)
             if broker is None:
                 continue
-            try:
-                resp = broker.fetch_price(code)
-            except Exception as exc:
-                self._record_api_diag("fetch_price_exception", code, f"{exchange_code}:{repr(exc)}")
-                continue
-
-            payload = first_dict(resp if isinstance(resp, dict) else {})
-            if not payload and isinstance(resp, dict):
-                payload = resp
-            if not payload:
-                detail = ""
-                if isinstance(resp, dict):
-                    detail = f"{exchange_code}:rt_cd={resp.get('rt_cd')} msg_cd={resp.get('msg_cd')} msg1={resp.get('msg1')}"
-                self._record_api_diag("fetch_price_empty_payload", code, detail)
-                continue
-
-            parsed = self._parse_price_payload(payload)
-            if parsed.get("price") is None:
-                detail = ""
-                if isinstance(resp, dict):
-                    detail = f"{exchange_code}:rt_cd={resp.get('rt_cd')} msg_cd={resp.get('msg_cd')} msg1={resp.get('msg1')}"
-                self._record_api_diag("fetch_price_no_price_field", code, detail)
-                continue
-
-            if parsed.get("open") is None or parsed.get("acml_volume") is None or parsed.get("low_price") is None:
-                detail_row = self.fetch_price_detail_snapshot(
-                    code,
-                    use_cache=use_cache,
-                    preferred_exchange=exchange_code,
+            for attempt in range(self._rate_limit_retries + 1):
+                self._log_api_call(
+                    kind="fetch_price_snapshot",
+                    code=code,
+                    attempt=attempt + 1,
+                    exchange=exchange_code,
+                    status="start",
                 )
-                if detail_row:
-                    if parsed.get("open") is None:
-                        parsed["open"] = detail_row.get("open")
-                    if parsed.get("acml_volume") is None:
-                        parsed["acml_volume"] = detail_row.get("acml_volume")
-                    if parsed.get("low_price") is None:
-                        parsed["low_price"] = detail_row.get("low_price")
-                    if not parsed.get("name") and detail_row.get("name"):
-                        parsed["name"] = detail_row.get("name")
+                try:
+                    resp = broker.fetch_price(code)
+                except Exception as exc:
+                    detail = f"{exchange_code}:{repr(exc)}"
+                    self._record_api_diag("fetch_price_exception", code, detail)
+                    self._log_api_call(
+                        kind="fetch_price_snapshot",
+                        code=code,
+                        attempt=attempt + 1,
+                        exchange=exchange_code,
+                        status="exception",
+                        detail=detail,
+                    )
+                    if self._is_rate_limited_error(detail) and attempt < self._rate_limit_retries:
+                        sleep_sec = min(
+                            self._rate_limit_backoff_max_sec,
+                            self._rate_limit_backoff_sec * (2**attempt),
+                        )
+                        self._log_api_call(
+                            kind="fetch_price_snapshot",
+                            code=code,
+                            attempt=attempt + 1,
+                            exchange=exchange_code,
+                            status="retry_backoff",
+                            detail=f"{sleep_sec:.2f}s",
+                        )
+                        time.sleep(sleep_sec)
+                        continue
+                    break
 
-            self._remember_symbol_exchange(code, exchange_code)
-            self._price_cache[code] = parsed
-            return parsed
+                payload = first_dict(resp if isinstance(resp, dict) else {})
+                if not payload and isinstance(resp, dict):
+                    payload = resp
+                detail = ""
+                if isinstance(resp, dict):
+                    detail = (
+                        f"{exchange_code}:rt_cd={resp.get('rt_cd')} "
+                        f"msg_cd={resp.get('msg_cd')} msg1={resp.get('msg1')}"
+                    )
+                self._log_api_call(
+                    kind="fetch_price_snapshot",
+                    code=code,
+                    attempt=attempt + 1,
+                    exchange=exchange_code,
+                    status="response",
+                    detail=f"has_payload={int(bool(payload))} {detail or ''}".strip(),
+                )
+                if not payload:
+                    self._record_api_diag("fetch_price_empty_payload", code, detail)
+                    if self._is_rate_limited_error(detail) and attempt < self._rate_limit_retries:
+                        sleep_sec = min(
+                            self._rate_limit_backoff_max_sec,
+                            self._rate_limit_backoff_sec * (2**attempt),
+                        )
+                        self._log_api_call(
+                            kind="fetch_price_snapshot",
+                            code=code,
+                            attempt=attempt + 1,
+                            exchange=exchange_code,
+                            status="retry_backoff",
+                            detail=f"{sleep_sec:.2f}s",
+                        )
+                        time.sleep(sleep_sec)
+                        continue
+                    break
+
+                parsed = self._parse_price_payload(payload)
+                if parsed.get("price") is None:
+                    self._record_api_diag("fetch_price_no_price_field", code, detail)
+                    if self._is_rate_limited_error(detail) and attempt < self._rate_limit_retries:
+                        sleep_sec = min(
+                            self._rate_limit_backoff_max_sec,
+                            self._rate_limit_backoff_sec * (2**attempt),
+                        )
+                        self._log_api_call(
+                            kind="fetch_price_snapshot",
+                            code=code,
+                            attempt=attempt + 1,
+                            exchange=exchange_code,
+                            status="retry_backoff",
+                            detail=f"{sleep_sec:.2f}s",
+                        )
+                        time.sleep(sleep_sec)
+                        continue
+                    break
+
+                if (
+                    parsed.get("open") is None
+                    or parsed.get("acml_volume") is None
+                    or parsed.get("low_price") is None
+                ):
+                    detail_row = self.fetch_price_detail_snapshot(
+                        code,
+                        use_cache=use_cache,
+                        preferred_exchange=exchange_code,
+                    )
+                    if detail_row:
+                        if parsed.get("open") is None:
+                            parsed["open"] = detail_row.get("open")
+                        if parsed.get("acml_volume") is None:
+                            parsed["acml_volume"] = detail_row.get("acml_volume")
+                        if parsed.get("low_price") is None:
+                            parsed["low_price"] = detail_row.get("low_price")
+                        if not parsed.get("name") and detail_row.get("name"):
+                            parsed["name"] = detail_row.get("name")
+
+                self._remember_symbol_exchange(code, exchange_code)
+                self._price_cache[code] = parsed
+                self._log_api_call(
+                    kind="fetch_price_snapshot",
+                    code=code,
+                    attempt=attempt + 1,
+                    exchange=exchange_code,
+                    status="ok",
+                    detail=f"price={parsed.get('price')}",
+                )
+                return parsed
 
         self._price_cache[code] = None
         return None
@@ -793,26 +1007,105 @@ class USDayTradingSelector:
             return self._daily_cache[code]
 
         rows: List[Dict[str, Any]] = []
-        resp: Dict[str, Any] = {}
         used_exchange = ""
-        for exchange_code in self._exchange_attempt_order(code):
+        final_err = ""
+        for ex_idx, exchange_code in enumerate(self._exchange_attempt_order(code)):
+            if ex_idx > 0 and self._us_exchange_spacing_sec > 0:
+                time.sleep(self._us_exchange_spacing_sec)
             broker = self._get_broker_for_exchange(exchange_code)
             if broker is None:
                 continue
-            try:
-                candidate_resp = self._fetch_ohlcv_oversea_compatible(broker, code)
-            except Exception as exc:
-                self._record_api_diag("fetch_prev_day_exception", code, f"{exchange_code}:{repr(exc)}")
-                continue
-            resp = candidate_resp if isinstance(candidate_resp, dict) else {}
-            rows = latest_list_of_dict(resp)
-            if rows:
-                used_exchange = exchange_code
+            for attempt in range(self._rate_limit_retries + 1):
+                resp: Dict[str, Any]
+                self._log_api_call(
+                    kind="fetch_prev_day_stats",
+                    code=code,
+                    attempt=attempt + 1,
+                    exchange=exchange_code,
+                    status="start",
+                )
+                try:
+                    candidate_resp = self._fetch_ohlcv_oversea_compatible(broker, code)
+                except Exception as exc:
+                    err_text = f"{exchange_code}:{repr(exc)}"
+                    final_err = err_text
+                    self._record_api_diag("fetch_prev_day_exception", code, err_text)
+                    self._log_api_call(
+                        kind="fetch_prev_day_stats",
+                        code=code,
+                        attempt=attempt + 1,
+                        exchange=exchange_code,
+                        status="exception",
+                        detail=err_text,
+                    )
+                    if self._is_rate_limited_error(err_text) and attempt < self._rate_limit_retries:
+                        sleep_sec = min(
+                            self._rate_limit_backoff_max_sec,
+                            self._rate_limit_backoff_sec * (2**attempt),
+                        )
+                        self._log_api_call(
+                            kind="fetch_prev_day_stats",
+                            code=code,
+                            attempt=attempt + 1,
+                            exchange=exchange_code,
+                            status="retry_backoff",
+                            detail=f"{sleep_sec:.2f}s",
+                        )
+                        time.sleep(sleep_sec)
+                        continue
+                    break
+
+                resp = candidate_resp if isinstance(candidate_resp, dict) else {}
+                rows = latest_list_of_dict(resp)
+                if rows:
+                    used_exchange = exchange_code
+                    self._log_api_call(
+                        kind="fetch_prev_day_stats",
+                        code=code,
+                        attempt=attempt + 1,
+                        exchange=exchange_code,
+                        status="ok",
+                        detail=f"rows={len(rows)}",
+                    )
+                    break
+                detail = (
+                    f"{exchange_code}:rt_cd={resp.get('rt_cd')} "
+                    f"msg_cd={resp.get('msg_cd')} msg1={resp.get('msg1')}"
+                )
+                final_err = detail
+                self._record_api_diag("fetch_prev_day_empty_rows", code, detail)
+                self._log_api_call(
+                    kind="fetch_prev_day_stats",
+                    code=code,
+                    attempt=attempt + 1,
+                    exchange=exchange_code,
+                    status="empty",
+                    detail=detail,
+                )
+                if self._is_rate_limited_error(detail):
+                    self._record_api_diag("fetch_prev_day_rate_limited", code, detail)
+                    if attempt < self._rate_limit_retries:
+                        sleep_sec = min(
+                            self._rate_limit_backoff_max_sec,
+                            self._rate_limit_backoff_sec * (2**attempt),
+                        )
+                        self._log_api_call(
+                            kind="fetch_prev_day_stats",
+                            code=code,
+                            attempt=attempt + 1,
+                            exchange=exchange_code,
+                            status="retry_backoff",
+                            detail=f"{sleep_sec:.2f}s",
+                        )
+                        time.sleep(sleep_sec)
+                        continue
                 break
-            detail = f"{exchange_code}:rt_cd={resp.get('rt_cd')} msg_cd={resp.get('msg_cd')} msg1={resp.get('msg1')}"
-            self._record_api_diag("fetch_prev_day_empty_rows", code, detail)
+            if rows:
+                break
 
         if not rows:
+            if final_err:
+                self._record_api_diag("fetch_prev_day_final_error", code, final_err)
             self._daily_cache[code] = None
             return None
 
@@ -1299,16 +1592,32 @@ class USDayTradingSelector:
                 "mode": "stage1_removed_top_liquidity",
             }
             try:
-                prev = self.fetch_prev_day_stats(symbol)
-                if prev is None or prev.prev_close <= 0:
+                print(f"[candidate-api] code={symbol} step=prev_day_stats cache-check start", flush=True)
+                prev = self._daily_cache.get(symbol)
+                if prev is None or prev.prev_close <= 0 or prev.prev_turnover <= 0:
                     scan_row["passed_stage1"] = False
-                    scan_row["skip_reason"] = "no_prev_day_stats"
+                    scan_row["skip_reason"] = "invalid_prev_day_stats_cache"
+                    print(
+                        f"[candidate-api] code={symbol} step=prev_day_stats fail reason=invalid_prev_day_stats_cache",
+                        flush=True,
+                    )
                     scan_rows.append(scan_row)
                     continue
+                print(
+                    f"[candidate-api] code={symbol} step=prev_day_stats cache-hit prev_close={prev.prev_close:.4f} prev_turnover={prev.prev_turnover:.0f}",
+                    flush=True,
+                )
 
+                print(
+                    f"[candidate-api] code={symbol} step=price_snapshot start",
+                    flush=True,
+                )
                 snap = self.fetch_price_snapshot(symbol)
-                current_price = prev.prev_close
-                open_price = prev.prev_close
+                prev_close = float(prev.prev_close)
+                prev_volume = float(prev.prev_volume)
+                prev_turnover = float(prev.prev_turnover)
+                current_price = prev_close
+                open_price = prev_close
                 change_pct = 0.0
                 if snap is not None:
                     snap_name = str(snap.get("name") or "").strip()
@@ -1325,23 +1634,35 @@ class USDayTradingSelector:
                         open_price = current_price
                     if snap_change is not None:
                         change_pct = snap_change
-                    elif prev.prev_close > 0:
-                        change_pct = ((current_price - prev.prev_close) / prev.prev_close) * 100.0
+                    elif prev_close > 0:
+                        change_pct = ((current_price - prev_close) / prev_close) * 100.0
+                    print(
+                        f"[candidate-api] code={symbol} step=price_snapshot ok price={current_price:.4f} open={open_price:.4f} change_pct={change_pct:.4f}",
+                        flush=True,
+                    )
                 else:
                     scan_row["skip_reason"] = "no_price_snapshot_fallback_prev_close"
-                    if prev.prev_close > 0:
-                        change_pct = ((current_price - prev.prev_close) / prev.prev_close) * 100.0
+                    print(
+                        f"[candidate-api] code={symbol} step=price_snapshot fail reason=no_price_snapshot_fallback_prev_close diag={self._latest_api_diag_for(symbol)}",
+                        flush=True,
+                    )
+                    if prev_close > 0:
+                        change_pct = ((current_price - prev_close) / prev_close) * 100.0
 
-                gap_pct = ((open_price - prev.prev_close) / prev.prev_close) * 100.0 if prev.prev_close > 0 else 0.0
+                if current_price <= 0:
+                    current_price = prev_close
+                if open_price <= 0:
+                    open_price = prev_close
+                gap_pct = ((open_price - prev_close) / prev_close) * 100.0 if prev_close > 0 else 0.0
 
                 scan_row["current_price"] = current_price
                 scan_row["open_price"] = open_price
                 scan_row["change_pct"] = change_pct
                 scan_row["gap_pct"] = gap_pct
-                scan_row["prev_close"] = prev.prev_close
-                scan_row["prev_day_volume"] = prev.prev_volume
-                scan_row["prev_day_turnover"] = prev.prev_turnover
-                scan_row["pass_prev_turnover"] = prev.prev_turnover > 0
+                scan_row["prev_close"] = prev_close
+                scan_row["prev_day_volume"] = prev_volume
+                scan_row["prev_day_turnover"] = prev_turnover
+                scan_row["pass_prev_turnover"] = True
                 scan_rows.append(scan_row)
 
                 candidates.append(
@@ -1352,9 +1673,9 @@ class USDayTradingSelector:
                         open_price=open_price,
                         current_change_pct=change_pct,
                         gap_pct=gap_pct,
-                        prev_close=prev.prev_close,
-                        prev_day_volume=prev.prev_volume,
-                        prev_day_turnover=prev.prev_turnover,
+                        prev_close=prev_close,
+                        prev_day_volume=prev_volume,
+                        prev_day_turnover=prev_turnover,
                     )
                 )
             finally:
@@ -1375,6 +1696,14 @@ class USDayTradingSelector:
             "(basis=liquidity_top_pool, stage1=disabled)",
             flush=True,
         )
+        api_diag = self.get_api_diagnostics()
+        if api_diag.get("counts"):
+            print(f"[candidate-api-summary] counts={api_diag['counts']}", flush=True)
+            for sample in list(api_diag.get("sample_errors", []))[:5]:
+                print(
+                    f"[candidate-api-sample] code={sample.get('code')} key={sample.get('key')} detail={sample.get('detail')}",
+                    flush=True,
+                )
         return selected
 
     def build_fallback_candidates(

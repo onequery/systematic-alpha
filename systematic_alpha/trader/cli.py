@@ -6,13 +6,19 @@ import shutil
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Tuple
 from zoneinfo import ZoneInfo
 
 from systematic_alpha.trader.config import TraderConfig, load_trader_config
 from systematic_alpha.trader.execution import execute_entry_intents
 from systematic_alpha.trader.liquidation import run_liquidation
-from systematic_alpha.trader.precompute import precompute_all_markets, precompute_market
+from systematic_alpha.trader.precompute import (
+    expected_candidate_count,
+    final_candidate_cache_count,
+    final_candidate_cache_path,
+    precompute_all_markets,
+    precompute_market,
+)
 from systematic_alpha.trader.realtime import collect_breakout_intents, refresh_market_prices
 from systematic_alpha.trader.report import generate_daily_report
 from systematic_alpha.trader.scheduler import (
@@ -37,6 +43,11 @@ def _now_iso() -> str:
     return datetime.now(KST).isoformat(timespec="seconds")
 
 
+def _trace(msg: str) -> None:
+    ts = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S KST")
+    print(f"[daemon-progress] {ts} {msg}", flush=True)
+
+
 def _parse_markets(value: str) -> List[str]:
     raw = str(value or "ALL").strip().upper()
     if raw in {"ALL", "*"}:
@@ -52,6 +63,54 @@ def _parse_markets(value: str) -> List[str]:
         seen.add(item)
         out.append(item)
     return out
+
+
+def _compute_precompute_done_from_cache(
+    cfg: TraderConfig,
+    trade_date: str,
+) -> Tuple[bool, List[Dict[str, object]]]:
+    states: List[Dict[str, object]] = []
+    market_enabled = getattr(cfg, "market_enabled", None)
+    markets: List[str] = []
+    for market in ("KR", "US"):
+        if callable(market_enabled):
+            try:
+                if not bool(market_enabled(market)):
+                    continue
+            except Exception:
+                continue
+        markets.append(market)
+    for market in markets:
+        cache_path = final_candidate_cache_path(cfg, market, trade_date)
+        count = int(final_candidate_cache_count(cache_path))
+        required = int(expected_candidate_count(cfg, market))
+        ready = bool(cache_path.exists() and count == required)
+        states.append(
+            {
+                "market": str(market).upper(),
+                "path": str(cache_path),
+                "exists": bool(cache_path.exists()),
+                "count": count,
+                "required": required,
+                "ready": ready,
+            }
+        )
+    all_ready = bool(states) and all(bool(x.get("ready")) for x in states)
+    return all_ready, states
+
+
+def _sync_precompute_done_meta_from_cache(
+    *,
+    cfg: TraderConfig,
+    storage: TraderStorage,
+    trade_date: str,
+) -> Tuple[bool, List[Dict[str, object]]]:
+    ready, states = _compute_precompute_done_from_cache(cfg, trade_date)
+    mark_key = f"precompute_done:{trade_date}"
+    mark_val = "1" if ready else "0"
+    if str(storage.get_meta(mark_key, "")) != mark_val:
+        storage.upsert_meta(mark_key, mark_val)
+    return ready, states
 
 
 def _ensure_trader_paths(cfg: TraderConfig) -> Dict[str, Path]:
@@ -232,8 +291,12 @@ def _ensure_daily_bootstrap(
     now_kst_dt: datetime,
     trade_date: str,
 ) -> Dict[str, object]:
-    precompute_key = f"precompute_done:{trade_date}"
-    precompute_done = str(storage.get_meta(precompute_key, "0")) == "1"
+    _trace(f"bootstrap.check trade_date={trade_date}")
+    precompute_done, precompute_states = _sync_precompute_done_meta_from_cache(
+        cfg=cfg,
+        storage=storage,
+        trade_date=trade_date,
+    )
     budget_done = storage.get_day_budget(trade_date) is not None
 
     pre_start, pre_end = precompute_window(cfg, now_kst_dt)
@@ -248,15 +311,41 @@ def _ensure_daily_bootstrap(
     elif now_kst_dt >= snap_time:
         trigger = "after_budget_snapshot_time"
 
+    _trace(
+        "bootstrap.state "
+        f"precompute_done={int(precompute_done)} budget_done={int(budget_done)} "
+        f"market_open={int(any_market_open)} trigger={trigger or 'none'} "
+        f"precompute_cache={precompute_states}"
+    )
+
     ran_precompute = False
     ran_budget_snapshot = False
 
     if (not precompute_done) and (any_market_open or now_kst_dt >= pre_end):
+        _trace(f"bootstrap.precompute.start trigger={trigger or 'catchup'}")
         result = precompute_all_markets(cfg=cfg, storage=storage, trade_date=trade_date)
-        storage.upsert_meta(precompute_key, "1")
+        _trace(
+            "bootstrap.precompute.done "
+            f"results={len(list(result.get('results', []) if isinstance(result, dict) else []))}"
+        )
+        precompute_done_after, precompute_states_after = _sync_precompute_done_meta_from_cache(
+            cfg=cfg,
+            storage=storage,
+            trade_date=trade_date,
+        )
+        _trace(
+            "bootstrap.precompute.cache_check "
+            f"ready={int(precompute_done_after)} states={precompute_states_after}"
+        )
         storage.log_event(
             "precompute_catchup_done",
-            {"trade_date": trade_date, "trigger": trigger or "catchup", "result": result},
+            {
+                "trade_date": trade_date,
+                "trigger": trigger or "catchup",
+                "result": result,
+                "cache_ready": bool(precompute_done_after),
+                "cache_states": precompute_states_after,
+            },
         )
         _notify_precompute_result(
             storage=storage,
@@ -268,8 +357,14 @@ def _ensure_daily_bootstrap(
         ran_precompute = True
 
     if (not budget_done) and (any_market_open or now_kst_dt >= snap_time):
+        _trace(f"bootstrap.budget.start trigger={trigger or 'catchup'}")
         budget = _snapshot_budget(cfg=cfg, storage=storage, sync=sync, trade_date=trade_date)
         if budget.get("ok"):
+            _trace(
+                "bootstrap.budget.done "
+                f"cash_krw={float(budget.get('cash_krw', 0.0) or 0.0):.0f} "
+                f"budget_per_trade={float(budget.get('budget_per_trade', 0.0) or 0.0):.0f}"
+            )
             storage.log_event(
                 "budget_snapshot_catchup",
                 {
@@ -286,6 +381,10 @@ def _ensure_daily_bootstrap(
                 f"1회예산={float(budget.get('budget_per_trade', 0.0) or 0.0):.0f}"
             )
         else:
+            _trace(
+                "bootstrap.budget.failed "
+                f"reason={budget.get('reason')} errors={budget.get('errors')}"
+            )
             storage.log_event(
                 "budget_snapshot_catchup_failed",
                 {
@@ -321,12 +420,15 @@ def _run_market_cycle(
     trade_date: str,
 ) -> Dict[str, object]:
     mk = str(market).upper()
+    _trace(f"cycle.{mk}.refresh.start trade_date={trade_date}")
     refresh = refresh_market_prices(cfg=cfg, storage=storage, market=mk, trade_date=trade_date)
+    _trace(f"cycle.{mk}.refresh.done watch_count={int(refresh.get('watch_count', 0) or 0)}")
     storage.log_event("realtime_refresh", refresh)
 
     market_filter = storage.get_market_filter(trade_date, mk)
     trading_enabled = bool(market_filter and market_filter.get("trading_enabled"))
     if not trading_enabled:
+        _trace(f"cycle.{mk}.skip reason=market_filter_off")
         payload = {
             "market": mk,
             "trade_date": trade_date,
@@ -338,10 +440,12 @@ def _run_market_cycle(
 
     intents = collect_breakout_intents(cfg=cfg, storage=storage, market=mk, trade_date=trade_date)
     if not intents:
+        _trace(f"cycle.{mk}.skip reason=no_intent")
         payload = {"market": mk, "trade_date": trade_date, "status": "NO_INTENT", "intent_count": 0}
         storage.log_event("cycle_no_intent", payload)
         return payload
 
+    _trace(f"cycle.{mk}.execute.start intents={len(intents)}")
     outcome = execute_entry_intents(
         cfg=cfg,
         storage=storage,
@@ -361,6 +465,9 @@ def _run_market_cycle(
         "skipped": outcome.skipped,
         "reject_reasons": outcome.reject_reasons[:5],
     }
+    _trace(
+        f"cycle.{mk}.execute.done sent={outcome.sent} rejected={outcome.rejected} skipped={outcome.skipped}"
+    )
     storage.log_event("cycle_executed", payload)
     return payload
 
@@ -412,6 +519,7 @@ def _archive_and_reset(cfg: TraderConfig) -> Dict[str, object]:
 
 def _daemon_loop(cfg: TraderConfig) -> int:
     storage, telegram, sync = _build_runtime(cfg)
+    _trace(f"daemon.start poll_seconds={cfg.poll_seconds} strategy_cycle_seconds={cfg.strategy_cycle_seconds}")
     telegram.send("[이벤트] [Trader] 시스템 시작")
     storage.log_event("daemon_start", {"started_at": _now_iso(), "poll_seconds": cfg.poll_seconds})
     last_cycle_ts: Dict[str, float] = {"KR": 0.0, "US": 0.0}
@@ -421,6 +529,7 @@ def _daemon_loop(cfg: TraderConfig) -> int:
         while True:
             now = datetime.now(KST)
             date_kst = trade_date_kst()
+            _trace(f"daemon.tick now={now.isoformat(timespec='seconds')} date_kst={date_kst}")
 
             catchup = _ensure_daily_bootstrap(
                 cfg=cfg,
@@ -431,14 +540,37 @@ def _daemon_loop(cfg: TraderConfig) -> int:
                 trade_date=date_kst,
             )
             if catchup.get("ran_precompute") or catchup.get("ran_budget_snapshot"):
+                _trace(
+                    "daemon.bootstrap.catchup "
+                    f"ran_precompute={int(bool(catchup.get('ran_precompute')))} "
+                    f"ran_budget_snapshot={int(bool(catchup.get('ran_budget_snapshot')))}"
+                )
                 storage.log_event("daily_bootstrap_catchup", catchup)
 
+            precompute_ready, precompute_states = _sync_precompute_done_meta_from_cache(
+                cfg=cfg,
+                storage=storage,
+                trade_date=date_kst,
+            )
+
             if should_run_precompute(cfg, now):
-                mark_key = f"precompute_done:{date_kst}"
-                if storage.get_meta(mark_key) != "1":
+                if not precompute_ready:
+                    _trace("daemon.precompute.scheduled.start")
                     result = precompute_all_markets(cfg=cfg, storage=storage, trade_date=date_kst)
-                    storage.upsert_meta(mark_key, "1")
-                    storage.log_event("precompute_done", result)
+                    _trace("daemon.precompute.scheduled.done")
+                    precompute_ready, precompute_states = _sync_precompute_done_meta_from_cache(
+                        cfg=cfg,
+                        storage=storage,
+                        trade_date=date_kst,
+                    )
+                    storage.log_event(
+                        "precompute_done",
+                        {
+                            "result": result,
+                            "cache_ready": bool(precompute_ready),
+                            "cache_states": precompute_states,
+                        },
+                    )
                     _notify_precompute_result(
                         storage=storage,
                         telegram=telegram,
@@ -449,8 +581,14 @@ def _daemon_loop(cfg: TraderConfig) -> int:
 
             if should_run_budget_snapshot(cfg, now):
                 if storage.get_day_budget(date_kst) is None:
+                    _trace("daemon.budget.scheduled.start")
                     budget = _snapshot_budget(cfg=cfg, storage=storage, sync=sync, trade_date=date_kst)
                     if budget.get("ok"):
+                        _trace(
+                            "daemon.budget.scheduled.done "
+                            f"cash_krw={float(budget['cash_krw']):.0f} "
+                            f"budget_per_trade={float(budget['budget_per_trade']):.0f}"
+                        )
                         telegram.send(
                             "[이벤트] [Trader] 일일 예산 스냅샷\n"
                             f"일자={date_kst}\n"
@@ -458,6 +596,10 @@ def _daemon_loop(cfg: TraderConfig) -> int:
                             f"1회예산={float(budget['budget_per_trade']):.0f}"
                         )
                     else:
+                        _trace(
+                            "daemon.budget.scheduled.failed "
+                            f"reason={budget.get('reason')} errors={budget.get('errors')}"
+                        )
                         telegram.send(
                             "[Action required] [Trader] 예산 스냅샷 실패\n"
                             f"일자={date_kst}\n"
@@ -467,6 +609,7 @@ def _daemon_loop(cfg: TraderConfig) -> int:
 
             for market in ("KR", "US"):
                 if not cfg.market_enabled(market):
+                    _trace(f"daemon.market.{market}.skip reason=disabled")
                     continue
                 if market == "US":
                     date_market = trade_date_et()
@@ -475,6 +618,7 @@ def _daemon_loop(cfg: TraderConfig) -> int:
 
                 phase = liquidation_phase(cfg, market)
                 if phase:
+                    _trace(f"daemon.market.{market}.liquidation.phase={phase} start")
                     phase_key = f"liq_done:{market}:{date_market}:{phase}"
                     if storage.get_meta(phase_key) != "1":
                         outcome = run_liquidation(
@@ -488,7 +632,12 @@ def _daemon_loop(cfg: TraderConfig) -> int:
                         )
                         storage.upsert_meta(phase_key, "1")
                         storage.log_event("liquidation_done", outcome.__dict__)
+                        _trace(
+                            f"daemon.market.{market}.liquidation.done "
+                            f"phase={phase} sent={outcome.sent} rejected={outcome.rejected} skipped={outcome.skipped}"
+                        )
                         if phase == "final_check" and last_report_date.get(market) != date_market:
+                            _trace(f"daemon.market.{market}.report.start")
                             generate_daily_report(
                                 cfg=cfg,
                                 storage=storage,
@@ -496,20 +645,29 @@ def _daemon_loop(cfg: TraderConfig) -> int:
                                 trade_date=date_market,
                             )
                             last_report_date[market] = date_market
+                            _trace(f"daemon.market.{market}.report.done")
+                    else:
+                        _trace(f"daemon.market.{market}.liquidation.phase={phase} skip=already_done")
                     continue
 
                 if not is_market_open(market):
+                    _trace(f"daemon.market.{market}.skip reason=market_closed")
                     continue
                 now_epoch = time.time()
                 if now_epoch - float(last_cycle_ts.get(market, 0.0)) < float(cfg.strategy_cycle_seconds):
+                    remain = float(cfg.strategy_cycle_seconds) - (now_epoch - float(last_cycle_ts.get(market, 0.0)))
+                    _trace(f"daemon.market.{market}.skip reason=cooldown remain_sec={max(0.0, remain):.1f}")
                     continue
 
                 # precompute + day budget are mandatory guards for live cycle.
                 if storage.get_day_budget(date_kst) is None:
+                    _trace(f"daemon.market.{market}.skip reason=no_budget_snapshot")
                     continue
-                if storage.get_meta(f"precompute_done:{date_kst}") != "1":
+                if not precompute_ready:
+                    _trace(f"daemon.market.{market}.skip reason=precompute_not_done")
                     continue
 
+                _trace(f"daemon.market.{market}.cycle.start")
                 cycle_payload = _run_market_cycle(
                     cfg=cfg,
                     storage=storage,
@@ -520,14 +678,19 @@ def _daemon_loop(cfg: TraderConfig) -> int:
                 )
                 storage.log_event("strategy_cycle", cycle_payload)
                 last_cycle_ts[market] = now_epoch
+                _trace(f"daemon.market.{market}.cycle.done status={cycle_payload.get('status')}")
 
             storage.log_event("heartbeat", {"ts": _now_iso()})
-            time.sleep(max(1, int(cfg.poll_seconds)))
+            sleep_sec = max(1, int(cfg.poll_seconds))
+            _trace(f"daemon.sleep seconds={sleep_sec}")
+            time.sleep(sleep_sec)
     except KeyboardInterrupt:
+        _trace("daemon.stop reason=keyboard_interrupt")
         storage.log_event("daemon_stop", {"reason": "keyboard_interrupt", "stopped_at": _now_iso()})
         telegram.send("[이벤트] [Trader] 시스템 종료")
         return 0
     finally:
+        _trace("daemon.finally storage.close")
         storage.close()
 
 
@@ -579,10 +742,17 @@ def main(argv: List[str] | None = None) -> int:
     try:
         if args.cmd == "status":
             latest = storage.latest_account_snapshot("ALL")
+            precompute_ready, precompute_states = _sync_precompute_done_meta_from_cache(
+                cfg=cfg,
+                storage=storage,
+                trade_date=trade_date_kst(),
+            )
             out = {
                 "now": _now_iso(),
                 "budget_date_kst": trade_date_kst(),
                 "precompute_done": storage.get_meta(f"precompute_done:{trade_date_kst()}"),
+                "precompute_ready": bool(precompute_ready),
+                "precompute_cache_states": precompute_states,
                 "latest_snapshot": latest,
             }
             print(json.dumps(out, ensure_ascii=False, indent=2))
@@ -609,7 +779,17 @@ def main(argv: List[str] | None = None) -> int:
                 if not cfg.market_enabled(market):
                     continue
                 results.append(precompute_market(cfg=cfg, storage=storage, market=market, trade_date=trade_date))
-            out = {"trade_date": trade_date, "results": results}
+            precompute_ready, precompute_states = _sync_precompute_done_meta_from_cache(
+                cfg=cfg,
+                storage=storage,
+                trade_date=trade_date,
+            )
+            out = {
+                "trade_date": trade_date,
+                "precompute_ready": bool(precompute_ready),
+                "precompute_cache_states": precompute_states,
+                "results": results,
+            }
             print(json.dumps(out, ensure_ascii=False, indent=2))
             return 0
 

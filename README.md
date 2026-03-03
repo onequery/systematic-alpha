@@ -13,6 +13,43 @@ KIS OpenAPI 모의투자용 자동매매 엔진입니다.
 - 텔레그램은 즉시 알림만 사용(30분 배치 요약 없음)
 - US S&P500 유니버스는 **원격 소스(datahub) 성공 시에만** 사용(폴백 없음, 실패 시 precompute 실패)
 
+## 현재 필터링 기준 (적용 중)
+- KR 원천 유니버스: `KOSPI200 + KOSDAQ150`
+- US 원천 유니버스: `S&P500`
+- 공통 1차 필터:
+  - 전일 통계 조회 성공(`prev_close`/`prev_turnover` 유효)
+  - `prev_close > 0`
+  - `prev_turnover > 0` (전일 거래대금 존재)
+  - 실패/누락 종목은 유니버스 단계에서 제외(불량 데이터 제외)
+- 공통 랭킹 기준:
+  - `prev_turnover` 내림차순
+- 공통 최종 후보:
+  - 시장별 상위 `20`개 (`TRADER_CANDIDATES_MAX_KR/US`)
+  - 유효 종목이 부족하면 20개 미만으로 확정될 수 있음
+- API 호출 제어:
+  - `TRADER_RATE_LIMIT_RETRIES`, `TRADER_RATE_LIMIT_BACKOFF_SEC`, `TRADER_RATE_LIMIT_BACKOFF_MAX_SEC` 기반 재시도/백오프
+  - US는 거래소 순회 사이에 `TRADER_US_EXCHANGE_SPACING_SEC` 간격 적용
+- 참고 산출물:
+  - 유효 유니버스 캐시: `out/trader/{kr|us}/{YYYYMMDD}/cache/{kr|us}_valid_universe.csv`
+  - 유동성 랭킹 캐시(풀): `out/trader/{kr|us}/{YYYYMMDD}/cache/{kr|us}_universe_liquidity.csv`
+  - 최종 후보 캐시(실제 실행 기준): `out/trader/{kr|us}/{YYYYMMDD}/cache/{kr|us}_final_candidates.csv`
+
+## 필터링 실험 후보 (미적용, 다음 단계)
+아래 항목은 현재 전략에 적용되지 않았고, 이후 실험 대상으로만 문서화합니다.
+
+- 전일 거래대금 하한값 강화:
+  - 단순 `> 0` 대신 시장별 최소 임계값 적용
+- 최근 N일 평균 거래대금 기반 필터:
+  - 단일 전일값 노이즈 완화
+- 가격/거래정지/관리종목 가드 강화:
+  - 실행 가능성 중심 필터
+- 변동성 품질 필터:
+  - 최근 N일 ATR/평균 range 기반 하한
+- 시장 레짐 연동 필터:
+  - 지수 필터 ON 시에만 후보 확정, OFF면 후보 생성은 하되 주문 차단 유지
+- 슬리피지/체결품질 사전 필터:
+  - 과거 체결 품질이 낮은 종목 제외
+
 ## 설정 파일
 - 민감정보: `.env`
 - 비민감 운용값: `config/trader.config`
