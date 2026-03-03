@@ -20,6 +20,7 @@ def build_strategy_config(
     output_json_path: Optional[str] = None,
     analytics_dir: Optional[str] = None,
 ) -> StrategyConfig:
+    liquidity_top_n = 20
     key, secret, acc_no, user_id = load_credentials(None)
     market_upper = str(market or "").upper()
     exchange = "NYSE"
@@ -34,10 +35,10 @@ def build_strategy_config(
         mock=cfg.use_mock,
         us_exchange=exchange,
         us_poll_interval=max(1.0, float(cfg.fallback_poll_seconds)),
-        kr_universe_size=int(cfg.kr_universe_size),
-        us_universe_size=int(cfg.us_universe_size),
+        # Kept for selector internals; objective universe is now fixed top-N by liquidity.
+        kr_universe_size=liquidity_top_n,
+        us_universe_size=liquidity_top_n,
         universe_file=universe_file,
-        max_symbols_scan=int(cfg.max_symbols_scan),
         pre_candidates=max(
             int(cfg.candidates_max_kr if market_upper == "KR" else cfg.candidates_max_us),
             20,
@@ -48,6 +49,7 @@ def build_strategy_config(
         ),
         collect_seconds=30,
         rest_sleep_sec=float(cfg.rest_sleep_sec),
+        # Stage1 directional gates for long-only breakout flow.
         min_change_pct=0.0,
         min_gap_pct=0.0,
         min_prev_turnover=0.0,
@@ -58,6 +60,7 @@ def build_strategy_config(
         min_maintain_ratio=0.0,
         min_strength_samples=1,
         min_bid_ask_samples=1,
+        # Enforce positive direction at Stage1: change>=0 and gap>=0.
         long_only=True,
         min_exec_ticks=1,
         min_orderbook_ticks=1,
@@ -100,4 +103,3 @@ def make_selector(
 
 def as_dict(strategy: StrategyConfig) -> Dict[str, object]:
     return asdict(strategy)
-

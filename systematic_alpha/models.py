@@ -17,7 +17,6 @@ class StrategyConfig:
     kr_universe_size: int
     us_universe_size: int
     universe_file: Optional[str]
-    max_symbols_scan: int
     pre_candidates: int
     final_picks: int
     collect_seconds: int

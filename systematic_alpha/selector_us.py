@@ -218,6 +218,12 @@ class USDayTradingSelector:
     def _sp500_cache_path(self) -> Path:
         return self._cache_dir() / "us_sp500_constituents.csv"
 
+    def _legacy_liquidity_cache_path(self) -> Path:
+        return Path("out") / f"us_universe_liquidity_{self.today_us}.csv"
+
+    def _liquidity_cache_path(self) -> Path:
+        return self._cache_dir() / "us_universe_liquidity.csv"
+
     def _prev_stats_cache_path(self) -> Path:
         return self._cache_dir() / "us_prev_day_stats.csv"
 
@@ -362,6 +368,38 @@ class USDayTradingSelector:
             for symbol in symbols:
                 writer.writerow([symbol, names.get(symbol, "")])
 
+    @staticmethod
+    def _read_liquidity_cache(path: Path) -> Tuple[List[str], Dict[str, str]]:
+        symbols: List[str] = []
+        names: Dict[str, str] = {}
+        seen = set()
+        if not path.exists():
+            return symbols, names
+        try:
+            with path.open("r", encoding="utf-8", newline="") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    symbol = normalize_symbol(row.get("symbol", ""))
+                    if not symbol or symbol in seen:
+                        continue
+                    seen.add(symbol)
+                    symbols.append(symbol)
+                    name = str(row.get("name", "")).strip()
+                    if name:
+                        names[symbol] = name
+        except Exception:
+            return [], {}
+        return symbols, names
+
+    @staticmethod
+    def _write_liquidity_cache(path: Path, rows: List[Tuple[str, str, float]]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["symbol", "name", "prev_turnover"])
+            for symbol, name, turnover in rows:
+                writer.writerow([symbol, name, f"{turnover:.0f}"])
+
     def _fetch_sp500_remote(self) -> Tuple[List[str], Dict[str, str]]:
         try:
             resp = requests.get(SP500_SOURCE_URL, timeout=10)
@@ -405,27 +443,81 @@ class USDayTradingSelector:
         return symbols, names
 
     def _build_objective_universe(self) -> Tuple[List[str], Dict[str, str]]:
-        remote_symbols, remote_names = self._fetch_sp500_remote()
-        if not remote_symbols:
-            # Strict mode: objective universe must come from remote source.
-            # Do not silently fall back to cached/bundled snapshots.
-            raise RuntimeError(
-                f"US objective universe fetch failed: source={SP500_SOURCE_URL}"
+        liquidity_top_n = 20
+        cache_path = self._sp500_cache_path()
+        remote_symbols, remote_names = self._read_sp500_csv(cache_path)
+        if remote_symbols:
+            print(
+                f"[universe] US source from daily cache: {len(remote_symbols)} "
+                f"(source={cache_path})",
+                flush=True,
+            )
+        else:
+            remote_symbols, remote_names = self._fetch_sp500_remote()
+            if not remote_symbols:
+                # Strict mode: if the day cache is absent and remote fetch fails, stop.
+                raise RuntimeError(
+                    f"US objective universe fetch failed: source={SP500_SOURCE_URL}"
+                )
+            try:
+                self._write_sp500_csv(cache_path, remote_symbols, remote_names)
+            except Exception:
+                pass
+            print(
+                f"[universe] US source refreshed from remote: {len(remote_symbols)} "
+                f"(remote={SP500_SOURCE_URL}, cache={cache_path})",
+                flush=True,
             )
 
-        cache_path = self._sp500_cache_path()
-        try:
-            self._write_sp500_csv(cache_path, remote_symbols, remote_names)
-        except Exception:
-            # Cache write is best-effort; remote fetch success is the source of truth.
-            pass
+        liquidity_cache_path = self._liquidity_cache_path()
+        cached_symbols, cached_names = self._read_liquidity_cache(liquidity_cache_path)
+        if not cached_symbols:
+            legacy_liq_path = self._legacy_liquidity_cache_path()
+            if legacy_liq_path.exists():
+                cached_symbols, cached_names = self._read_liquidity_cache(legacy_liq_path)
+        if cached_symbols:
+            target = min(liquidity_top_n, len(cached_symbols))
+            selected_symbols = cached_symbols[:target]
+            selected_names = {symbol: cached_names.get(symbol, "") for symbol in selected_symbols}
+            print(
+                f"[universe] US objective pool from cache: {target}/{len(cached_symbols)} "
+                f"(basis=prev_day_turnover_rank)",
+                flush=True,
+            )
+            return selected_symbols, selected_names
 
-        target = min(self.config.us_universe_size, len(remote_symbols))
-        selected_symbols = remote_symbols[:target]
-        selected_names = {symbol: remote_names.get(symbol, "") for symbol in selected_symbols if remote_names.get(symbol)}
+        scan_symbols = remote_symbols
+
+        ranked: List[Tuple[str, str, float]] = []
+        total = len(scan_symbols)
+        progress_every = max(50, self.config.stage1_log_interval * 10)
+        for idx, symbol in enumerate(scan_symbols, start=1):
+            try:
+                prev = self.fetch_prev_day_stats(symbol)
+                if prev is None or prev.prev_turnover <= 0:
+                    continue
+                ranked.append((symbol, remote_names.get(symbol, ""), prev.prev_turnover))
+            finally:
+                if idx % progress_every == 0 or idx == total:
+                    pct = (idx / total * 100.0) if total > 0 else 100.0
+                    print(
+                        f"[universe] liquidity-scan={idx}/{total} ({pct:.1f}%), ranked={len(ranked)}",
+                        flush=True,
+                    )
+                if self.config.rest_sleep_sec > 0:
+                    time.sleep(self.config.rest_sleep_sec)
+
+        ranked.sort(key=lambda item: item[2], reverse=True)
+        if ranked:
+            self._write_liquidity_cache(liquidity_cache_path, ranked)
+
+        target = min(liquidity_top_n, len(ranked))
+        selected = ranked[:target]
+        selected_symbols = [symbol for symbol, _, _ in selected]
+        selected_names = {symbol: name for symbol, name, _ in selected if name}
         print(
-            f"[universe] US objective pool selected: {len(selected_symbols)}/{len(remote_symbols)} "
-            f"(basis=S&P500_constituents, source=remote:{SP500_SOURCE_URL}, us_universe_size={self.config.us_universe_size})",
+            f"[universe] US objective pool built: {len(selected_symbols)}/{len(ranked)} "
+            f"(basis=prev_day_turnover_rank, top_n={liquidity_top_n}, scanned={len(scan_symbols)}, source=remote:{SP500_SOURCE_URL})",
             flush=True,
         )
         return selected_symbols, selected_names
@@ -455,9 +547,12 @@ class USDayTradingSelector:
                 deduped_names[normalized] = names[symbol]
             elif names.get(normalized):
                 deduped_names[normalized] = names[normalized]
-            if len(deduped) >= self.config.max_symbols_scan:
-                break
 
+        print(
+            f"[universe] US objective pool selected: {len(deduped)} "
+            "(basis=prev_day_turnover_rank_top20)",
+            flush=True,
+        )
         return deduped, deduped_names
 
     @staticmethod

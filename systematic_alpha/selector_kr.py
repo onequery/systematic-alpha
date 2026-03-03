@@ -71,6 +71,9 @@ class DayTradingSelector:
     def _liquidity_cache_path(self) -> Path:
         return self._cache_dir() / "kr_universe_liquidity.csv"
 
+    def _benchmark_universe_cache_path(self) -> Path:
+        return self._cache_dir() / "kr_benchmark_universe.csv"
+
     def _prev_stats_cache_path(self) -> Path:
         return self._cache_dir() / "kr_prev_day_stats.csv"
 
@@ -199,42 +202,161 @@ class DayTradingSelector:
             for code, name, turnover in rows:
                 writer.writerow([code, name, f"{turnover:.0f}"])
 
+    def _read_benchmark_universe_cache(self, path: Path) -> Tuple[List[str], Dict[str, str], int, int]:
+        codes: List[str] = []
+        names: Dict[str, str] = {}
+        seen = set()
+        kospi_count = 0
+        kosdaq_count = 0
+        if not path.exists():
+            return codes, names, kospi_count, kosdaq_count
+        try:
+            with path.open("r", encoding="utf-8", newline="") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    bucket = str(row.get("bucket", "")).strip().upper()
+                    if bucket == "KOSPI200":
+                        kospi_count += 1
+                    elif bucket == "KOSDAQ150":
+                        kosdaq_count += 1
+                    code = normalize_code(row.get("code", "")).strip()
+                    if len(code) != 6 or not code.isdigit() or code in seen:
+                        continue
+                    seen.add(code)
+                    codes.append(code)
+                    name = str(row.get("name", "")).strip()
+                    if name:
+                        names[code] = name
+        except Exception:
+            return [], {}, 0, 0
+        return codes, names, kospi_count, kosdaq_count
+
+    def _write_benchmark_universe_cache(self, path: Path, rows: List[Tuple[str, str, str]]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["code", "name", "bucket"])
+            for code, name, bucket in rows:
+                writer.writerow([code, name, bucket])
+
+    @staticmethod
+    def _flag_enabled(value: Any) -> bool:
+        text = str(value if value is not None else "").strip().upper()
+        if not text:
+            return False
+        if text in {"0", "N", "NO", "FALSE", "F", "-", "--", "NAN", "NONE"}:
+            return False
+        return True
+
+    def _load_kr_benchmark_universe(self) -> Tuple[List[str], Dict[str, str]]:
+        """
+        Build KR source universe from KOSPI200 + KOSDAQ150 constituents only.
+        """
+        cache_path = self._benchmark_universe_cache_path()
+        cached_codes, cached_names, cached_kospi, cached_kosdaq = self._read_benchmark_universe_cache(
+            cache_path
+        )
+        if cached_codes:
+            print(
+                f"[universe] KR source from daily cache: KOSPI200={cached_kospi}, "
+                f"KOSDAQ150={cached_kosdaq}, merged={len(cached_codes)}, cache={cache_path}",
+                flush=True,
+            )
+            return cached_codes, cached_names
+
+        try:
+            kospi_df = self.broker.fetch_kospi_symbols()
+            kosdaq_df = self.broker.fetch_kosdaq_symbols()
+        except Exception as exc:
+            raise RuntimeError(f"KR benchmark universe fetch failed: {exc}") from exc
+
+        if kospi_df is None or getattr(kospi_df, "empty", True):
+            raise RuntimeError("KR benchmark universe fetch failed: empty_kospi_symbols")
+        if kosdaq_df is None or getattr(kosdaq_df, "empty", True):
+            raise RuntimeError("KR benchmark universe fetch failed: empty_kosdaq_symbols")
+
+        kospi_flag_col = None
+        for col in ("KOSPI200섹터업종", "KOSPI200"):
+            if col in list(kospi_df.columns):
+                kospi_flag_col = col
+                break
+        if not kospi_flag_col:
+            cols = ",".join(str(c) for c in list(kospi_df.columns)[:20])
+            raise RuntimeError(f"KR benchmark universe fetch failed: missing_kospi200_flag_col cols={cols}")
+        if "KOSDAQ150" not in list(kosdaq_df.columns):
+            cols = ",".join(str(c) for c in list(kosdaq_df.columns)[:20])
+            raise RuntimeError(f"KR benchmark universe fetch failed: missing_kosdaq150_flag_col cols={cols}")
+
+        codes: List[str] = []
+        names: Dict[str, str] = {}
+        seen = set()
+        cache_rows: List[Tuple[str, str, str]] = []
+
+        def _append(code_raw: Any, name_raw: Any, bucket: str) -> None:
+            code = normalize_code(code_raw).strip()
+            if len(code) != 6 or not code.isdigit():
+                return
+            if code in seen:
+                return
+            seen.add(code)
+            codes.append(code)
+            name = str(name_raw or "").strip()
+            if name:
+                names[code] = name
+            cache_rows.append((code, name, bucket))
+
+        kospi_count = 0
+        for _, row in kospi_df.iterrows():
+            if not self._flag_enabled(row.get(kospi_flag_col)):
+                continue
+            kospi_count += 1
+            _append(row.get("단축코드"), row.get("한글명"), "KOSPI200")
+
+        kosdaq_count = 0
+        for _, row in kosdaq_df.iterrows():
+            if not self._flag_enabled(row.get("KOSDAQ150")):
+                continue
+            kosdaq_count += 1
+            _append(row.get("단축코드"), row.get("한글명"), "KOSDAQ150")
+
+        if not codes:
+            raise RuntimeError(
+                "KR benchmark universe fetch failed: no_codes_from_kospi200_kosdaq150"
+            )
+        self._write_benchmark_universe_cache(cache_path, cache_rows)
+
+        print(
+            f"[universe] KR source fixed: KOSPI200={kospi_count}, KOSDAQ150={kosdaq_count}, "
+            f"merged={len(codes)}, cache={cache_path}",
+            flush=True,
+        )
+        return codes, names
+
     def _build_objective_universe(self) -> Tuple[List[str], Dict[str, str]]:
+        liquidity_top_n = 20
+        source_codes, source_names = self._load_kr_benchmark_universe()
+        source_code_set = set(source_codes)
         cache_path = self._liquidity_cache_path()
         cached_codes, cached_names = self._read_liquidity_cache(cache_path)
         if not cached_codes:
             legacy_path = self._legacy_liquidity_cache_path()
             if legacy_path.exists():
                 cached_codes, cached_names = self._read_liquidity_cache(legacy_path)
-        if cached_codes:
-            target = min(self.config.kr_universe_size, len(cached_codes))
+        cached_codes = [code for code in cached_codes if code in source_code_set]
+        if cached_codes and len(cached_codes) >= liquidity_top_n:
+            target = min(liquidity_top_n, len(cached_codes))
             selected_codes = cached_codes[:target]
-            selected_names = {code: cached_names.get(code, "") for code in selected_codes}
+            selected_names = {
+                code: source_names.get(code, cached_names.get(code, "")) for code in selected_codes
+            }
             print(
                 f"[universe] KR objective pool from cache: {target}/{len(cached_codes)} "
-                f"(basis=prev_day_turnover_rank)",
+                "(basis=prev_day_turnover_rank, source=KOSPI200+KOSDAQ150)",
                 flush=True,
             )
             return selected_codes, selected_names
 
-        try:
-            symbols_df = self.broker.fetch_symbols()
-        except Exception as exc:
-            print(f"[universe] KR objective remote fetch failed: {exc}", flush=True)
-            raise RuntimeError("KR objective universe fetch failed") from exc
-        max_count = len(symbols_df.index) if hasattr(symbols_df, "index") else 20000
-        all_codes, all_names = extract_codes_and_names_from_df(symbols_df, max_count=max_count)
-        scan_budget = min(
-            len(all_codes),
-            max(50, self.config.max_symbols_scan, self.config.kr_universe_size),
-        )
-        scan_codes = all_codes[:scan_budget]
-        if scan_budget < len(all_codes):
-            print(
-                f"[universe] KR liquidity scan capped: {scan_budget}/{len(all_codes)} "
-                f"(max_symbols_scan={self.config.max_symbols_scan}, kr_universe_size={self.config.kr_universe_size})",
-                flush=True,
-            )
+        scan_codes = source_codes
 
         ranked: List[Tuple[str, str, float]] = []
         total = len(scan_codes)
@@ -244,7 +366,7 @@ class DayTradingSelector:
                 prev = self.fetch_prev_day_stats(code)
                 if prev is None or prev.prev_turnover <= 0:
                     continue
-                ranked.append((code, all_names.get(code, ""), prev.prev_turnover))
+                ranked.append((code, source_names.get(code, ""), prev.prev_turnover))
             finally:
                 if idx % progress_every == 0 or idx == total:
                     pct = (idx / total * 100.0) if total > 0 else 100.0
@@ -259,13 +381,13 @@ class DayTradingSelector:
         if ranked:
             self._write_liquidity_cache(cache_path, ranked)
 
-        target = min(self.config.kr_universe_size, len(ranked))
+        target = min(liquidity_top_n, len(ranked))
         selected = ranked[:target]
         selected_codes = [code for code, _, _ in selected]
         selected_names = {code: name for code, name, _ in selected if name}
         print(
             f"[universe] KR objective pool built: {len(selected_codes)}/{len(ranked)} "
-            f"(basis=prev_day_turnover_rank)",
+            f"(basis=prev_day_turnover_rank, top_n={liquidity_top_n}, scanned={len(scan_codes)}, source=KOSPI200+KOSDAQ150)",
             flush=True,
         )
         return selected_codes, selected_names
@@ -276,7 +398,6 @@ class DayTradingSelector:
             if not universe_path.exists():
                 raise FileNotFoundError(f"Universe file not found: {universe_path}")
             codes, file_names = parse_universe_file(universe_path)
-            codes = codes[: self.config.max_symbols_scan]
             names = {code: file_names.get(code, "") for code in codes if file_names.get(code)}
 
             # Fill missing names from symbol master if available.
@@ -296,19 +417,13 @@ class DayTradingSelector:
 
         objective_codes, objective_names = self._build_objective_universe()
         if not objective_codes:
-            symbols_df = self.broker.fetch_symbols()
-            codes, names = extract_codes_and_names_from_df(symbols_df, self.config.max_symbols_scan)
-            print(
-                f"[universe] fallback to raw symbol list: {len(codes)} (objective pool unavailable)",
-                flush=True,
-            )
-            return codes, names
+            raise RuntimeError("KR objective universe empty after KOSPI200+KOSDAQ150 scan")
 
-        final_codes = objective_codes[: self.config.max_symbols_scan]
+        final_codes = objective_codes
         final_names = {code: objective_names.get(code, "") for code in final_codes}
         print(
             f"[universe] KR objective pool selected: {len(final_codes)} "
-            f"(kr_universe_size={self.config.kr_universe_size}, max_symbols_scan={self.config.max_symbols_scan})",
+            "(basis=prev_day_turnover_rank_top20)",
             flush=True,
         )
         return final_codes, final_names

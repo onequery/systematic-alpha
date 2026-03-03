@@ -154,9 +154,6 @@ class TraderConfig:
     strict_sync: bool
     sync_max_staleness_sec: int
 
-    kr_universe_size: int
-    us_universe_size: int
-    max_symbols_scan: int
     rest_sleep_sec: float
 
     market_filter_symbol_kr: str
@@ -242,9 +239,6 @@ def load_trader_config(project_root: str | Path = ".") -> TraderConfig:
         rate_limit_backoff_max_sec=_float_env("TRADER_RATE_LIMIT_BACKOFF_MAX_SEC", 20.0, 0.1),
         strict_sync=_bool_env("TRADER_SYNC_STRICT", True),
         sync_max_staleness_sec=_int_env("TRADER_SYNC_MAX_STALENESS_SEC", 30, 1),
-        kr_universe_size=_int_env("TRADER_KR_UNIVERSE_SIZE", 180, 10),
-        us_universe_size=_int_env("TRADER_US_UNIVERSE_SIZE", 500, 10),
-        max_symbols_scan=_int_env("TRADER_MAX_SYMBOLS_SCAN", 240, 10),
         rest_sleep_sec=_float_env("TRADER_REST_SLEEP_SEC", 0.06, 0.0),
         market_filter_symbol_kr=_text_env("TRADER_MARKET_FILTER_SYMBOL_KR", "069500"),
         market_filter_symbol_us=_text_env("TRADER_MARKET_FILTER_SYMBOL_US", "SPY").upper(),

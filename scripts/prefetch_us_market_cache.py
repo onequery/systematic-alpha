@@ -24,7 +24,6 @@ def build_prefetch_config(
     user_id: str | None,
     us_exchange: str,
     us_universe_size: int,
-    max_symbols_scan: int,
 ) -> StrategyConfig:
     return StrategyConfig(
         market="US",
@@ -38,7 +37,6 @@ def build_prefetch_config(
         kr_universe_size=500,
         us_universe_size=max(50, us_universe_size),
         universe_file=None,
-        max_symbols_scan=max(50, max_symbols_scan),
         pre_candidates=40,
         final_picks=3,
         collect_seconds=0,
@@ -77,7 +75,6 @@ def main() -> int:
     parser.add_argument("--key-file", type=str, default=None)
     parser.add_argument("--us-exchange", type=str, default="NASD")
     parser.add_argument("--us-universe-size", type=int, default=500)
-    parser.add_argument("--max-symbols-scan", type=int, default=500)
     parser.add_argument("--min-success-ratio", type=float, default=0.2)
     parser.add_argument("--min-success-count", type=int, default=20)
     parser.add_argument("--force-refresh", action="store_true", default=False)
@@ -99,7 +96,6 @@ def main() -> int:
         user_id=user_id,
         us_exchange=args.us_exchange,
         us_universe_size=args.us_universe_size,
-        max_symbols_scan=args.max_symbols_scan,
     )
     mojito_module = import_mojito_module()
     selector = USDayTradingSelector(mojito_module, config)
@@ -111,7 +107,7 @@ def main() -> int:
 
     print(
         f"[prefetch-us-cache] start: exchange={config.us_exchange}, "
-        f"us_universe_size={config.us_universe_size}, max_symbols_scan={config.max_symbols_scan}",
+        f"us_universe_size={config.us_universe_size}",
         flush=True,
     )
     codes, _ = selector.load_universe()

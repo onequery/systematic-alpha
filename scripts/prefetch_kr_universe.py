@@ -23,7 +23,6 @@ def build_prefetch_config(
     acc_no: str,
     user_id: str | None,
     kr_universe_size: int,
-    max_symbols_scan: int,
     mock: bool,
 ) -> StrategyConfig:
     return StrategyConfig(
@@ -38,7 +37,6 @@ def build_prefetch_config(
         kr_universe_size=max(50, kr_universe_size),
         us_universe_size=500,
         universe_file=None,
-        max_symbols_scan=max(50, max_symbols_scan),
         pre_candidates=40,
         final_picks=3,
         collect_seconds=0,
@@ -82,12 +80,8 @@ def main() -> int:
         help="Target KR objective pool size for cache build (bounded for pre-open stability).",
     )
     parser.add_argument(
-        "--max-symbols-scan",
-        type=int,
-        default=240,
-        help="KR prefetch scan cap before open (higher = broader but slower).",
+        "--force-refresh", action="store_true", default=False
     )
-    parser.add_argument("--force-refresh", action="store_true", default=False)
     args = parser.parse_args()
 
     project_root = Path(args.project_root).resolve()
@@ -107,7 +101,6 @@ def main() -> int:
         acc_no=acc_no,
         user_id=user_id,
         kr_universe_size=args.kr_universe_size,
-        max_symbols_scan=args.max_symbols_scan,
         mock=use_mock,
     )
     mojito_module = import_mojito_module()
@@ -120,7 +113,7 @@ def main() -> int:
 
     print(
         f"[prefetch-kr] start: kr_universe_size={config.kr_universe_size}, "
-        f"max_symbols_scan={config.max_symbols_scan}, mock={config.mock}, cache={cache_path}",
+        f"mock={config.mock}, cache={cache_path}",
         flush=True,
     )
     codes, _ = selector.load_universe()
