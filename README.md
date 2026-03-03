@@ -11,6 +11,7 @@ KIS OpenAPI 모의투자용 자동매매 엔진입니다.
 - 운영 감시/청산은 `후보군 ∪ 서버 보유종목`
 - 서버(KIS API) 상태가 단일 진실원천(SoT), 로컬은 덮어씀
 - 텔레그램은 즉시 알림만 사용(30분 배치 요약 없음)
+- US S&P500 유니버스는 **원격 소스(datahub) 성공 시에만** 사용(폴백 없음, 실패 시 precompute 실패)
 
 ## 설정 파일
 - 민감정보: `.env`
@@ -47,6 +48,18 @@ KIS OpenAPI 모의투자용 자동매매 엔진입니다.
 
 # 테스트/검증 실행(로그는 logs/trader_test/*로 분리)
 ./scripts/run_trader_test_wsl.sh --action status
+
+# 단위 테스트
+/home/heesu/anaconda3/envs/systematic-alpha/bin/python -m pytest -q tests/test_trader_algorithm.py tests/test_trader_morning_prep.py
+
+# 실 API/원격소스 헬스체크 테스트 (DNS/API 실패 시 테스트 실패)
+/home/heesu/anaconda3/envs/systematic-alpha/bin/python -m pytest -q -m live_api tests/test_trader_live_api_health.py
+
+# 테스트 잔존물 정리 + 전체 테스트(단위+live_api) 1회 실행
+./scripts/run_all_tests_wsl.sh
+
+# live_api 제외 실행(빠른 로컬 회귀)
+./scripts/run_all_tests_wsl.sh --skip-live
 ```
 
 ## 크론 작업
@@ -77,6 +90,15 @@ KIS OpenAPI 모의투자용 자동매매 엔진입니다.
 - 테스트 로그: `logs/trader_test/<YYYYMMDD>/...`
 - `run_trader_wsl.sh`에서 `--log-profile`로 경로를 명시할 수 있습니다.
   - 예: `./scripts/run_trader_wsl.sh --log-profile trader_test --action sync-account --market US`
+
+## DB 요약 조회
+```bash
+# test 프로파일, 특정 일자
+/home/heesu/anaconda3/envs/systematic-alpha/bin/python scripts/trader_db_summary.py --profile test --date YYYYMMDD --limit 10
+
+# prod 프로파일, 최근 상태
+/home/heesu/anaconda3/envs/systematic-alpha/bin/python scripts/trader_db_summary.py --profile prod --limit 10
+```
 
 ## 상태/산출물 분리(Profile)
 - 운영 기본 프로파일: `prod`

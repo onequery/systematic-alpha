@@ -200,10 +200,10 @@ def load_trader_config(project_root: str | Path = ".") -> TraderConfig:
     if not enabled_markets:
         enabled_markets = ["KR", "US"]
 
-    us_sync_exchanges = _csv_env("TRADER_US_SYNC_EXCHANGES", ["NYSE", "AMEX"])
+    us_sync_exchanges = _csv_env("TRADER_US_SYNC_EXCHANGES", ["NASD", "NYSE", "AMEX"])
     us_sync_exchanges = [m for m in us_sync_exchanges if m in {"NASD", "NYSE", "AMEX"}]
     if not us_sync_exchanges:
-        us_sync_exchanges = ["NYSE", "AMEX"]
+        us_sync_exchanges = ["NASD", "NYSE", "AMEX"]
 
     return TraderConfig(
         project_root=root,

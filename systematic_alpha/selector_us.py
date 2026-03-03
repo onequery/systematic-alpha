@@ -29,7 +29,6 @@ from systematic_alpha.models import (
 )
 
 SP500_SOURCE_URL = "https://datahub.io/core/s-and-p-500-companies/r/constituents.csv"
-SP500_BUNDLED_SNAPSHOT_PATH = Path(__file__).resolve().parent / "data" / "us_sp500_snapshot.csv"
 
 
 def _normalize_us_exchange_code(raw_exchange: str) -> str:
@@ -406,50 +405,27 @@ class USDayTradingSelector:
         return symbols, names
 
     def _build_objective_universe(self) -> Tuple[List[str], Dict[str, str]]:
-        source = ""
-        symbols: List[str] = []
-        names: Dict[str, str] = {}
+        remote_symbols, remote_names = self._fetch_sp500_remote()
+        if not remote_symbols:
+            # Strict mode: objective universe must come from remote source.
+            # Do not silently fall back to cached/bundled snapshots.
+            raise RuntimeError(
+                f"US objective universe fetch failed: source={SP500_SOURCE_URL}"
+            )
 
         cache_path = self._sp500_cache_path()
-        cached_symbols, cached_names = self._read_sp500_csv(cache_path)
-        if not cached_symbols:
-            legacy_path = self._legacy_sp500_cache_path()
-            if legacy_path.exists():
-                cached_symbols, cached_names = self._read_sp500_csv(legacy_path)
-        if cached_symbols:
-            source = f"cache:{cache_path}"
-            symbols = cached_symbols
-            names = cached_names
-        else:
-            remote_symbols, remote_names = self._fetch_sp500_remote()
-            if remote_symbols:
-                source = f"remote:{SP500_SOURCE_URL}"
-                symbols = remote_symbols
-                names = remote_names
-                try:
-                    self._write_sp500_csv(cache_path, symbols, names)
-                except Exception:
-                    pass
-            else:
-                bundled_symbols, bundled_names = self._read_sp500_csv(SP500_BUNDLED_SNAPSHOT_PATH)
-                if bundled_symbols:
-                    source = f"bundled:{SP500_BUNDLED_SNAPSHOT_PATH}"
-                    symbols = bundled_symbols
-                    names = bundled_names
+        try:
+            self._write_sp500_csv(cache_path, remote_symbols, remote_names)
+        except Exception:
+            # Cache write is best-effort; remote fetch success is the source of truth.
+            pass
 
-        if not symbols:
-            print(
-                "[universe] US objective pool unavailable (S&P500 source and snapshot failed).",
-                flush=True,
-            )
-            return [], {}
-
-        target = min(self.config.us_universe_size, len(symbols))
-        selected_symbols = symbols[:target]
-        selected_names = {symbol: names.get(symbol, "") for symbol in selected_symbols if names.get(symbol)}
+        target = min(self.config.us_universe_size, len(remote_symbols))
+        selected_symbols = remote_symbols[:target]
+        selected_names = {symbol: remote_names.get(symbol, "") for symbol in selected_symbols if remote_names.get(symbol)}
         print(
-            f"[universe] US objective pool selected: {len(selected_symbols)}/{len(symbols)} "
-            f"(basis=S&P500_constituents, source={source}, us_universe_size={self.config.us_universe_size})",
+            f"[universe] US objective pool selected: {len(selected_symbols)}/{len(remote_symbols)} "
+            f"(basis=S&P500_constituents, source=remote:{SP500_SOURCE_URL}, us_universe_size={self.config.us_universe_size})",
             flush=True,
         )
         return selected_symbols, selected_names
@@ -1550,4 +1526,3 @@ class USDayTradingSelector:
             reverse=True,
         )
         return results
-

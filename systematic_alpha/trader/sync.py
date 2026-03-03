@@ -44,19 +44,36 @@ def _api_error_text(payload: Any) -> str:
     rt_cd = str(payload.get("rt_cd", "") or "").strip()
     msg_cd = str(payload.get("msg_cd", "") or "").strip()
     msg1 = str(payload.get("msg1", "") or "").strip()
+
+    def _is_benign_notice() -> bool:
+        t = msg1.lower()
+        # KIS mock endpoints sometimes return informational notices without data body.
+        # These should not hard-fail strict sync.
+        if "모의투자 조회가 완료되었습니다" in msg1:
+            return True
+        if "조회할 내역" in msg1 and "없" in msg1:
+            return True
+        if msg_cd in {"20310000", "70070000"}:
+            return True
+        if "no data" in t or "empty result" in t:
+            return True
+        return False
+
     if rt_cd and rt_cd != "0":
+        if _is_benign_notice():
+            return ""
         chunks = [f"rt_cd={rt_cd}"]
         if msg_cd:
             chunks.append(f"msg_cd={msg_cd}")
         if msg1:
             chunks.append(f"msg1={msg1}")
         return ", ".join(chunks)
-    if msg_cd and msg_cd != "0":
-        chunks = [f"msg_cd={msg_cd}"]
-        if msg1:
-            chunks.append(f"msg1={msg1}")
-        return ", ".join(chunks)
-    if "output" not in payload and "output1" not in payload:
+    # If payload carries usable output containers, treat as success even if msg_cd is non-zero.
+    if any(k in payload for k in ("output", "output1", "output2")):
+        return ""
+    if _is_benign_notice():
+        return ""
+    if "output" not in payload and "output1" not in payload and "output2" not in payload:
         if msg1:
             return f"missing_output:{msg1}"
         return "missing_output"

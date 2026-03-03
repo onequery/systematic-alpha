@@ -110,6 +110,119 @@ def _snapshot_budget(
     return {"ok": True, **payload}
 
 
+def _analyze_precompute_result(result: Dict[str, object]) -> Dict[str, List[Dict[str, object]]]:
+    api_failures: List[Dict[str, object]] = []
+    bar_shortages: List[Dict[str, object]] = []
+    for row in list(result.get("results", []) if isinstance(result, dict) else []):
+        if not isinstance(row, dict):
+            continue
+        market = str(row.get("market", "") or "").upper()
+        status = str(row.get("status", "") or "").upper()
+        detail = row.get("detail", {}) if isinstance(row.get("detail"), dict) else {}
+        if status != "OK":
+            api_failures.append(
+                {
+                    "market": market,
+                    "kind": "precompute_error",
+                    "error": str(detail.get("error", "unknown_precompute_error")),
+                }
+            )
+            continue
+
+        index_filter = detail.get("index_filter", {}) if isinstance(detail.get("index_filter"), dict) else {}
+        reason = str(index_filter.get("reason", "") or "")
+        if reason == "index_fetch_failed":
+            api_failures.append(
+                {
+                    "market": market,
+                    "kind": "index_fetch_failed",
+                    "error": index_filter.get("fetch_diagnostics", {}),
+                }
+            )
+        elif reason == "insufficient_index_bars":
+            bar_shortages.append(
+                {
+                    "market": market,
+                    "kind": "insufficient_index_bars",
+                    "bars": int(index_filter.get("bars", 0) or 0),
+                    "required_bars": int(index_filter.get("required_bars", 0) or 0),
+                    "index_symbol": str(index_filter.get("index_symbol", "") or ""),
+                }
+            )
+
+    return {
+        "api_failures": api_failures,
+        "bar_shortages": bar_shortages,
+    }
+
+
+def _notify_precompute_result(
+    *,
+    storage: TraderStorage,
+    telegram: TelegramClient,
+    trade_date: str,
+    trigger: str,
+    result: Dict[str, object],
+) -> None:
+    rows = list(result.get("results", []) if isinstance(result, dict) else [])
+    kr_candidates = next(
+        (int(x.get("candidate_count", 0) or 0) for x in rows if isinstance(x, dict) and x.get("market") == "KR"),
+        0,
+    )
+    us_candidates = next(
+        (int(x.get("candidate_count", 0) or 0) for x in rows if isinstance(x, dict) and x.get("market") == "US"),
+        0,
+    )
+    telegram.send(
+        "[이벤트] [Trader] 일일 패치 완료\n"
+        f"일자={trade_date}\n"
+        f"트리거={trigger}\n"
+        f"KR후보={kr_candidates}\n"
+        f"US후보={us_candidates}"
+    )
+
+    analyzed = _analyze_precompute_result(result)
+    api_failures = analyzed["api_failures"]
+    bar_shortages = analyzed["bar_shortages"]
+
+    if api_failures:
+        storage.log_event(
+            "precompute_api_failure_alert",
+            {"trade_date": trade_date, "trigger": trigger, "failures": api_failures},
+        )
+        lines = []
+        for item in api_failures[:3]:
+            mk = str(item.get("market", "") or "")
+            kind = str(item.get("kind", "") or "")
+            err = str(item.get("error", ""))[:220]
+            lines.append(f"- {mk} ({kind}): {err}")
+        telegram.send(
+            "[Action required] [Trader] 사전계산 API 실패\n"
+            f"일자={trade_date}\n"
+            f"건수={len(api_failures)}\n"
+            "상세(최대3건):\n"
+            + "\n".join(lines)
+        )
+
+    if bar_shortages:
+        storage.log_event(
+            "precompute_index_bar_shortage_notice",
+            {"trade_date": trade_date, "trigger": trigger, "shortages": bar_shortages},
+        )
+        lines = []
+        for item in bar_shortages[:3]:
+            lines.append(
+                f"- {item.get('market')} {item.get('index_symbol')}: bars={item.get('bars')} / need={item.get('required_bars')}"
+            )
+        telegram.send(
+            "[이벤트] [Trader] 지수 바 부족\n"
+            f"일자={trade_date}\n"
+            f"건수={len(bar_shortages)}\n"
+            "상세(최대3건):\n"
+            + "\n".join(lines)
+        )
+
+
 def _ensure_daily_bootstrap(
     *,
     cfg: TraderConfig,
@@ -145,10 +258,12 @@ def _ensure_daily_bootstrap(
             "precompute_catchup_done",
             {"trade_date": trade_date, "trigger": trigger or "catchup", "result": result},
         )
-        telegram.send(
-            "[이벤트] [Trader] 사전 계산 지연 보정 실행\n"
-            f"일자={trade_date}\n"
-            f"트리거={trigger or 'catchup'}"
+        _notify_precompute_result(
+            storage=storage,
+            telegram=telegram,
+            trade_date=trade_date,
+            trigger=f"catchup:{trigger or 'catchup'}",
+            result=result,
         )
         ran_precompute = True
 
@@ -324,11 +439,12 @@ def _daemon_loop(cfg: TraderConfig) -> int:
                     result = precompute_all_markets(cfg=cfg, storage=storage, trade_date=date_kst)
                     storage.upsert_meta(mark_key, "1")
                     storage.log_event("precompute_done", result)
-                    telegram.send(
-                        "[이벤트] [Trader] 일일 패치 완료\n"
-                        f"일자={date_kst}\n"
-                        f"KR후보={next((r['candidate_count'] for r in result['results'] if r['market']=='KR'), 0)}\n"
-                        f"US후보={next((r['candidate_count'] for r in result['results'] if r['market']=='US'), 0)}"
+                    _notify_precompute_result(
+                        storage=storage,
+                        telegram=telegram,
+                        trade_date=date_kst,
+                        trigger="scheduled_precompute",
+                        result=result,
                     )
 
             if should_run_budget_snapshot(cfg, now):

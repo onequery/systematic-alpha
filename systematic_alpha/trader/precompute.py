@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import time
 from datetime import datetime
 from statistics import mean
 from typing import Any, Dict, List, Optional, Tuple
@@ -89,6 +91,193 @@ def _fetch_ohlcv_rows(selector: Any, market: str, symbol: str) -> List[Dict[str,
     return []
 
 
+def _payload_api_error(payload: Any) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    rt_cd = str(payload.get("rt_cd", "") or "").strip()
+    msg_cd = str(payload.get("msg_cd", "") or "").strip()
+    msg1 = str(payload.get("msg1", "") or "").strip()
+    if rt_cd and rt_cd != "0":
+        chunks = [f"rt_cd={rt_cd}"]
+        if msg_cd:
+            chunks.append(f"msg_cd={msg_cd}")
+        if msg1:
+            chunks.append(f"msg1={msg1}")
+        return ", ".join(chunks)
+    return ""
+
+
+def _is_rate_limited_error(err_text: str) -> bool:
+    text = str(err_text or "").lower()
+    return ("egw00201" in text) or ("초당 거래건수를 초과" in text) or ("rate limit" in text)
+
+
+def _prioritized_us_exchange_order(symbol: str, order: List[str]) -> List[str]:
+    sym = str(symbol or "").upper()
+    preferred_map = {
+        "SPY": "AMEX",
+        "QQQ": "NASD",
+        "DIA": "NYSE",
+        "IWM": "AMEX",
+    }
+    preferred = preferred_map.get(sym)
+    if not preferred:
+        return list(order)
+    # For index/ETF symbols used as regime gauges, querying the canonical exchange first
+    # (and only) reduces noisy empty responses and extra API calls that can trigger rate limits.
+    strict_primary = str(os.getenv("TRADER_US_OHLCV_STRICT_PRIMARY_EXCHANGE", "1") or "1").strip().lower()
+    if strict_primary in {"1", "true", "yes", "on"}:
+        return [preferred]
+    out: List[str] = [preferred]
+    out.extend([x for x in order if str(x).upper() != preferred])
+    # keep unique and uppercase
+    uniq: List[str] = []
+    seen = set()
+    for ex in out:
+        exu = str(ex or "").upper()
+        if not exu or exu in seen:
+            continue
+        seen.add(exu)
+        uniq.append(exu)
+    return uniq
+
+
+def _fetch_ohlcv_rows_with_diag(selector: Any, market: str, symbol: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    mk = str(market).upper()
+    sym = str(symbol or "").upper()
+    if mk == "KR":
+        try:
+            resp = selector.broker.fetch_ohlcv_recent30(sym, timeframe="D", adj_price=True)
+            rows = _parse_ohlcv_rows(latest_list_of_dict(resp if isinstance(resp, dict) else {}))
+            err = _payload_api_error(resp)
+            if rows:
+                return rows, {"status": "ok", "market": mk, "symbol": sym, "bars": len(rows)}
+            if err:
+                return [], {"status": "fetch_failed", "market": mk, "symbol": sym, "error": err}
+            return [], {
+                "status": "empty",
+                "market": mk,
+                "symbol": sym,
+                "error": "empty_ohlcv_rows",
+            }
+        except Exception as exc:
+            return [], {
+                "status": "fetch_failed",
+                "market": mk,
+                "symbol": sym,
+                "error": repr(exc),
+            }
+
+    attempts: List[Dict[str, Any]] = []
+    try:
+        exchange_order = list(selector._exchange_attempt_order(sym))  # type: ignore[attr-defined]
+    except Exception:
+        exchange_order = ["NYSE", "AMEX", "NASD"]
+    exchange_order = _prioritized_us_exchange_order(sym, exchange_order)
+
+    retry_count = 2
+    retry_base_sec = 1.2
+    exchange_spacing_sec = 0.8
+    try:
+        retry_count = max(0, int(float(os.getenv("TRADER_US_OHLCV_RATE_RETRIES", "2") or 2)))
+    except Exception:
+        retry_count = 2
+    try:
+        retry_base_sec = max(0.1, float(os.getenv("TRADER_US_OHLCV_RATE_BACKOFF_SEC", "1.2") or 1.2))
+    except Exception:
+        retry_base_sec = 1.2
+    try:
+        exchange_spacing_sec = max(0.0, float(os.getenv("TRADER_US_OHLCV_EXCHANGE_SPACING_SEC", "0.8") or 0.8))
+    except Exception:
+        exchange_spacing_sec = 0.8
+
+    for ex_idx, ex in enumerate(exchange_order):
+        broker = None
+        if ex_idx > 0 and exchange_spacing_sec > 0:
+            time.sleep(exchange_spacing_sec)
+        try:
+            broker = selector._get_broker_for_exchange(ex)  # type: ignore[attr-defined]
+            if broker is None:
+                attempts.append({"exchange": ex, "status": "broker_none"})
+                continue
+
+            ex_done = False
+            for attempt_idx in range(retry_count + 1):
+                resp = selector._fetch_ohlcv_oversea_compatible(broker, sym)  # type: ignore[attr-defined]
+                rows = _parse_ohlcv_rows(latest_list_of_dict(resp if isinstance(resp, dict) else {}))
+                err = _payload_api_error(resp)
+                if rows:
+                    attempts.append(
+                        {
+                            "exchange": ex,
+                            "status": "ok",
+                            "bars": len(rows),
+                            "attempt": attempt_idx + 1,
+                        }
+                    )
+                    return rows, {
+                        "status": "ok",
+                        "market": mk,
+                        "symbol": sym,
+                        "selected_exchange": ex,
+                        "bars": len(rows),
+                        "attempts": attempts,
+                    }
+
+                if err and _is_rate_limited_error(err):
+                    attempts.append(
+                        {
+                            "exchange": ex,
+                            "status": "rate_limited",
+                            "error": err,
+                            "attempt": attempt_idx + 1,
+                        }
+                    )
+                    if attempt_idx < retry_count:
+                        time.sleep(retry_base_sec * (2**attempt_idx))
+                        continue
+                    ex_done = True
+                    break
+
+                if err:
+                    attempts.append(
+                        {
+                            "exchange": ex,
+                            "status": "api_error",
+                            "error": err,
+                            "attempt": attempt_idx + 1,
+                        }
+                    )
+                else:
+                    attempts.append(
+                        {
+                            "exchange": ex,
+                            "status": "empty",
+                            "error": "empty_ohlcv_rows",
+                            "attempt": attempt_idx + 1,
+                        }
+                    )
+                ex_done = True
+                break
+
+            if ex_done:
+                continue
+        except Exception as exc:
+            attempts.append({"exchange": ex, "status": "error", "error": repr(exc)})
+            continue
+
+    any_error = any(a.get("status") in {"error", "api_error", "rate_limited"} for a in attempts)
+    any_empty = any(a.get("status") in {"empty", "broker_none"} for a in attempts)
+    status = "fetch_failed" if any_error else ("empty" if any_empty else "fetch_failed")
+    return [], {
+        "status": status,
+        "market": mk,
+        "symbol": sym,
+        "attempts": attempts,
+        "error": "all_exchanges_failed_or_empty",
+    }
+
+
 def _prev_day_range(selector: Any, market: str, symbol: str, trade_date: str) -> Tuple[Optional[float], Optional[float], Optional[float]]:
     rows = _fetch_ohlcv_rows(selector, market, symbol)
     if not rows:
@@ -108,7 +297,16 @@ def _prev_day_range(selector: Any, market: str, symbol: str, trade_date: str) ->
 
 
 def _market_filter(selector: Any, market: str, index_symbol: str, trade_date: str, ma_days: int) -> Dict[str, Any]:
-    rows = _fetch_ohlcv_rows(selector, market, index_symbol)
+    rows, diag = _fetch_ohlcv_rows_with_diag(selector, market, index_symbol)
+    if str(diag.get("status", "")).lower() == "fetch_failed":
+        return {
+            "index_symbol": index_symbol,
+            "prev_close": None,
+            "ma_prev": None,
+            "trading_enabled": False,
+            "reason": "index_fetch_failed",
+            "fetch_diagnostics": diag,
+        }
     hist = [r for r in rows if str(r.get("date", "")) < str(trade_date)]
     closes = [float(r["close"]) for r in hist if to_float(r.get("close")) is not None]
     if len(closes) < max(2, ma_days):
@@ -118,6 +316,9 @@ def _market_filter(selector: Any, market: str, index_symbol: str, trade_date: st
             "ma_prev": None,
             "trading_enabled": False,
             "reason": "insufficient_index_bars",
+            "bars": len(closes),
+            "required_bars": max(2, ma_days),
+            "fetch_diagnostics": diag,
         }
     prev_close = float(closes[-1])
     ma_prev = float(mean(closes[-ma_days:]))
@@ -129,6 +330,9 @@ def _market_filter(selector: Any, market: str, index_symbol: str, trade_date: st
         "ma_prev": ma_prev,
         "trading_enabled": enabled,
         "reason": reason,
+        "bars": len(closes),
+        "required_bars": max(2, ma_days),
+        "fetch_diagnostics": diag,
     }
 
 

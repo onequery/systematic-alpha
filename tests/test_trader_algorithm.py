@@ -14,7 +14,7 @@ from systematic_alpha.trader.execution import execute_entry_intents
 from systematic_alpha.trader.realtime import SignalIntent, _watch_symbols, collect_breakout_intents
 from systematic_alpha.trader.scheduler import ET, us_liquidation_plan
 from systematic_alpha.trader.storage import TraderStorage
-from systematic_alpha.trader.sync import AccountSyncService, SyncResult
+from systematic_alpha.trader.sync import AccountSyncService, SyncResult, _api_error_text
 
 
 class _DummyTelegram:
@@ -387,6 +387,26 @@ class TraderAlgorithmTests(unittest.TestCase):
         self.assertEqual(self.root / "state" / "trader_test", cfg.state_dir)
         self.assertEqual(self.root / "out" / "trader_test", cfg.out_dir)
         self.assertEqual(self.root / "logs" / "trader_test", cfg.logs_dir)
+
+    def test_sync_api_error_text_treats_benign_kis_notices_as_success(self) -> None:
+        payload_with_notice_and_output = {
+            "msg_cd": "20310000",
+            "msg1": "모의투자 조회가 완료되었습니다.",
+            "output2": {"dnca_tot_amt": "1000000"},
+        }
+        payload_no_data_notice = {
+            "msg_cd": "70070000",
+            "msg1": "모의투자 조회할 내역(자료)이 없습니다.",
+        }
+        payload_real_error = {
+            "rt_cd": "1",
+            "msg_cd": "EGW00201",
+            "msg1": "초당 거래건수를 초과하였습니다.",
+        }
+
+        self.assertEqual("", _api_error_text(payload_with_notice_and_output))
+        self.assertEqual("", _api_error_text(payload_no_data_notice))
+        self.assertIn("rt_cd=1", _api_error_text(payload_real_error))
 
 
 if __name__ == "__main__":

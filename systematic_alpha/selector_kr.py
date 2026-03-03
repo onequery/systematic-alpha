@@ -217,7 +217,11 @@ class DayTradingSelector:
             )
             return selected_codes, selected_names
 
-        symbols_df = self.broker.fetch_symbols()
+        try:
+            symbols_df = self.broker.fetch_symbols()
+        except Exception as exc:
+            print(f"[universe] KR objective remote fetch failed: {exc}", flush=True)
+            raise RuntimeError("KR objective universe fetch failed") from exc
         max_count = len(symbols_df.index) if hasattr(symbols_df, "index") else 20000
         all_codes, all_names = extract_codes_and_names_from_df(symbols_df, max_count=max_count)
         scan_budget = min(
