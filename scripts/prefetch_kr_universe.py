@@ -13,7 +13,7 @@ from systematic_alpha.credentials import load_credentials
 from systematic_alpha.dotenv import load_env_stack
 from systematic_alpha.models import StrategyConfig
 from systematic_alpha.mojito_loader import import_mojito_module
-from systematic_alpha.selector import DayTradingSelector
+from systematic_alpha.selector_kr import DayTradingSelector
 
 
 def build_prefetch_config(
@@ -97,7 +97,7 @@ def main() -> int:
 
     os.chdir(project_root)
     load_env_stack(project_root)
-    execution_mode = str(os.getenv("AGENT_LAB_EXECUTION_MODE", "mojito_mock") or "mojito_mock").strip().lower()
+    execution_mode = str(os.getenv("TRADER_EXECUTION_MODE", "mojito_mock") or "mojito_mock").strip().lower()
     use_mock = "mock" in execution_mode
 
     api_key, api_secret, acc_no, user_id = load_credentials(args.key_file)

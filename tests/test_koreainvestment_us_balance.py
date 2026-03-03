@@ -44,7 +44,7 @@ class KoreaInvestmentUsBalanceTests(unittest.TestCase):
 
     def test_fetch_balance_oversea_calls_dayornight_every_request(self) -> None:
         client = self._make_client()
-        with patch.dict("os.environ", {"AGENT_LAB_US_DAYORNIGHT_CALL_SPACING_SEC": "0"}, clear=False):
+        with patch.dict("os.environ", {"TRADER_US_DAYORNIGHT_CALL_SPACING_SEC": "0"}, clear=False):
             with patch.object(client, "fetch_oversea_day_night", return_value={"output": {"PSBL_YN": "N"}}) as m_day:
                 with patch(f"{_MOD.__name__}.requests.get") as m_get:
                     m_get.return_value = _DummyResponse(
@@ -71,7 +71,7 @@ class KoreaInvestmentUsBalanceTests(unittest.TestCase):
             events.append("balance_get")
             return _DummyResponse({"rt_cd": "0", "output1": [], "output2": []}, {"tr_cont": ""})
 
-        with patch.dict("os.environ", {"AGENT_LAB_US_DAYORNIGHT_CALL_SPACING_SEC": "0.6"}, clear=False):
+        with patch.dict("os.environ", {"TRADER_US_DAYORNIGHT_CALL_SPACING_SEC": "0.6"}, clear=False):
             with patch.object(client, "fetch_oversea_day_night", side_effect=_daynight):
                 with patch(f"{_MOD.__name__}.time.sleep", side_effect=_sleep) as m_sleep:
                     with patch(f"{_MOD.__name__}.requests.get", side_effect=_get):

@@ -6,7 +6,7 @@ from typing import Iterable, Sequence
 
 
 DEFAULT_ENV_STACK: tuple[str, ...] = (
-    "config/agent_lab.config",
+    "config/trader.config",
     ".env",
 )
 
@@ -62,7 +62,7 @@ def load_env_stack(
     Precedence:
     1) Existing process environment (never overridden)
     2) Later files override earlier files within the provided stack
-       (default: config/agent_lab.config -> .env)
+       (default: config/trader.config -> .env)
     """
 
     root = Path(project_root)
