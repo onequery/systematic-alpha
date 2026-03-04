@@ -173,6 +173,30 @@ class USDayTradingSelector:
         t = str(text or "").lower()
         return ("egw00201" in t) or ("초당 거래건수를 초과" in t) or ("rate limit" in t)
 
+    @staticmethod
+    def _is_transient_network_error(text: str) -> bool:
+        t = str(text or "").lower()
+        patterns = (
+            "connecttimeout",
+            "readtimeout",
+            "timed out",
+            "max retries exceeded",
+            "connection reset",
+            "remote disconnected",
+            "temporarily unavailable",
+            "temporary failure in name resolution",
+            "name or service not known",
+            "failed to establish a new connection",
+            "connection aborted",
+            "proxyerror",
+            "dnserror",
+        )
+        return any(p in t for p in patterns)
+
+    @classmethod
+    def _is_retryable_error(cls, text: str) -> bool:
+        return cls._is_rate_limited_error(text) or cls._is_transient_network_error(text)
+
     def _latest_api_diag_for(self, code: str) -> str:
         return str(self._api_diag_last_by_code.get(str(code), "") or "")
 
@@ -857,7 +881,7 @@ class USDayTradingSelector:
                         status="exception",
                         detail=detail,
                     )
-                    if self._is_rate_limited_error(detail) and attempt < self._rate_limit_retries:
+                    if self._is_retryable_error(detail) and attempt < self._rate_limit_retries:
                         sleep_sec = min(
                             self._rate_limit_backoff_max_sec,
                             self._rate_limit_backoff_sec * (2**attempt),
@@ -893,7 +917,7 @@ class USDayTradingSelector:
                 )
                 if not payload:
                     self._record_api_diag("fetch_price_empty_payload", code, detail)
-                    if self._is_rate_limited_error(detail) and attempt < self._rate_limit_retries:
+                    if self._is_retryable_error(detail) and attempt < self._rate_limit_retries:
                         sleep_sec = min(
                             self._rate_limit_backoff_max_sec,
                             self._rate_limit_backoff_sec * (2**attempt),
@@ -913,7 +937,7 @@ class USDayTradingSelector:
                 parsed = self._parse_price_payload(payload)
                 if parsed.get("price") is None:
                     self._record_api_diag("fetch_price_no_price_field", code, detail)
-                    if self._is_rate_limited_error(detail) and attempt < self._rate_limit_retries:
+                    if self._is_retryable_error(detail) and attempt < self._rate_limit_retries:
                         sleep_sec = min(
                             self._rate_limit_backoff_max_sec,
                             self._rate_limit_backoff_sec * (2**attempt),
@@ -1038,7 +1062,7 @@ class USDayTradingSelector:
                         status="exception",
                         detail=err_text,
                     )
-                    if self._is_rate_limited_error(err_text) and attempt < self._rate_limit_retries:
+                    if self._is_retryable_error(err_text) and attempt < self._rate_limit_retries:
                         sleep_sec = min(
                             self._rate_limit_backoff_max_sec,
                             self._rate_limit_backoff_sec * (2**attempt),

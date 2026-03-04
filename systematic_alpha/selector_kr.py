@@ -80,6 +80,30 @@ class DayTradingSelector:
         t = str(text or "").lower()
         return ("egw00201" in t) or ("초당 거래건수를 초과" in t) or ("rate limit" in t)
 
+    @staticmethod
+    def _is_transient_network_error(text: str) -> bool:
+        t = str(text or "").lower()
+        patterns = (
+            "connecttimeout",
+            "readtimeout",
+            "timed out",
+            "max retries exceeded",
+            "connection reset",
+            "remote disconnected",
+            "temporarily unavailable",
+            "temporary failure in name resolution",
+            "name or service not known",
+            "failed to establish a new connection",
+            "connection aborted",
+            "proxyerror",
+            "dnserror",
+        )
+        return any(p in t for p in patterns)
+
+    @classmethod
+    def _is_retryable_error(cls, text: str) -> bool:
+        return cls._is_rate_limited_error(text) or cls._is_transient_network_error(text)
+
     def _record_api_diag(self, key: str, code: str, detail: str = "") -> None:
         self._api_diag_counts[key] = self._api_diag_counts.get(key, 0) + 1
         if detail:
@@ -619,7 +643,7 @@ class DayTradingSelector:
                     status="exception",
                     detail=err_text,
                 )
-                if self._is_rate_limited_error(err_text) and attempt < self._rate_limit_retries:
+                if self._is_retryable_error(err_text) and attempt < self._rate_limit_retries:
                     sleep_sec = min(
                         self._rate_limit_backoff_max_sec,
                         self._rate_limit_backoff_sec * (2**attempt),
@@ -653,7 +677,7 @@ class DayTradingSelector:
             if rows:
                 break
             self._record_api_diag("fetch_prev_day_empty_rows", code, err or "empty_rows")
-            if err and self._is_rate_limited_error(err) and attempt < self._rate_limit_retries:
+            if err and self._is_retryable_error(err) and attempt < self._rate_limit_retries:
                 sleep_sec = min(
                     self._rate_limit_backoff_max_sec,
                     self._rate_limit_backoff_sec * (2**attempt),
@@ -748,7 +772,7 @@ class DayTradingSelector:
                     status="exception",
                     detail=err_text,
                 )
-                if self._is_rate_limited_error(err_text) and attempt < self._rate_limit_retries:
+                if self._is_retryable_error(err_text) and attempt < self._rate_limit_retries:
                     sleep_sec = min(
                         self._rate_limit_backoff_max_sec,
                         self._rate_limit_backoff_sec * (2**attempt),
@@ -781,7 +805,7 @@ class DayTradingSelector:
             )
             if not output:
                 self._record_api_diag("fetch_price_empty_payload", code, err or "empty_payload")
-                if err and self._is_rate_limited_error(err) and attempt < self._rate_limit_retries:
+                if err and self._is_retryable_error(err) and attempt < self._rate_limit_retries:
                     sleep_sec = min(
                         self._rate_limit_backoff_max_sec,
                         self._rate_limit_backoff_sec * (2**attempt),
@@ -808,7 +832,7 @@ class DayTradingSelector:
 
             if price is None:
                 self._record_api_diag("fetch_price_no_price_field", code, err or "price_missing")
-                if err and self._is_rate_limited_error(err) and attempt < self._rate_limit_retries:
+                if err and self._is_retryable_error(err) and attempt < self._rate_limit_retries:
                     sleep_sec = min(
                         self._rate_limit_backoff_max_sec,
                         self._rate_limit_backoff_sec * (2**attempt),
