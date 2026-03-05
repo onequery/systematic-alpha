@@ -77,6 +77,13 @@ def _resolve_us_exchange_for_mojito(mojito_module, raw_exchange: str) -> str:
 
 
 class USDayTradingSelector:
+    _FINAL_API_DIAG_KEYS = {
+        "broker_create_exception",
+        "fetch_prev_day_final_error",
+        "fetch_prev_day_no_parsed_rows",
+        "fetch_prev_day_no_target_rows",
+    }
+
     def __init__(self, mojito_module, config: StrategyConfig):
         self.mojito = mojito_module
         self.config = config
@@ -257,6 +264,19 @@ class USDayTradingSelector:
             "counts": dict(self._api_diag_counts),
             "sample_errors": list(self._api_diag_samples),
         }
+
+    def _get_final_api_diagnostics(self) -> Dict[str, Any]:
+        counts = {
+            k: v
+            for k, v in self._api_diag_counts.items()
+            if k in self._FINAL_API_DIAG_KEYS
+        }
+        sample_errors = [
+            s
+            for s in self._api_diag_samples
+            if str(s.get("key") or "") in self._FINAL_API_DIAG_KEYS
+        ]
+        return {"counts": counts, "sample_errors": sample_errors}
 
     def _session_root_dir(self) -> Path:
         if self.config.output_json_path:
@@ -1720,7 +1740,7 @@ class USDayTradingSelector:
             "(basis=liquidity_top_pool, stage1=disabled)",
             flush=True,
         )
-        api_diag = self.get_api_diagnostics()
+        api_diag = self._get_final_api_diagnostics()
         if api_diag.get("counts"):
             print(f"[candidate-api-summary] counts={api_diag['counts']}", flush=True)
             for sample in list(api_diag.get("sample_errors", []))[:5]:
