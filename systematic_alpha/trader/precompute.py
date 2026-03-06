@@ -23,6 +23,26 @@ def _now_iso() -> str:
     return datetime.now(KST).isoformat(timespec="seconds")
 
 
+def _log_index_api_call(
+    *,
+    market: str,
+    symbol: str,
+    status: str,
+    attempt: int,
+    exchange: str = "",
+    detail: str = "",
+) -> None:
+    msg = (
+        f"[api-call] market={str(market).upper()} kind=fetch_index_ohlcv "
+        f"code={str(symbol).upper()} attempt={attempt} status={status}"
+    )
+    if exchange:
+        msg += f" exchange={exchange}"
+    if detail:
+        msg += f" detail={detail}"
+    print(msg, flush=True)
+
+
 def expected_candidate_count(cfg: TraderConfig, market: str) -> int:
     mk = str(market or "").upper()
     try:
@@ -211,13 +231,40 @@ def _fetch_ohlcv_rows_with_diag(selector: Any, market: str, symbol: str) -> Tupl
     sym = str(symbol or "").upper()
     if mk == "KR":
         try:
+            _log_index_api_call(
+                market=mk,
+                symbol=sym,
+                status="start",
+                attempt=1,
+            )
             resp = selector.broker.fetch_ohlcv_recent30(sym, timeframe="D", adj_price=True)
             rows = _parse_ohlcv_rows(latest_list_of_dict(resp if isinstance(resp, dict) else {}))
             err = _payload_api_error(resp)
             if rows:
+                _log_index_api_call(
+                    market=mk,
+                    symbol=sym,
+                    status="ok",
+                    attempt=1,
+                    detail=f"bars={len(rows)}",
+                )
                 return rows, {"status": "ok", "market": mk, "symbol": sym, "bars": len(rows)}
             if err:
+                _log_index_api_call(
+                    market=mk,
+                    symbol=sym,
+                    status="response_error",
+                    attempt=1,
+                    detail=err,
+                )
                 return [], {"status": "fetch_failed", "market": mk, "symbol": sym, "error": err}
+            _log_index_api_call(
+                market=mk,
+                symbol=sym,
+                status="empty",
+                attempt=1,
+                detail="empty_ohlcv_rows",
+            )
             return [], {
                 "status": "empty",
                 "market": mk,
@@ -225,6 +272,13 @@ def _fetch_ohlcv_rows_with_diag(selector: Any, market: str, symbol: str) -> Tupl
                 "error": "empty_ohlcv_rows",
             }
         except Exception as exc:
+            _log_index_api_call(
+                market=mk,
+                symbol=sym,
+                status="exception",
+                attempt=1,
+                detail=repr(exc),
+            )
             return [], {
                 "status": "fetch_failed",
                 "market": mk,
@@ -267,10 +321,25 @@ def _fetch_ohlcv_rows_with_diag(selector: Any, market: str, symbol: str) -> Tupl
 
             ex_done = False
             for attempt_idx in range(retry_count + 1):
+                _log_index_api_call(
+                    market=mk,
+                    symbol=sym,
+                    status="start",
+                    attempt=attempt_idx + 1,
+                    exchange=str(ex),
+                )
                 resp = selector._fetch_ohlcv_oversea_compatible(broker, sym)  # type: ignore[attr-defined]
                 rows = _parse_ohlcv_rows(latest_list_of_dict(resp if isinstance(resp, dict) else {}))
                 err = _payload_api_error(resp)
                 if rows:
+                    _log_index_api_call(
+                        market=mk,
+                        symbol=sym,
+                        status="ok",
+                        attempt=attempt_idx + 1,
+                        exchange=str(ex),
+                        detail=f"bars={len(rows)}",
+                    )
                     attempts.append(
                         {
                             "exchange": ex,
@@ -289,6 +358,14 @@ def _fetch_ohlcv_rows_with_diag(selector: Any, market: str, symbol: str) -> Tupl
                     }
 
                 if err and _is_rate_limited_error(err):
+                    _log_index_api_call(
+                        market=mk,
+                        symbol=sym,
+                        status="response_error",
+                        attempt=attempt_idx + 1,
+                        exchange=str(ex),
+                        detail=err,
+                    )
                     attempts.append(
                         {
                             "exchange": ex,
@@ -304,6 +381,14 @@ def _fetch_ohlcv_rows_with_diag(selector: Any, market: str, symbol: str) -> Tupl
                     break
 
                 if err:
+                    _log_index_api_call(
+                        market=mk,
+                        symbol=sym,
+                        status="response_error",
+                        attempt=attempt_idx + 1,
+                        exchange=str(ex),
+                        detail=err,
+                    )
                     attempts.append(
                         {
                             "exchange": ex,
@@ -313,6 +398,14 @@ def _fetch_ohlcv_rows_with_diag(selector: Any, market: str, symbol: str) -> Tupl
                         }
                     )
                 else:
+                    _log_index_api_call(
+                        market=mk,
+                        symbol=sym,
+                        status="empty",
+                        attempt=attempt_idx + 1,
+                        exchange=str(ex),
+                        detail="empty_ohlcv_rows",
+                    )
                     attempts.append(
                         {
                             "exchange": ex,
@@ -327,6 +420,14 @@ def _fetch_ohlcv_rows_with_diag(selector: Any, market: str, symbol: str) -> Tupl
             if ex_done:
                 continue
         except Exception as exc:
+            _log_index_api_call(
+                market=mk,
+                symbol=sym,
+                status="exception",
+                attempt=1,
+                exchange=str(ex),
+                detail=repr(exc),
+            )
             attempts.append({"exchange": ex, "status": "error", "error": repr(exc)})
             continue
 

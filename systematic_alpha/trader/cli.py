@@ -245,6 +245,24 @@ def _notify_precompute_result(
     bar_shortages = analyzed["bar_shortages"]
 
     if api_failures:
+        for item in api_failures[:5]:
+            mk = str(item.get("market", "") or "")
+            kind = str(item.get("kind", "") or "")
+            err_obj = item.get("error", "")
+            if isinstance(err_obj, dict):
+                err_status = str(err_obj.get("status", "") or "")
+                err_symbol = str(err_obj.get("symbol", "") or "")
+                err_msg = str(err_obj.get("error", "") or "")
+                _trace(
+                    "precompute.api_failure "
+                    f"trade_date={trade_date} market={mk} kind={kind} "
+                    f"status={err_status or '-'} symbol={err_symbol or '-'} error={err_msg[:220]}"
+                )
+            else:
+                _trace(
+                    "precompute.api_failure "
+                    f"trade_date={trade_date} market={mk} kind={kind} error={str(err_obj)[:220]}"
+                )
         storage.log_event(
             "precompute_api_failure_alert",
             {"trade_date": trade_date, "trigger": trigger, "failures": api_failures},
@@ -264,6 +282,12 @@ def _notify_precompute_result(
         )
 
     if bar_shortages:
+        for item in bar_shortages[:5]:
+            _trace(
+                "precompute.index_bar_shortage "
+                f"trade_date={trade_date} market={item.get('market')} index={item.get('index_symbol')} "
+                f"bars={item.get('bars')} required={item.get('required_bars')}"
+            )
         storage.log_event(
             "precompute_index_bar_shortage_notice",
             {"trade_date": trade_date, "trigger": trigger, "shortages": bar_shortages},
