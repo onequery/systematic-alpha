@@ -321,8 +321,10 @@ def _ensure_daily_bootstrap(
     ran_precompute = False
     ran_budget_snapshot = False
 
-    if (not precompute_done) and (any_market_open or now_kst_dt >= pre_end):
-        _trace(f"bootstrap.precompute.start trigger={trigger or 'catchup'}")
+    # If today's candidate cache is missing, run precompute immediately regardless of time window.
+    if not precompute_done:
+        precompute_trigger = trigger or "missing_cache_startup"
+        _trace(f"bootstrap.precompute.start trigger={precompute_trigger}")
         result = precompute_all_markets(cfg=cfg, storage=storage, trade_date=trade_date)
         _trace(
             "bootstrap.precompute.done "
@@ -341,7 +343,7 @@ def _ensure_daily_bootstrap(
             "precompute_catchup_done",
             {
                 "trade_date": trade_date,
-                "trigger": trigger or "catchup",
+                "trigger": precompute_trigger,
                 "result": result,
                 "cache_ready": bool(precompute_done_after),
                 "cache_states": precompute_states_after,
@@ -351,7 +353,7 @@ def _ensure_daily_bootstrap(
             storage=storage,
             telegram=telegram,
             trade_date=trade_date,
-            trigger=f"catchup:{trigger or 'catchup'}",
+            trigger=f"catchup:{precompute_trigger}",
             result=result,
         )
         ran_precompute = True
